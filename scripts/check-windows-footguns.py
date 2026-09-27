@@ -54,12 +54,33 @@ from pathlib import Path
 
 
 
+def _not3(v):
+    return None if v is None else (not v)
+
+
+def _any3(vs):
+    if any(v is True for v in vs):
+        return True
+    return None if any(v is None for v in vs) else False
+
+
+def _all3(vs):
+    if any(v is False for v in vs):
+        return False
+    return None if any(v is None for v in vs) else True
+
+
 def cfg_live_for_windows(expr: str) -> bool:
     """Whether a cfg(...) expression can hold for a Windows build.
 
-    windows=True, unix/macos/linux=False; anything the scanner cannot
-    resolve (feature="..", test, unknown names) evaluates True, erring
-    toward LOOKING AT the code. This replaces a name-regex heuristic that
+    Three-valued: True means it can hold for Windows, False means it
+    cannot, None means unknown (feature gates, test, unresolvable names).
+    Unknown must NOT collapse into a boolean, because `not(unknown)` is
+    unknown, not False: encoding unknown as True made
+    cfg(not(feature = "x")) evaluate to False, so the scanner SKIPPED a
+    scope that can compile on Windows and a Unix-only call inside it would
+    pass the gate. Callers treat anything not definitely-False as live.
+    This replaces a name-regex heuristic that
     misclassified negated gates in both directions:
     cfg(not(any(target_os = "macos", target_os = "linux"))) runs ON Windows
     yet looked unix-only (false negative), and not(windows) needed a special
@@ -79,7 +100,7 @@ def cfg_live_for_windows(expr: str) -> bool:
         return True
     vals = {
         "windows": True, "other_os": False, "unix": False,
-        "macos": False, "linux": False, "neutral": True,
+        "macos": False, "linux": False, "neutral": None,
     }
     pos = 0
 
@@ -104,14 +125,14 @@ def cfg_live_for_windows(expr: str) -> bool:
         if t in ("cfg", "any", "all", "not"):
             args = parse_args(True)
             if t == "not":
-                return not args[0]
-            return any(args) if t == "any" else all(args)
+                return _not3(args[0])
+            return _any3(args) if t == "any" else _all3(args)
         if t == "(":
-            return all(parse_args(True))
+            return _all3(parse_args(True))
         if t in vals:
             return vals[t]
         if t[0].isalpha() or t[0] == "_":
-            return True  # unknown predicate: assume it can be enabled
+            return None  # unknown predicate: could go either way
         raise ValueError(f"cfg: unexpected token {t!r}")
 
     try:
@@ -119,7 +140,9 @@ def cfg_live_for_windows(expr: str) -> bool:
         while pos < len(toks) and toks[pos] == ",":
             pos += 1
             top.append(parse_term())
-        return pos == len(toks) and all(top)
+        if pos != len(toks):
+            return True
+        return _all3(top) is not False
     except (ValueError, IndexError):
         return True
 ATTR = re.compile(r"#\[!?[^\]]*\]")
@@ -282,11 +305,15 @@ mod m {
 '''
 
 # The two negated-gate shapes the old name-regex got WRONG, pinned from
-# the review finding: not(any(macos,linux)) IS windows-live (the spawn
-# inside must be caught) and not(windows) is NOT (no finding allowed).
+# the review finding, both directions: not(any(macos,linux)) IS
+# windows-live (its spawn must be caught), not(feature = "...") is UNKNOWN
+# and must be scanned too (its kill must be caught -- this is the shape
+# that was silently skipped), and not(windows) is dead (no finding).
 SELF_NEGATED = r'''
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn fallback() { let _ = std::process::Command::new("sh"); }
+#[cfg(not(feature = "telegram"))]
+fn maybe_on_windows() { unsafe { libc::kill(1, 2); } }
 #[cfg(not(windows))]
 fn unix_only() { unsafe { libc::kill(1, 2); } }
 '''
@@ -309,8 +336,9 @@ def self_test():
             ok = False
         (d / "negated.rs").write_text(SELF_NEGATED)
         names = [rule for _, _, rule, _, _ in scan_file(d / "negated.rs", set(RULES))]
-        if names != ["unix-proc"]:
-            print(f"self-test FAIL: negated gates gave {names}, expected exactly ['unix-proc']",
+        if names != ["unix-proc", "unix-api"]:
+            print(f"self-test FAIL: negated gates gave {names}, "
+                  f"expected exactly ['unix-proc', 'unix-api']",
                   file=sys.stderr)
             ok = False
         (d / "decl.rs").write_text("#[cfg(unix)]\nmod gated;\n")
