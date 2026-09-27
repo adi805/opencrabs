@@ -372,6 +372,17 @@ mod tests {
         assert!(s.contains("-ExecutionTimeLimit ([TimeSpan]::Zero)"));
     }
 
+    // Windows-only: `shell_program()` is the one function in this module
+    // whose result is platform-specific. Off Windows the module still
+    // compiles (its script builders are pure), but the `SystemRoot` fallback
+    // below is a `C:\Windows\...` path, and a Unix host reads it two ways
+    // that both break this test: `Path::is_absolute()` is false, and `\` is
+    // not a separator so `file_name()` returns the whole string. Asserting
+    // either there fails for the wrong reason and takes the Linux `Test` job
+    // down with it. The assertion belongs where it is meaningful, and it is
+    // not lost: the Windows platform-behaviour slice runs
+    // `cargo test --target x86_64-pc-windows-msvc --lib -- cli::service_windows`.
+    #[cfg(windows)]
     #[test]
     fn shell_program_is_an_absolute_trusted_path() {
         let p = shell_program();
