@@ -429,7 +429,7 @@ impl EvolveTool {
             // sharing violation, which we ignore; only truly dead orphans
             // get collected, so this can never pull a running binary's rug.
             if let (Some(dir), Some(name)) = (exe_path.parent(), exe_path.file_name()) {
-                let prefix = format!("{name}.old");
+                let prefix = format!("{}.old", name.to_string_lossy());
                 if let Ok(rd) = std::fs::read_dir(dir) {
                     for entry in rd.flatten() {
                         let fname = entry.file_name();
