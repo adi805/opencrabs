@@ -512,11 +512,26 @@ impl EvolveTool {
                     )));
                 }
             }
-            return Ok(ToolResult::error(format!(
-                "Failed to replace binary at {}: {e}. Previous executable was restored to its \
-                 path; re-run evolve to retry the swap.",
-                exe_path.display()
-            )));
+            // Report the state that actually holds, not the state the
+            // Windows branch is supposed to have produced. The restore above
+            // is cfg(windows); on Unix the pre-rename unlink already removed
+            // exe_path, so a hardcoded "was restored" told the operator to
+            // retry with a binary that is not there. exists() is the fact.
+            let still_there = exe_path.exists();
+            return Ok(ToolResult::error(if still_there {
+                format!(
+                    "Failed to replace binary at {}: {e}. The previous executable is still in \
+                     place; re-run evolve to retry the swap.",
+                    exe_path.display()
+                )
+            } else {
+                format!(
+                    "Failed to replace binary at {}: {e}. The previous executable is gone -- it \
+                     was unlinked before the rename, so there is nothing to restore on this \
+                     platform. Reinstall from the release artifact, then re-run evolve.",
+                    exe_path.display()
+                )
+            }));
         }
 
         // Post-swap verification
