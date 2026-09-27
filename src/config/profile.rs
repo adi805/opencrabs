@@ -269,9 +269,27 @@ impl ProfileRegistry {
         }
         #[cfg(windows)]
         {
+            // The comment that used to sit here claimed "opening with write +
+            // no sharing provides exclusion". std::fs opens with
+            // FILE_SHARE_ALL, so that was never true and this block was a
+            // no-op. LockFileEx is the real analogue of the flock arm above;
+            // the OS releases the range when `lock_file` drops below.
+            use crate::config::winlock::LockOutcome;
             use std::os::windows::io::AsRawHandle;
-            // On Windows, opening with write + no sharing provides exclusion
-            let _ = lock_file.as_raw_handle();
+            match crate::config::winlock::exclusive(lock_file.as_raw_handle(), false) {
+                LockOutcome::Acquired => {}
+                // A blocking request waits rather than reporting contention,
+                // so this arm only fires if that ever changes.
+                LockOutcome::Held => {
+                    bail!(
+                        "failed to lock {}: held by another process",
+                        lock_path.display()
+                    )
+                }
+                LockOutcome::Failed(e) => {
+                    bail!("failed to lock {}: {}", lock_path.display(), e)
+                }
+            }
         }
 
         // Load current state under lock
@@ -891,6 +909,27 @@ pub(crate) fn acquire_scheduler_lock_in(lock_dir: &Path, profile: &str) -> Optio
         }
     }
 
+    #[cfg(windows)]
+    {
+        use crate::config::winlock::LockOutcome;
+        use std::os::windows::io::AsRawHandle;
+        // Same policy as the flock arm: contention declines silently (a live
+        // process owns this profile's scheduler), a genuine failure declines
+        // loudly — spawning on an uncertain lock is the double-fire this
+        // guard exists to prevent.
+        match crate::config::winlock::exclusive(file.as_raw_handle(), true) {
+            LockOutcome::Acquired => {}
+            LockOutcome::Held => return None,
+            LockOutcome::Failed(e) => {
+                tracing::warn!(
+                    "scheduler lock: cannot lock {}: {e} - not spawning scheduler",
+                    path.display()
+                );
+                return None;
+            }
+        }
+    }
+
     // Stamp the owner PID for observability (`cat` the lock file to see who
     // holds it). The flock, not this write, is the real guard, so a torn write
     // is harmless.
@@ -1028,6 +1067,33 @@ pub(crate) fn acquire_instance_lock_in(lock_dir: &Path, profile: &str) -> Instan
                     // does not exist.
                     .filter(|p| is_pid_alive(*p));
                 return InstanceGuard::Held { pid };
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use crate::config::winlock::LockOutcome;
+        use std::os::windows::io::AsRawHandle;
+        // Non-blocking: a live holder means a second instance of this
+        // profile, and #1072's contract is that it must not boot.
+        match crate::config::winlock::exclusive(file.as_raw_handle(), true) {
+            LockOutcome::Acquired => {}
+            LockOutcome::Held => {
+                let pid = fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    // Same stale-stamp discipline as the Unix arm: never
+                    // name a PID that is not alive.
+                    .filter(|p| is_pid_alive(*p));
+                return InstanceGuard::Held { pid };
+            }
+            LockOutcome::Failed(e) => {
+                tracing::warn!(
+                    "instance lock: cannot lock {}: {e} - starting without the guard",
+                    path.display()
+                );
+                return InstanceGuard::Unavailable;
             }
         }
     }
@@ -1236,6 +1302,20 @@ pub(crate) fn preempt_instances_in(lock_dir: &Path, stop_services: bool) -> Vec<
         if ret != 0 {
             let err = std::io::Error::last_os_error();
             tracing::debug!(pid, error = %err, "preempt: SIGTERM to background instance failed");
+        }
+    }
+
+    // Windows has no signal channel to a headless console process, so there
+    // is no polite rung to try first: this is TerminateProcess straight
+    // away, which is exactly why the ownership evidence (an alive PID stamped
+    // into a lock file whose range we could not take) must be positive
+    // before we get here. See winlock::terminate's contract. The ~3s wait
+    // loop below gives the same exit window SIGTERM would, and the
+    // stopped-flag computation is already platform-agnostic.
+    #[cfg(windows)]
+    for &pid in owners.keys() {
+        if let Err(e) = crate::config::winlock::terminate(pid) {
+            tracing::debug!(pid, error = %e, "preempt: TerminateProcess failed");
         }
     }
 
