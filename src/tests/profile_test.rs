@@ -14,8 +14,8 @@ use crate::config::profile::{
     ProfileEntry, ProfileRegistry, acquire_token_lock, active_profile, base_opencrabs_dir,
     create_profile, delete_profile, export_profile, foreign_lock_owners, hash_token,
     import_profile, list_profiles, migrate_profile, parse_lock_owner_pid, release_all_locks,
-    release_token_lock, resolve_profile_home, set_active_profile, split_pid_ticks,
-    validate_profile_name,
+    release_token_lock, resolve_creation_ticks, resolve_profile_home, set_active_profile,
+    split_pid_ticks, validate_profile_name,
 };
 use tempfile::tempdir;
 
@@ -1747,4 +1747,46 @@ fn foreign_lock_owner_resolves_a_reused_pid_to_the_newest_creation_time() {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// The bug this pins: a wall clock that stepped backward between the dead lock
+/// holder and the process that inherited its PID leaves the DEAD claim as the
+/// larger number, so taking the maximum hands `terminate` a creation time that
+/// cannot match the live owner and the handover never completes. Matching the
+/// live process's own reading picks the owner whichever way the clock moved.
+#[test]
+fn resolve_creation_ticks_matches_the_live_process_not_the_newest_claim() {
+    assert_eq!(
+        resolve_creation_ticks(Some(8000), &[Some(9000), Some(8000)]),
+        Some(8000),
+        "the live process's own reading must win over a larger stale claim"
+    );
+    assert_eq!(
+        resolve_creation_ticks(Some(8000), &[Some(8000), Some(9000)]),
+        Some(8000),
+        "the answer must not depend on the order the stamps were read in"
+    );
+    // Nothing recorded belongs to the live process, so ownership is not
+    // proved: refuse (fail-closed) rather than kill on a guess.
+    assert_eq!(resolve_creation_ticks(Some(8000), &[Some(9000)]), None);
+    assert_eq!(resolve_creation_ticks(Some(8000), &[None]), None);
+}
+
+/// Without a kernel reading -- every non-Windows platform -- the greatest
+/// claim still wins, and a legacy stamp never displaces a recorded time.
+#[test]
+fn resolve_creation_ticks_falls_back_to_the_newest_claim() {
+    assert_eq!(
+        resolve_creation_ticks(None, &[Some(9000), Some(8000)]),
+        Some(9000)
+    );
+    assert_eq!(
+        resolve_creation_ticks(None, &[Some(8000), Some(9000)]),
+        Some(9000)
+    );
+    assert_eq!(
+        resolve_creation_ticks(None, &[None, Some(9000)]),
+        Some(9000)
+    );
+    assert_eq!(resolve_creation_ticks(None, &[None, None]), None);
 }
