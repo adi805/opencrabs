@@ -402,6 +402,45 @@ impl EvolveTool {
         // at debug so a future incident can still see whether the unlink
         // succeeded (helps distinguish "rename failed because exe was
         // busy" from "rename failed because directory is read-only" etc.).
+        // Windows cannot unlink a running image at all: the OS keeps the file
+        // open for the mapped executable, so remove_file always fails with
+        // sharing violation (32) AND the subsequent rename onto the path
+        // fails too. What Windows DOES allow is renaming a loaded exe — the
+        // mapping follows the file, not the path. So move the live binary
+        // aside to a sibling name first; the shared `rename(tmp -> exe)`
+        // below then lands unobstructed, and the existing health-check
+        // rollback (which renames the backup copy back) keeps working
+        // unchanged. The .old sibling is cleaned up next to the backup.
+        #[cfg(windows)]
+        {
+            let aside_path = {
+                let mut p = exe_path.clone().into_os_string();
+                p.push(".old");
+                std::path::PathBuf::from(p)
+            };
+            // A previous interrupted evolve can leave .old behind, and
+            // rename() does not overwrite on Windows.
+            let _ = std::fs::remove_file(&aside_path);
+            if let Err(e) = std::fs::rename(&exe_path, &aside_path) {
+                tracing::warn!(
+                    target: "evolve",
+                    exe_path = %exe_path.display(),
+                    aside = %aside_path.display(),
+                    error = %e,
+                    session_id = %sid,
+                    "evolve: could not move the running exe aside"
+                );
+                let _ = std::fs::remove_file(&tmp_path);
+                return Ok(ToolResult::error(format!(
+                    "Cannot replace the running binary at {} on Windows: {e}. \
+                     The update download is intact; stop this process (scheduled task or \
+                     `opencrabs service stop`) and re-run evolve to swap it in.",
+                    exe_path.display()
+                )));
+            }
+        }
+
+        #[cfg(not(windows))]
         if let Err(e) = std::fs::remove_file(&exe_path) {
             tracing::debug!(
                 target: "evolve",
@@ -430,6 +469,14 @@ impl EvolveTool {
         // Post-swap verification
         if let Err(reason) = health_check_binary(&exe_path).await {
             if backup_path.exists() {
+                // Windows rename cannot overwrite an existing path, so clear
+                // the health-check-failed exe first. It is no longer a loaded
+                // image (the running process is served by the .old copy), so
+                // the delete should succeed; if it does not, the rename below
+                // lands in the CRITICAL arm with a truthful error. On Unix
+                // rename(2) replaces atomically — nothing to do.
+                #[cfg(windows)]
+                let _ = std::fs::remove_file(&exe_path);
                 if let Err(e) = std::fs::rename(&backup_path, &exe_path) {
                     tracing::error!(
                         target: "evolve",
@@ -472,6 +519,17 @@ impl EvolveTool {
         }
 
         let _ = std::fs::remove_file(&backup_path);
+        // Success: the moved-aside .old copy is dead weight — this process
+        // is served by its image mapping, not its directory entry. Best
+        // effort: a leftover .old is removed at the start of the next
+        // evolve's move-aside, so a crash here never accumulates cruft
+        // beyond one file.
+        #[cfg(windows)]
+        {
+            let mut p = exe_path.clone().into_os_string();
+            p.push(".old");
+            let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+        }
 
         // Extract the bundled RTK binary from the same archive.
         // The release workflow packs `rtk` alongside `opencrabs` into the
