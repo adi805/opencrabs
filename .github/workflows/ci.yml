@@ -358,15 +358,25 @@ jobs:
           # per-module zero-detection here is a SCREAM (module renamed, not
           # yet merged, or renamed by a sibling PR), not a pass -- the same
           # anti-fake-green principle the footgun gate's --self-test enforces.
+          # Actions' bash runs with -e, so an unguarded substitution exits AT
+          # the assignment and `rc=$?` below is never reached: the loop would
+          # abort on the first failing module, print none of the captured
+          # output, and skip every module after it. The smoke step above
+          # carries the same guard for the same reason. One more trap: with
+          # `--lib`, cargo writes "test result: FAILED. N passed" on failure,
+          # so parsing `$out` must not assume the ok-form.
           status=0
           for m in config::winlock cli::service_windows tests::utils_shell_test \
                    tests::utils_cwd_test tests::browser_default_windows_test; do
+            set +e
             out=$(cargo test --locked --profile ci --target x86_64-pc-windows-msvc \
                     --lib -- "$m" 2>&1)
             rc=$?
-            n=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | head -n1)
+            set -e
+            n=$(printf '%s\n' "$out" | sed -n 's/^test result: [a-z]*\. \([0-9]*\) passed.*/\1/p' | head -n1)
+            failed=$(printf '%s\n' "$out" | sed -n 's/.*; \([0-9]*\) failed.*/\1/p' | head -n1)
             if [ $rc -ne 0 ]; then
-              echo "::warning::Windows slice FAILS ($rc): $m"
+              echo "::warning::Windows slice FAILS (rc=$rc, failed=${failed:-?}): $m"
               printf '%s\n' "$out" | tail -20
               status=1
             elif [ -z "$n" ] || [ "$n" -eq 0 ]; then
