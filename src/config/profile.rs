@@ -1185,15 +1185,50 @@ pub(crate) struct ForeignOwner {
     pub(crate) channels: Vec<String>,
 }
 
-/// Resolve two creation-time claims for one PID down to the one that can
-/// belong to the live process. `Option::max` is the whole rule and it is the
-/// right one: a process that dies holding a PID leaves its stamp behind, and
-/// whoever inherits that PID is created strictly later, so the greatest
-/// creation time is the live owner's. `None` -- a legacy or non-Windows stamp
-/// -- sorts below every real creation time, so it never wins and never erases
-/// a value that was already recorded.
+/// Fold two creation-time claims for one PID down to the newest. This is the
+/// fallback for when the kernel cannot be asked for the live process's own
+/// reading: a process that dies holding a PID leaves its stamp behind, and on
+/// a clock that only moves forward whoever inherits that PID is created
+/// strictly later, so the greatest claim is the live owner's. `None` -- a
+/// legacy or non-Windows stamp -- sorts below every real creation time, so it
+/// never wins and never erases a value that was already recorded.
 fn newest_ticks(current: Option<u64>, candidate: Option<u64>) -> Option<u64> {
     current.max(candidate)
+}
+
+/// The live process's own creation time, when the OS can be asked for it.
+/// Windows only: it is the one platform whose stamps carry a creation time
+/// and whose handover proves birth before killing, so it is the only one
+/// where picking the wrong claim can matter.
+#[cfg(windows)]
+fn live_creation_ticks(pid: u32) -> Option<u64> {
+    crate::config::winlock::creation_ticks_of(pid)
+}
+
+/// Every other platform writes a bare PID into its stamps, so there is no
+/// recorded time to match against.
+#[cfg(not(windows))]
+fn live_creation_ticks(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Resolve every creation-time claim recorded for one live PID down to the one
+/// that can belong to the process holding it now.
+///
+/// `live` is the kernel's own reading for that PID, when it could be taken.
+/// With it, only an EXACT match proves ownership: a claim that disagrees
+/// belongs to a process that died holding the PID. Comparing against the live
+/// process instead of between two claims is what makes this immune to a wall
+/// clock that stepped backward between the two births -- taking the greatest
+/// claim would then hand `terminate` the corpse's creation time, its birth
+/// proof would refuse the real owner, and the handover would never complete.
+/// Without a reading (non-Windows, or a refused handle) the greatest claim
+/// wins, which is order-independent.
+pub(crate) fn resolve_creation_ticks(live: Option<u64>, claims: &[Option<u64>]) -> Option<u64> {
+    match live {
+        Some(live) => claims.contains(&Some(live)).then_some(live),
+        None => claims.iter().copied().fold(None, newest_ticks),
+    }
 }
 
 /// Map every *live, foreign* lock owner for the active profile to the
@@ -1207,6 +1242,10 @@ pub(crate) fn foreign_lock_owners(
     let current_profile = active_profile().unwrap_or("default");
     let self_pid = std::process::id();
     let mut owners: std::collections::BTreeMap<u32, ForeignOwner> = Default::default();
+    // Every creation-time claim read for each PID, kept until the whole
+    // directory has been scanned: resolution needs them all at once, see
+    // [`resolve_creation_ticks`].
+    let mut claims: std::collections::BTreeMap<u32, Vec<Option<u64>>> = Default::default();
 
     let entries = match fs::read_dir(lock_dir) {
         Ok(e) => e,
@@ -1244,16 +1283,19 @@ pub(crate) fn foreign_lock_owners(
             .map(|(c, _)| c.to_string())
             .unwrap_or(fname);
         let owner = owners.entry(pid).or_default();
+        owner.channels.push(channel);
         // Several locks can name one PID. When that PID was reused, one stamp
         // belongs to a process that died holding it and another to the live
-        // owner, and they disagree about the creation time. Keeping whichever
-        // file `read_dir` happens to return first makes the answer depend on
-        // directory order: `terminate` then gets the dead process's creation
-        // time, its creation-time proof rejects the real owner, and the
-        // handover never completes. The maximum is order-independent and is
-        // the live owner by the argument on [`newest_ticks`].
-        owner.creation_ticks = newest_ticks(owner.creation_ticks, ticks);
-        owner.channels.push(channel);
+        // owner, and they disagree about the creation time. Hold every claim
+        // until the directory is fully scanned, then resolve once: the answer
+        // needs the live process's own reading, not the order `read_dir`
+        // happened to return the files in.
+        claims.entry(pid).or_default().push(ticks);
+    }
+    for (pid, owner) in owners.iter_mut() {
+        if let Some(claims) = claims.get(pid) {
+            owner.creation_ticks = resolve_creation_ticks(live_creation_ticks(*pid), claims);
+        }
     }
     owners
 }
