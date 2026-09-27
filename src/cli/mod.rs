@@ -10,6 +10,7 @@ pub(crate) mod daemon_health;
 pub(crate) mod doctor_fix;
 pub(crate) mod headless_callbacks;
 pub(crate) mod migrate;
+#[cfg(windows)]
 pub(crate) mod service_windows;
 pub(crate) mod session_notify;
 pub(crate) mod session_resolve;
