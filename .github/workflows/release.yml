@@ -245,6 +245,24 @@ jobs:
         # narrowed (#1402).
         run: cargo build --locked --release --target ${{ matrix.target }} --all-features
 
+      - name: "Smoke (windows): execute the shipping artifact before packaging"
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          # The ci.yml smoke runs the ci-profile binary; this one runs the
+          # release-profile binary that actually ships in
+          # opencrabs-v<version>-windows-amd64.zip (different LTO/codegen
+          # shape, different link). If it dies on DLL load or console
+          # init, stop before packaging so a dead artifact never reaches
+          # the download page. Greptile P1 finding on the #2 smoke.
+          set +e
+          ver=$(./target/${{ matrix.target }}/release/${{ matrix.artifact_name }} --version 2>&1)
+          status=$?
+          set -e
+          echo "exit=$status version=$ver"
+          [ "$status" -eq 0 ] || exit 1
+          echo "$ver" | grep -qi opencrabs
+
       - name: Download and bundle RTK 0.40.0
         shell: bash
         run: |
