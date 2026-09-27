@@ -1950,7 +1950,11 @@ fn service_identifiers() -> (String, String, String) {
 }
 
 /// Build the daemon arguments, including `-p <profile>` when a named profile is active.
-fn daemon_args() -> Vec<String> {
+///
+/// `pub(crate)` because the onboarding wizard's Windows arm registers the same
+/// task action the `service install` verb does, and it must not invent its own
+/// argument list.
+pub(crate) fn daemon_args() -> Vec<String> {
     let mut args = Vec::new();
     if let Some(name) = crate::config::profile::active_profile()
         && name != "default"
