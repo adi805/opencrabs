@@ -231,7 +231,7 @@ pub fn terminate(pid: u32, stamped_at: std::time::SystemTime) -> io::Result<()> 
                             }
                         }
                         Some(_) => Err(io::Error::new(
-                            io::ErrorKind::Stale,
+                            io::ErrorKind::NotFound,
                             format!(
                                 "refusing to terminate PID {pid}: same image, but the process \
                                  was created after the lock stamp was written (PID reuse)"
