@@ -325,7 +325,12 @@ impl SelfUpdater {
         let _child = std::process::Command::new(binary_path)
             .args(["chat", "--session", &session_id.to_string()])
             .env("OPENCRABS_EVOLVED_FROM", crate::VERSION)
-            .stdin(std::process::Stdio::null())
+            // Deliberately NO .stdin() override: when all three stdio knobs
+            // stay at inherit, Rust omits STARTF_USESTDHANDLES and Windows
+            // binds the child's standard handles to its NEW console. Passing
+            // Stdio::null() looked tidy but handed the successor the NUL
+            // device as STD_INPUT, so the restarted TUI could never see a
+            // keystroke.
             .creation_flags(CREATE_NEW_CONSOLE)
             .spawn()
             .map_err(|e| anyhow::anyhow!("restart spawn failed: {e}"))?;
