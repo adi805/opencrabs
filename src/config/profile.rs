@@ -1177,11 +1177,12 @@ pub struct PreemptedInstance {
 /// One foreign lock owner found by [`foreign_lock_owners`]: the channels it
 /// held, and -- on Windows stamps -- the creation time it recorded, which
 /// [`crate::config::winlock::terminate`] needs to tell the real owner from a
-/// process that merely inherited its PID.
+/// process that merely inherited its PID. `pub(crate)`, fields included,
+/// because the sibling test module asserts on what a scan found.
 #[derive(Default)]
-struct ForeignOwner {
-    creation_ticks: Option<u64>,
-    channels: Vec<String>,
+pub(crate) struct ForeignOwner {
+    pub(crate) creation_ticks: Option<u64>,
+    pub(crate) channels: Vec<String>,
 }
 
 /// Resolve two creation-time claims for one PID down to the one that can
