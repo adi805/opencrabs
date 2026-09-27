@@ -96,17 +96,20 @@ impl TriggerRunner {
     }
 
     /// Run the given shell command under the platform shell with the
-    /// configured timeout: `sh -c` on unix, `cmd /C` on Windows. Hardcoding
-    /// `/bin/sh -c` here compiles green on the windows build but fails at
-    /// runtime on every trigger -- exactly the "starts vs ships" class the
-    /// footgun gate exists to catch. Uses shell_pair so this stays aligned
-    /// with the shell the rest of the app picks (#7 will add a probe; the
-    /// POSIX-vs-cmd dialect gap for trigger snippets is tracked there).
+    /// configured timeout. This is the repo's own shell contract
+    /// ([`crate::utils::shell::shell_pair`] + `PushShellCommand`), not a
+    /// hand-rolled `.arg()`: cmd.exe does not parse MSVCRT-escaped argv, so
+    /// a quoted payload like `dir "C:\Program Files"` must ride through as
+    /// raw text (raw_arg), while unix keeps plain .arg semantics.
+    /// Hardcoding `/bin/sh -c` here compiles green on the windows build but
+    /// fails at runtime on every trigger -- exactly the "starts vs ships"
+    /// class the footgun gate exists to catch. The POSIX-vs-cmd dialect
+    /// gap for trigger snippets is tracked as #7.
     pub async fn run(&self, cmd: &str) -> Result<TriggerResult, String> {
+        use crate::utils::shell::PushShellCommand;
         let (shell, shell_arg) = crate::utils::shell::shell_pair();
         let child = Command::new(shell)
-            .arg(shell_arg)
-            .arg(cmd)
+            .push_shell_command(shell_arg, cmd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             // On timeout the future below is dropped, and a tokio Child does
