@@ -95,6 +95,8 @@ unsafe extern "system" {
         overlapped: *const Overlapped,
     ) -> i32;
     fn OpenProcess(desired_access: u32, inherit: i32, pid: u32) -> RawHandle;
+    /// Pseudo-handle for this process (`(HANDLE)-1`); never needs closing.
+    fn GetCurrentProcess() -> RawHandle;
     fn TerminateProcess(process: RawHandle, exit_code: u32) -> i32;
     fn CloseHandle(object: RawHandle) -> i32;
     fn QueryFullProcessImageNameW(
@@ -126,22 +128,33 @@ impl Filetime {
     }
 }
 
-/// 1601-01-01 → 1970-01-01 in 100ns ticks (369 years).
-const WINDOWS_TICKS_BEFORE_UNIX: u64 = 116_444_736_000_000_000;
-
-/// Slack for the birth check, in 100ns ticks (2 s). A file's LastWriteTime
-/// is not guaranteed to be as fine as the process creation time it is
-/// compared against: FAT carries 2 s DOS time, and SMB plus some filter
-/// drivers coarsen what the API reports. Without this slack a stamp
-/// written microseconds after the owner started can read as OLDER than the
-/// owner, and the check then refuses the handover it exists to perform.
-/// The image-path match still gates on "same executable", so a recycled
-/// PID has to reappear within the slack to be mistaken for the owner.
-const MTIME_COARSENESS_TICKS: u64 = 20_000_000;
-
-fn system_time_ticks(t: io::Result<std::time::SystemTime>) -> Option<u64> {
-    let d = t.ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
-    Some(WINDOWS_TICKS_BEFORE_UNIX + d.as_secs() * 10_000_000 + (d.subsec_nanos() as u64) / 100)
+/// Creation time of THIS process, in Win32 100ns ticks, or `None` if the
+/// query fails. The lock-stamp writer calls this at lock time and records the
+/// result, so [`terminate`] can compare the target's creation time against the
+/// owner's own reading of the SAME kernel32 clock. That exactness is the point:
+/// the alternative -- comparing the target's creation time to the lock file's
+/// mtime -- spans two clocks of different resolution, and inside the coarser
+/// one a legitimate owner and a recycled PID look identical. See [`terminate`].
+///
+/// On failure the caller writes a stamp with no creation field, and
+/// [`terminate`] then refuses the kill rather than trusting a bare PID.
+pub fn own_creation_ticks() -> Option<u64> {
+    let mut creation = Filetime { low: 0, high: 0 };
+    let mut ignored = Filetime { low: 0, high: 0 };
+    // `GetProcessTimes` wants `*mut FILETIME` for all four outputs, and a raw
+    // pointer parameter is where the borrow of `ignored` ends, so reusing one
+    // local for exit/kernel/user is accepted (each `&mut` is a fresh temporary
+    // coerced at the call). Only `creation` is ever read.
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut ignored,
+            &mut ignored,
+            &mut ignored,
+        )
+    };
+    (ok != 0).then(|| creation.ticks())
 }
 
 /// Exclusive whole-file lock on `handle`, mirroring `flock::exclusive`
@@ -185,23 +198,48 @@ pub fn unlock(handle: RawHandle) -> io::Result<()> {
 /// process holding the number now. Two independent proofs, both required:
 ///  1. IMAGE PATH: kernel32's full image path of the target, compared
 ///     (case-insensitively) against this process's own `current_exe()`.
-///  2. BIRTH TIME: `GetProcessTimes` creation vs the stamp file's
-///     `stamped_at` mtime. A process born AFTER the stamp was last written
-///     cannot have written it; so whatever it is, it is not the owner, and
-///     the PID was recycled under a stale stamp. (The range lock proves
-///     nothing about who holds it; the file stamp is not an OS lock.)
-///     Because an mtime can be coarser than a process creation time, the
-///     comparison allows MTIME_COARSENESS_TICKS before concluding reuse.
-/// Anything unverifiable (unreadable image, failed time query, missing
-/// mtime) we do NOT kill. "Leaves a stubborn instance running" always
-/// beats "kills something unrelated the user is doing".
-pub fn terminate(pid: u32, stamped_at: std::time::SystemTime) -> io::Result<()> {
+///  2. CREATION TIME: `GetProcessTimes` creation of the target, compared for
+///     EXACT equality against the creation time the owner recorded in its own
+///     stamp. The owner asks kernel32 for its own creation time when it takes
+///     the lock, so both numbers come from one clock; a stale stamp therefore
+///     cannot authorise a kill even if Windows recycled the PID, because the
+///     process now holding that number was created at a different instant.
+///
+/// Why not compare the target's creation time to the lock file's mtime, as an
+/// earlier revision did: that spans two clocks of different resolution. Inside
+/// the coarser one (FAT carries 2 s DOS time; SMB and some filter drivers
+/// coarsen LastWriteTime) a legitimate owner and a recycled PID are
+/// indistinguishable, so no slack value is safe -- slack wide enough to admit
+/// the real owner also admits a recycled PID, and slack tight enough to reject
+/// the recycled PID also rejects the real owner. Recording the owner's own
+/// creation time removes the ambiguity instead of trading one failure for the
+/// other.
+///
+/// `expected_creation_ticks` is `None` when the stamp predates the creation
+/// field (or the owner could not query its own creation time). That cannot
+/// prove ownership, so it is refused. Anything else unverifiable (unreadable
+/// image, failed time query) is refused too: we do NOT kill. "Leaves a
+/// stubborn instance running" always beats "kills something unrelated the user
+/// is doing".
+pub fn terminate(pid: u32, expected_creation_ticks: Option<u64>) -> io::Result<()> {
     const PROCESS_TERMINATE: u32 = 0x0001;
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 
     let self_exe = match normalize_exe_path(&std::env::current_exe()?) {
         Some(p) => p,
         None => return Err(io::Error::other("cannot resolve own exe path")),
+    };
+
+    // Fail closed before touching the process: a stamp with no recorded
+    // creation time cannot distinguish the owner from a recycled PID.
+    let Some(expected) = expected_creation_ticks else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to terminate PID {pid}: the lock stamp records no creation time, \
+                 so PID reuse cannot be ruled out"
+            ),
+        ));
     };
 
     // One handle, both rights: query the image to verify identity, and
@@ -223,9 +261,9 @@ pub fn terminate(pid: u32, stamped_at: std::time::SystemTime) -> io::Result<()> 
         let path = String::from_utf16_lossy(&buf[..size as usize]);
         match normalize_exe_path(std::path::Path::new(&path)) {
             Some(target) if target == self_exe => {
-                // Image matches; now prove the process is older than the
-                // stamp it supposedly wrote. All four time outputs are
-                // required by the API shape; only creation is read.
+                // Image matches; now prove this is the process that wrote the
+                // stamp, by creation time. All four time outputs are required
+                // by the API shape; only creation is read.
                 let mut creation = Filetime { low: 0, high: 0 };
                 let mut ignored = Filetime { low: 0, high: 0 };
                 if unsafe {
@@ -233,30 +271,21 @@ pub fn terminate(pid: u32, stamped_at: std::time::SystemTime) -> io::Result<()> 
                 } == 0
                 {
                     Err(io::Error::last_os_error())
-                } else {
-                    match system_time_ticks(Ok(stamped_at)) {
-                        Some(stamp) if creation.ticks() <= stamp.saturating_add(MTIME_COARSENESS_TICKS) => {
-                            if unsafe { TerminateProcess(h, 1) } != 0 {
-                                Ok(())
-                            } else {
-                                Err(io::Error::last_os_error())
-                            }
-                        }
-                        Some(_) => Err(io::Error::new(
-                            io::ErrorKind::NotFound,
-                            format!(
-                                "refusing to terminate PID {pid}: same image, but the process \
-                                 was created after the lock stamp was written (PID reuse)"
-                            ),
-                        )),
-                        None => Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!(
-                                "refusing to terminate PID {pid}: stamp mtime unreadable, \
-                                 PID reuse cannot be ruled out"
-                            ),
-                        )),
+                } else if creation.ticks() == expected {
+                    if unsafe { TerminateProcess(h, 1) } != 0 {
+                        Ok(())
+                    } else {
+                        Err(io::Error::last_os_error())
                     }
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "refusing to terminate PID {pid}: same image, but the process \
+                             was created at a different instant than the lock stamp records \
+                             (PID reuse)"
+                        ),
+                    ))
                 }
             }
             Some(_) => Err(io::Error::new(
@@ -289,6 +318,18 @@ fn normalize_exe_path(p: &std::path::Path) -> Option<String> {
 mod tests {
     use super::*;
     use std::os::windows::io::AsRawHandle;
+
+    /// The stamp's creation field is what makes the birth proof exact, so it
+    /// must be present on Windows: a `None` here would make every stamp
+    /// unverifiable and the handover refuse -- fail-closed, but useless. The
+    /// value must also be STABLE, since `terminate` compares it for equality.
+    #[test]
+    fn own_creation_ticks_is_present_and_stable() {
+        let a = own_creation_ticks().expect("GetProcessTimes must work on Windows");
+        let b = own_creation_ticks().expect("GetProcessTimes must work on Windows");
+        assert_eq!(a, b, "a process's creation time must not change");
+        assert!(a > 0, "a creation time of zero means the query lied");
+    }
 
     /// Range-lock contention is per-HANDLE, so a second handle to the same
     /// file in the SAME process contends exactly like a second process.
