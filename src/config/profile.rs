@@ -1175,6 +1175,36 @@ fn foreign_lock_owners(lock_dir: &Path) -> std::collections::BTreeMap<u32, Vec<S
     owners
 }
 
+/// Newest mtime among `dir`'s lock files stamped `profile:pid`. This is the
+/// evidence winlock::terminate's birth proof consumes: the owner process
+/// must predate the stamp it allegedly wrote. Windows-only caller.
+#[cfg(windows)]
+fn stamp_mtime_for(lock_dir: &Path, profile: &str, pid: u32) -> Option<std::time::SystemTime> {
+    let mut best: Option<std::time::SystemTime> = None;
+    let entries = fs::read_dir(lock_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("lock") {
+            continue;
+        }
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some((prof, pid_field)) = contents.trim().split_once(':') else {
+            continue;
+        };
+        if prof != profile || parse_lock_owner_pid(pid_field) != Some(pid) {
+            continue;
+        }
+        if let Ok(meta) = path.metadata() {
+            if let Ok(t) = meta.modified() {
+                best = Some(best.map_or(t, |b| b.max(t)));
+            }
+        }
+    }
+    best
+}
+
 /// TUI priority: shut down any OTHER live instance of the active profile
 /// that currently holds channel token locks, so the interactive session
 /// can take over the channels.
@@ -1238,7 +1268,42 @@ pub(crate) fn parse_launchctl_labels(output: &str) -> Vec<String> {
 }
 
 pub(crate) fn preempt_instances_in(lock_dir: &Path, stop_services: bool) -> Vec<PreemptedInstance> {
-    let owners = foreign_lock_owners(lock_dir);
+    let mut owners = foreign_lock_owners(lock_dir);
+
+    // Windows handover gap (tracked as #6): a daemon with NO enabled
+    // channels holds only the instance lock under locks/instance/, which
+    // the token scan above never sees. The TUI then gets `Held`, preemption
+    // finds nobody, and the handover dies in its retry loop. Consult the
+    // instance stamp as a fallback owner source; the kill is still gated
+    // by winlock::terminate's image AND birth proofs, so a stale instance
+    // stamp gets refused exactly like a stale token stamp.
+    #[cfg(windows)]
+    {
+        if owners.is_empty() {
+            let profile = active_profile().unwrap_or_else(|| "default".to_string());
+            let ipath = lock_dir.join("instance").join(format!("{profile}.lock"));
+            if let (Ok(contents), Ok(meta)) = (fs::read_to_string(&ipath), ipath.metadata()) {
+                if let Some(pid) = contents.trim().parse::<u32>().ok() {
+                    if pid != std::process::id() && is_pid_alive(pid) {
+                        let stamped = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                        match crate::config::winlock::terminate(pid, stamped) {
+                            Ok(()) => {
+                                owners.insert(pid, vec!["instance".to_string()]);
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    pid,
+                                    error = %e,
+                                    "preempt: instance-lock owner rejected by fail-closed verify"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if owners.is_empty() {
         return Vec::new();
     }
@@ -1318,9 +1383,17 @@ pub(crate) fn preempt_instances_in(lock_dir: &Path, stop_services: bool) -> Vec<
     // loop below gives the same exit window SIGTERM would, and the
     // stopped-flag computation is already platform-agnostic.
     #[cfg(windows)]
-    for &pid in owners.keys() {
-        if let Err(e) = crate::config::winlock::terminate(pid) {
-            tracing::debug!(pid, error = %e, "preempt: TerminateProcess failed");
+    {
+        let profile = active_profile().unwrap_or_else(|| "default".to_string());
+        for &pid in owners.keys() {
+            // Feed terminate the newest mtime among this profile's stamps
+            // naming the PID; no readable stamp mtime degrades to
+            // UNIX_EPOCH, which the birth proof rejects (fail-closed).
+            let stamped = stamp_mtime_for(lock_dir, &profile, pid)
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            if let Err(e) = crate::config::winlock::terminate(pid, stamped) {
+                tracing::debug!(pid, error = %e, "preempt: TerminateProcess refused or failed");
+            }
         }
     }
 
