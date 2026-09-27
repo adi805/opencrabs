@@ -85,6 +85,12 @@ unsafe extern "system" {
     fn OpenProcess(desired_access: u32, inherit: i32, pid: u32) -> RawHandle;
     fn TerminateProcess(process: RawHandle, exit_code: u32) -> i32;
     fn CloseHandle(object: RawHandle) -> i32;
+    fn QueryFullProcessImageNameW(
+        process: RawHandle,
+        flags: u32,
+        exe_name: *mut u16,
+        size: *mut u32,
+    ) -> i32;
 }
 
 /// Exclusive whole-file lock on `handle`, mirroring `flock::exclusive`
@@ -119,25 +125,70 @@ pub fn unlock(handle: RawHandle) -> io::Result<()> {
     }
 }
 
-/// Hard stop for the Windows preempt path. Unix has a polite rung (SIGTERM)
-/// and a rude one (SIGKILL); a headless Windows console process has no
-/// signal channel at all, so this is the rude rung only. That is exactly why
-/// the caller must hold positive ownership evidence — an alive PID stamped
-/// into a lock file whose range we could not take — before reaching here.
-/// Never call it for a PID we merely suspect.
+/// Hard stop for the Windows preempt path — FAIL-CLOSED on target identity.
+///
+/// Unix has a polite rung (SIGTERM) and a rude one (SIGKILL); a headless
+/// Windows console process has no signal channel at all, so this is the rude
+/// rung only. That is exactly why a PID alone must not pull the trigger:
+/// Windows recycles PIDs, and a stale lock stamp can name an unrelated
+/// process holding the number now. So we open the process, ask kernel32 for
+/// its FULL IMAGE PATH, and compare it (case-insensitively) against this
+/// process's own `current_exe()`. Not us — or unreadable — we do NOT kill.
+/// "Leaves a stubborn instance running" always beats "kills something
+/// unrelated the user is doing".
 pub fn terminate(pid: u32) -> io::Result<()> {
     const PROCESS_TERMINATE: u32 = 0x0001;
-    let h = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+    let self_exe = match normalize_exe_path(&std::env::current_exe()?) {
+        Some(p) => p,
+        None => return Err(io::Error::other("cannot resolve own exe path")),
+    };
+
+    // One handle, both rights: query the image to verify identity, and
+    // terminate only once verified.
+    let rights = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+    let h = unsafe { OpenProcess(rights, 0, pid) };
     if h.is_null() {
         return Err(io::Error::last_os_error());
     }
-    let ok = unsafe { TerminateProcess(h, 1) };
-    unsafe { CloseHandle(h) };
-    if ok != 0 {
-        Ok(())
-    } else {
+
+    let mut buf = [0u16; 32_768];
+    let mut size = buf.len() as u32;
+    let queried = unsafe { QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size) };
+    let outcome = if queried == 0 {
+        // Cannot read the image path of the thing we were about to kill:
+        // that IS the fail-closed condition, not a nuisance.
         Err(io::Error::last_os_error())
-    }
+    } else {
+        let path = String::from_utf16_lossy(&buf[..size as usize]);
+        match normalize_exe_path(std::path::Path::new(&path)) {
+            Some(target) if target == self_exe => {
+                if unsafe { TerminateProcess(h, 1) } != 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }
+            Some(_) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("refusing to terminate PID {pid}: image {path:?} is not this binary"),
+            )),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to terminate PID {pid}: unreadable image path {path:?}"),
+            )),
+        }
+    };
+    unsafe { CloseHandle(h) };
+    outcome
+}
+
+/// Lowercase + trim trailing separators so two `\\?\`-normalized Win32 paths
+/// compare case-insensitively (short paths and the current one can differ in
+/// case and separator style while naming the same file).
+fn normalize_exe_path(p: &std::path::Path) -> Option<String> {
+    Some(p.to_string_lossy().to_lowercase().trim_end_matches('\\').to_string())
 }
 
 #[cfg(test)]
