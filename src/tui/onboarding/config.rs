@@ -1288,7 +1288,12 @@ fn install_daemon_service() -> Result<(), String> {
         install_launchagent()
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        install_scheduled_task()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         Err("Daemon installation not supported on this platform".to_string())
     }
@@ -1319,6 +1324,33 @@ OOMPolicy=continue
 WantedBy=default.target
 "#
     )
+}
+
+/// Windows autostart for the daemon the wizard was asked to install: the same
+/// Scheduled Task the `service install` verb registers. This platform used to
+/// fall through to an Err that the caller only logged as a warning, so a user
+/// who ticked "install daemon" finished onboarding with nothing installed and
+/// no message saying so.
+#[cfg(target_os = "windows")]
+fn install_scheduled_task() -> Result<(), String> {
+    use crate::cli::service_windows as st;
+
+    let exe = std::env::current_exe().map_err(|e| format!("Failed to get exe path: {e}"))?;
+    let args = crate::cli::commands::daemon_args();
+    let profile = crate::config::profile::active_profile();
+    let suffix = match profile {
+        Some(name) if name != "default" => format!(".{name}"),
+        _ => String::new(),
+    };
+    let task = format!("com.opencrabs.daemon{suffix}");
+    let label = profile.unwrap_or("default");
+    let desc = format!("OpenCrabs daemon [{label}]. Registered by the onboarding wizard.");
+
+    match st::run_script(&st::install_script(&task, &exe, &args, &desc)) {
+        st::TaskResult::Ok(_) => Ok(()),
+        st::TaskResult::Missing => Err("the task scheduler rejected the registration".to_string()),
+        st::TaskResult::Failed(e) => Err(e),
+    }
 }
 
 #[cfg(target_os = "linux")]
