@@ -60,15 +60,20 @@ pub fn join_arguments(args: &[String]) -> String {
 /// Settings: `-StartWhenAvailable` catches a missed logon (machine asleep,
 /// laptop lid); `-ExecutionTimeLimit Zero` stops the scheduler killing a
 /// long-running daemon at its default 72h; `-MultipleInstances IgnoreNew`
-/// stops a second logon stacking daemons — the instance lock (#3) is the
+/// stops a second logon stacking daemons; the instance lock (#3) is the
 /// backstop, but the task layer should not be racing it on purpose.
+/// `-RestartCount 3 -RestartInterval 1min` restarts a CRASHED daemon:
+/// without it the logon trigger alone means "dead until next login",
+/// which is not the always-on promise `service status` makes. The
+/// interval is only between retry attempts, not a rate limit on runs.
 pub fn install_script(task: &str, binary: &Path, args: &[String], description: &str) -> String {
     format!(
         "$ErrorActionPreference='Stop'; \
          $a = New-ScheduledTaskAction -Execute {exe} -Argument {arg}; \
          $t = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME; \
          $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries \
-         -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero); \
+         -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) \
+         -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); \
          Register-ScheduledTask -TaskName {name} -Action $a -Trigger $t -Settings $s \
          -Description {desc} -Force | Out-Null; \
          'ok'",
@@ -93,20 +98,26 @@ pub fn stop_script(task: &str) -> String {
     )
 }
 
-/// Arm or disarm the logon trigger without deleting the registration:
-/// `disable` is what "keep the binary but stop autostarting" means here,
-/// mirroring `systemctl disable` more than `uninstall`.
-pub fn enable_script(task: &str) -> String {
+/// Stop AND wait for the action process to actually exit: a bounded poll
+/// (30s, 250ms ticks) on the task's State, exit 1 on timeout so callers
+/// can refuse to proceed. Stop-ScheduledTask only signals; the daemon's
+/// own shutdown (SQLite WAL flush, channel sockets) is asynchronous, and
+/// both `restart` (IgnoreNew would reject the new launch while the old
+/// one still holds the instance lock) and `uninstall` (an unregistered
+/// task cannot be addressed again, orphaning the live process) need the
+/// exit itself, not the signal. A vanished task counts as stopped.
+pub fn stop_and_wait_script(task: &str) -> String {
     format!(
-        "$ErrorActionPreference='Stop'; Enable-ScheduledTask -TaskName {}",
-        ps_str(task)
-    )
-}
-
-pub fn disable_script(task: &str) -> String {
-    format!(
-        "$ErrorActionPreference='Stop'; Disable-ScheduledTask -TaskName {}",
-        ps_str(task)
+        "$ErrorActionPreference='Stop'; Stop-ScheduledTask -TaskName {t} -ErrorAction SilentlyContinue; \
+         $deadline=(Get-Date).AddSeconds(30); \
+         while ($true) {{ \
+           try {{ $t = Get-ScheduledTask -TaskName {t} -ErrorAction Stop }} \
+           catch {{ exit 0 }} \
+           if ($t.State -ne 'Running') {{ exit 0 }} \
+           if ((Get-Date) -gt $deadline) {{ exit 1 }} \
+           Start-Sleep -Milliseconds 250 \
+         }}",
+        t = ps_str(task)
     )
 }
 
@@ -153,7 +164,11 @@ pub struct TaskStatus {
 pub fn parse_status(raw: &str) -> Result<TaskStatus, String> {
     let get = |key: &str| -> String {
         raw.lines()
-            .find_map(|l| l.split_once('|').filter(|(k, _)| *k == key).map(|(_, v)| v.trim().to_string()))
+            .find_map(|l| {
+                l.split_once('|')
+                    .filter(|(k, _)| *k == key)
+                    .map(|(_, v)| v.trim().to_string())
+            })
             .unwrap_or_else(|| "-".to_string())
     };
     if !raw.contains("state|") {
@@ -169,19 +184,35 @@ pub fn parse_status(raw: &str) -> Result<TaskStatus, String> {
     })
 }
 
-/// Locate a PowerShell host: `pwsh` (7+) when present, else the in-box
-/// Windows PowerShell. Returns the program to invoke.
-fn shell_program() -> &'static str {
-    // where.exe is the platform locator; pwsh missing from PATH simply
-    // falls through to the in-box shell, which exists by OS guarantee.
-    let found = std::process::Command::new("where.exe")
-        .arg("pwsh")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if found { "pwsh" } else { "powershell" }
+/// Locate a PowerShell host from TRUSTED ABSOLUTE paths only.
+///
+/// Launching the bare names `where.exe`/`pwsh`/`powershell` meant the
+/// caller's PATH (and any relative entry in it) chose which binary ran
+/// with the user's privileges on every service verb: a planted
+/// `powershell.exe` in the current directory was enough. So there is no
+/// lookup spawn at all any more: prefer the machine-wide MSI location
+/// for pwsh 7, else the in-box Windows PowerShell under System32. Both
+/// candidates sit under package-manager ACLs a plain user cannot swap
+/// a binary into. PATH-discovered pwsh installs lose here on purpose;
+/// every cmdlet this module emits exists in 5.1.
+fn shell_program() -> std::path::PathBuf {
+    let sys_root = std::env::var("SystemRoot")
+        .or_else(|_| std::env::var("windir"))
+        .unwrap_or_else(|_| r"C:\Windows".to_string());
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        let pwsh7 = std::path::Path::new(&pf)
+            .join("PowerShell")
+            .join("7")
+            .join("pwsh.exe");
+        if pwsh7.is_file() {
+            return pwsh7;
+        }
+    }
+    std::path::Path::new(&sys_root)
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe")
 }
 
 /// Outcome of a script run: success with stdout, or a one-line message
@@ -201,10 +232,17 @@ pub fn run_script(script: &str) -> TaskResult {
         return TaskResult::Failed("scheduled tasks are a Windows facility".into());
     }
     let mut cmd = std::process::Command::new(shell_program());
-    cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -212,15 +250,18 @@ pub fn run_script(script: &str) -> TaskResult {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     match cmd.output() {
-        Ok(out) if out.status.success() => TaskResult::Ok(
-            String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        ),
+        Ok(out) if out.status.success() => {
+            TaskResult::Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
         Ok(out) => {
             let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
             // PS 5.1 and 7 phrase "no such task" differently; match the
             // common stems rather than full sentences.
             let lower = err.to_lowercase();
-            if lower.contains("cannot find") || lower.contains("no task") || lower.contains("not exist") {
+            if lower.contains("cannot find")
+                || lower.contains("no task")
+                || lower.contains("not exist")
+            {
                 TaskResult::Missing
             } else {
                 TaskResult::Failed(if err.is_empty() {
@@ -246,7 +287,10 @@ mod tests {
 
     #[test]
     fn ps_str_quotes_and_escapes_literals() {
-        assert_eq!(ps_str(r"C:\Users\joe\opencrabs.exe"), r"'C:\Users\joe\opencrabs.exe'");
+        assert_eq!(
+            ps_str(r"C:\Users\joe\opencrabs.exe"),
+            r"'C:\Users\joe\opencrabs.exe'"
+        );
         assert_eq!(ps_str("it's"), "'it''s'");
         assert_eq!(ps_str("$env:x"), "'$env:x'");
         assert_eq!(ps_str("a; Remove-Item *"), "'a; Remove-Item *'");
@@ -255,7 +299,10 @@ mod tests {
     #[test]
     fn join_arguments_quotes_only_what_needs_it() {
         assert_eq!(join_arguments(&["daemon".into()]), "daemon");
-        assert_eq!(join_arguments(&["-p".into(), "work".into(), "daemon".into()]), "-p work daemon");
+        assert_eq!(
+            join_arguments(&["-p".into(), "work".into(), "daemon".into()]),
+            "-p work daemon"
+        );
         assert_eq!(
             join_arguments(&["-p".into(), "es cap e".into(), "daemon".into()]),
             "-p 'es cap e' daemon"
@@ -272,7 +319,10 @@ mod tests {
             &["daemon".into()],
             "don't; do this",
         );
-        assert!(s.contains(r#"-Execute 'C:\Users\O''Brien\opencrabs.exe'"#), "{s}");
+        assert!(
+            s.contains(r#"-Execute 'C:\Users\O''Brien\opencrabs.exe'"#),
+            "{s}"
+        );
         assert!(s.contains(r#"-Description 'don''t; do this'"#), "{s}");
         assert!(s.contains("-ExecutionTimeLimit ([TimeSpan]::Zero)"));
         assert!(s.contains("-MultipleInstances IgnoreNew"));
@@ -297,10 +347,33 @@ mod tests {
     }
 
     #[test]
-    fn enable_disable_uninstall_target_the_task_by_literal() {
-        assert_eq!(enable_script("t'x"), "$ErrorActionPreference='Stop'; Enable-ScheduledTask -TaskName 't''x'");
+    fn lifecycle_scripts_target_the_task_by_literal() {
         assert!(uninstall_script("t").contains("-Confirm:$false"));
         assert!(stop_script("t").contains("Stop-ScheduledTask"));
+        // quoting must survive a hostile task name in the wait loop too
+        let w = stop_and_wait_script("t'x");
+        assert!(w.contains("Stop-ScheduledTask -TaskName 't''x'"));
+        assert!(w.contains("Get-ScheduledTask -TaskName 't''x'"));
+        assert!(w.contains("exit 1"));
+    }
+
+    #[test]
+    fn install_settings_restart_crashes_and_never_expire() {
+        let s = install_script("t", std::path::Path::new("C:\\bin\\oc.exe"), &[], "d");
+        assert!(s.contains("-RestartCount 3"));
+        assert!(s.contains("-RestartInterval (New-TimeSpan -Minutes 1)"));
+        assert!(s.contains("-ExecutionTimeLimit ([TimeSpan]::Zero)"));
+    }
+
+    #[test]
+    fn shell_program_is_an_absolute_trusted_path() {
+        let p = shell_program();
+        assert!(p.is_absolute(), "must never be a bare PATH name: {p:?}");
+        let leaf = p.file_name().map(|f| f.to_string_lossy().into_owned());
+        assert!(matches!(
+            leaf.as_deref(),
+            Some("pwsh.exe") | Some("powershell.exe")
+        ));
     }
 
     #[test]
