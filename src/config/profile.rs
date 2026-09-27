@@ -724,14 +724,60 @@ pub fn migrate_profile(from: &str, to: &str, force: bool) -> Result<Vec<String>>
 
 // ─── Token Lock ──────────────────────────────────────────────────────
 
-/// Parse the owner PID from the second field of a lock file (`profile:pid`).
+/// Parse the owner PID from the second field of a lock file.
+///
+/// The field is `pid` for every non-Windows writer and `pid:creation-ticks` on
+/// Windows (see [`owner_stamp`]), so the PID is the *leading* `:`-separated
+/// half. Reading the whole field as a number is not a style question: a live
+/// Windows owner's stamp then fails to parse, the caller reads that as
+/// corruption, and it overwrites a lock that was protecting a running instance
+/// -- exactly the double-start this file exists to prevent.
 ///
 /// Returns `None` when the field names no live owner: a missing/zero PID, or a
 /// corrupted value (e.g. an external in-place edit concatenated entries, so the
 /// field is `"101528ops:103104"`). Callers treat `None` as a stale lock to take
 /// over, rather than coercing it to PID 0 (issue #192).
 pub(crate) fn parse_lock_owner_pid(field: &str) -> Option<u32> {
-    field.trim().parse::<u32>().ok().filter(|&p| p != 0)
+    let field = field.trim();
+    let head = match field.split_once(':') {
+        Some((head, _)) => head,
+        None => field,
+    };
+    head.trim().parse::<u32>().ok().filter(|&p| p != 0)
+}
+
+/// Split a stamp's PID field into `(pid, creation_ticks)`, tolerating both the
+/// original `pid` shape and the Windows `pid:ticks` shape.
+///
+/// The ticks half is this process's own creation time, written by
+/// [`owner_stamp`] so [`crate::config::winlock::terminate`] can prove
+/// ownership by exact creation time instead of comparing a lock file's mtime
+/// (a coarser clock) against a process creation time. `None` means the stamp
+/// has no creation field -- an older stamp, or a non-Windows writer -- and the
+/// preempt path then refuses the kill rather than trusting a bare PID.
+pub(crate) fn split_pid_ticks(field: &str) -> Option<(u32, Option<u64>)> {
+    let (pid_field, ticks_field) = match field.trim().split_once(':') {
+        Some((p, t)) => (p, Some(t)),
+        None => (field, None),
+    };
+    let pid = parse_lock_owner_pid(pid_field)?;
+    let ticks = ticks_field.and_then(|t| t.trim().parse::<u64>().ok());
+    Some((pid, ticks))
+}
+
+/// Body of a lock stamp: this process's PID, plus its creation time on
+/// Windows. See [`split_pid_ticks`] for what the extra field buys. A failed
+/// creation-time query writes the bare PID, which the preempt path reads as
+/// unverifiable and refuses -- fail-closed, never a guess.
+fn owner_stamp() -> String {
+    let pid = std::process::id();
+    #[cfg(windows)]
+    {
+        if let Some(ticks) = crate::config::winlock::own_creation_ticks() {
+            return format!("{pid}:{ticks}");
+        }
+    }
+    pid.to_string()
 }
 
 /// Check and acquire a token lock for a channel credential.
@@ -791,7 +837,9 @@ pub fn acquire_token_lock(channel: &str, token_hash: &str) -> Result<()> {
         }
     }
 
-    fs::write(&lock_file, format!("{}:{}", current_profile, pid))?;
+    // `owner_stamp` rather than the bare PID: on Windows the preempt path
+    // needs the owner's creation time to tell it apart from a recycled PID.
+    fs::write(&lock_file, format!("{}:{}", current_profile, owner_stamp()))?;
     Ok(())
 }
 
@@ -806,9 +854,10 @@ pub fn release_token_lock(channel: &str, token_hash: &str) {
 /// Release all locks held by this process.
 pub fn release_all_locks() {
     let lock_dir = base_opencrabs_dir().join("locks");
-    let pid = std::process::id();
     let current_profile = active_profile().unwrap_or("default");
-    let expected = format!("{}:{}", current_profile, pid);
+    // Built from `owner_stamp` so the comparison matches what was written,
+    // creation-time field and all.
+    let expected = format!("{}:{}", current_profile, owner_stamp());
 
     if let Ok(entries) = fs::read_dir(&lock_dir) {
         for entry in entries.flatten() {
@@ -938,7 +987,7 @@ pub(crate) fn acquire_scheduler_lock_in(lock_dir: &Path, profile: &str) -> Optio
         let mut f = &file;
         let _ = f.set_len(0);
         let _ = f.seek(SeekFrom::Start(0));
-        if let Err(e) = write!(f, "{}", std::process::id()) {
+        if let Err(e) = write!(f, "{}", owner_stamp()) {
             tracing::debug!("scheduler lock: could not stamp PID into {path:?}: {e}");
         }
     }
@@ -1003,7 +1052,7 @@ pub fn instance_running(profile: &str) -> bool {
 pub(crate) fn instance_running_in(lock_dir: &Path, profile: &str) -> bool {
     let path = lock_dir.join(format!("{profile}.lock"));
     match fs::read_to_string(&path) {
-        Ok(contents) => contents.trim().parse::<u32>().is_ok_and(is_pid_alive),
+        Ok(contents) => split_pid_ticks(&contents).is_some_and(|(pid, _)| is_pid_alive(pid)),
         Err(_) => false, // missing lock file => no live instance => adoptable
     }
 }
@@ -1060,7 +1109,7 @@ pub(crate) fn acquire_instance_lock_in(lock_dir: &Path, profile: &str) -> Instan
             FlockOutcome::Held => {
                 let pid = fs::read_to_string(&path)
                     .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .and_then(|s| split_pid_ticks(&s).map(|(pid, _)| pid))
                     // A stamp naming a dead process means the file is stale while
                     // something else holds the flock, or the stamp was never
                     // written. Reporting it would send the user chasing a PID that
@@ -1082,7 +1131,7 @@ pub(crate) fn acquire_instance_lock_in(lock_dir: &Path, profile: &str) -> Instan
             LockOutcome::Held => {
                 let pid = fs::read_to_string(&path)
                     .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .and_then(|s| split_pid_ticks(&s).map(|(pid, _)| pid))
                     // Same stale-stamp discipline as the Unix arm: never
                     // name a PID that is not alive.
                     .filter(|p| is_pid_alive(*p));
@@ -1103,7 +1152,7 @@ pub(crate) fn acquire_instance_lock_in(lock_dir: &Path, profile: &str) -> Instan
         let mut f = &file;
         let _ = f.set_len(0);
         let _ = f.seek(SeekFrom::Start(0));
-        if let Err(e) = write!(f, "{}", std::process::id()) {
+        if let Err(e) = write!(f, "{}", owner_stamp()) {
             tracing::debug!("instance lock: could not stamp PID into {path:?}: {e}");
         }
     }
@@ -1125,15 +1174,38 @@ pub struct PreemptedInstance {
     pub stopped: bool,
 }
 
+/// One foreign lock owner found by [`foreign_lock_owners`]: the channels it
+/// held, and -- on Windows stamps -- the creation time it recorded, which
+/// [`crate::config::winlock::terminate`] needs to tell the real owner from a
+/// process that merely inherited its PID.
+#[derive(Default)]
+struct ForeignOwner {
+    creation_ticks: Option<u64>,
+    channels: Vec<String>,
+}
+
+/// Resolve two creation-time claims for one PID down to the one that can
+/// belong to the live process. `Option::max` is the whole rule and it is the
+/// right one: a process that dies holding a PID leaves its stamp behind, and
+/// whoever inherits that PID is created strictly later, so the greatest
+/// creation time is the live owner's. `None` -- a legacy or non-Windows stamp
+/// -- sorts below every real creation time, so it never wins and never erases
+/// a value that was already recorded.
+fn newest_ticks(current: Option<u64>, candidate: Option<u64>) -> Option<u64> {
+    current.max(candidate)
+}
+
 /// Map every *live, foreign* lock owner for the active profile to the
 /// channels it holds, reading lock files from `lock_dir`. "Foreign" = a PID
 /// other than this process. Pure file inspection, no side effects. The dir is
 /// a parameter so tests can point it at a TempDir and never read the real
 /// workspace.
-fn foreign_lock_owners(lock_dir: &Path) -> std::collections::BTreeMap<u32, Vec<String>> {
+pub(crate) fn foreign_lock_owners(
+    lock_dir: &Path,
+) -> std::collections::BTreeMap<u32, ForeignOwner> {
     let current_profile = active_profile().unwrap_or("default");
     let self_pid = std::process::id();
-    let mut owners: std::collections::BTreeMap<u32, Vec<String>> = Default::default();
+    let mut owners: std::collections::BTreeMap<u32, ForeignOwner> = Default::default();
 
     let entries = match fs::read_dir(lock_dir) {
         Ok(e) => e,
@@ -1156,8 +1228,8 @@ fn foreign_lock_owners(lock_dir: &Path) -> std::collections::BTreeMap<u32, Vec<S
         if profile != current_profile {
             continue;
         }
-        let pid = match parse_lock_owner_pid(pid_field) {
-            Some(p) => p,
+        let (pid, ticks) = match split_pid_ticks(pid_field) {
+            Some(pair) => pair,
             None => continue,
         };
         if pid == self_pid || !is_pid_alive(pid) {
@@ -1170,39 +1242,19 @@ fn foreign_lock_owners(lock_dir: &Path) -> std::collections::BTreeMap<u32, Vec<S
             .and_then(|s| s.rsplit_once('_'))
             .map(|(c, _)| c.to_string())
             .unwrap_or(fname);
-        owners.entry(pid).or_default().push(channel);
+        let owner = owners.entry(pid).or_default();
+        // Several locks can name one PID. When that PID was reused, one stamp
+        // belongs to a process that died holding it and another to the live
+        // owner, and they disagree about the creation time. Keeping whichever
+        // file `read_dir` happens to return first makes the answer depend on
+        // directory order: `terminate` then gets the dead process's creation
+        // time, its creation-time proof rejects the real owner, and the
+        // handover never completes. The maximum is order-independent and is
+        // the live owner by the argument on [`newest_ticks`].
+        owner.creation_ticks = newest_ticks(owner.creation_ticks, ticks);
+        owner.channels.push(channel);
     }
     owners
-}
-
-/// Newest mtime among `dir`'s lock files stamped `profile:pid`. This is the
-/// evidence winlock::terminate's birth proof consumes: the owner process
-/// must predate the stamp it allegedly wrote. Windows-only caller.
-#[cfg(windows)]
-fn stamp_mtime_for(lock_dir: &Path, profile: &str, pid: u32) -> Option<std::time::SystemTime> {
-    let mut best: Option<std::time::SystemTime> = None;
-    let entries = fs::read_dir(lock_dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|x| x.to_str()) != Some("lock") {
-            continue;
-        }
-        let Ok(contents) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Some((prof, pid_field)) = contents.trim().split_once(':') else {
-            continue;
-        };
-        if prof != profile || parse_lock_owner_pid(pid_field) != Some(pid) {
-            continue;
-        }
-        if let Ok(meta) = path.metadata() {
-            if let Ok(t) = meta.modified() {
-                best = Some(best.map_or(t, |b| b.max(t)));
-            }
-        }
-    }
-    best
 }
 
 /// TUI priority: shut down any OTHER live instance of the active profile
@@ -1279,20 +1331,25 @@ pub(crate) fn preempt_instances_in(lock_dir: &Path, stop_services: bool) -> Vec<
     // the token scan above never sees. The TUI then gets `Held`, preemption
     // finds nobody, and the handover dies in its retry loop. Consult the
     // instance stamp as a fallback owner source; the kill is still gated
-    // by winlock::terminate's image AND birth proofs, so a stale instance
-    // stamp gets refused exactly like a stale token stamp.
+    // by winlock::terminate's image AND creation-time proofs, so a stale
+    // instance stamp gets refused exactly like a stale token stamp.
     #[cfg(windows)]
     {
         if owners.is_empty() {
             let profile = active_profile().unwrap_or("default");
             let ipath = lock_dir.join("instance").join(format!("{profile}.lock"));
-            if let (Ok(contents), Ok(meta)) = (fs::read_to_string(&ipath), ipath.metadata()) {
-                if let Some(pid) = contents.trim().parse::<u32>().ok() {
+            if let Ok(contents) = fs::read_to_string(&ipath) {
+                if let Some((pid, ticks)) = split_pid_ticks(&contents) {
                     if pid != std::process::id() && is_pid_alive(pid) {
-                        let stamped = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                        match crate::config::winlock::terminate(pid, stamped) {
+                        match crate::config::winlock::terminate(pid, ticks) {
                             Ok(()) => {
-                                owners.insert(pid, vec!["instance".to_string()]);
+                                owners.insert(
+                                    pid,
+                                    ForeignOwner {
+                                        creation_ticks: ticks,
+                                        channels: vec!["instance".to_string()],
+                                    },
+                                );
                             }
                             Err(e) => {
                                 tracing::debug!(
@@ -1388,14 +1445,11 @@ pub(crate) fn preempt_instances_in(lock_dir: &Path, stop_services: bool) -> Vec<
     // stopped-flag computation is already platform-agnostic.
     #[cfg(windows)]
     {
-        let profile = active_profile().unwrap_or("default");
-        for &pid in owners.keys() {
-            // Feed terminate the newest mtime among this profile's stamps
-            // naming the PID; no readable stamp mtime degrades to
-            // UNIX_EPOCH, which the birth proof rejects (fail-closed).
-            let stamped = stamp_mtime_for(lock_dir, &profile, pid)
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            if let Err(e) = crate::config::winlock::terminate(pid, stamped) {
+        for (pid, owner) in owners.iter() {
+            // Feed terminate the creation time the owner recorded in its own
+            // stamp; a legacy stamp without one passes None, which terminate
+            // rejects rather than trusting a bare PID (fail-closed).
+            if let Err(e) = crate::config::winlock::terminate(*pid, owner.creation_ticks) {
                 tracing::debug!(pid, error = %e, "preempt: TerminateProcess refused or failed");
             }
         }
@@ -1403,7 +1457,8 @@ pub(crate) fn preempt_instances_in(lock_dir: &Path, stop_services: bool) -> Vec<
 
     let mut results: Vec<PreemptedInstance> = owners
         .into_iter()
-        .map(|(pid, mut channels)| {
+        .map(|(pid, owner)| {
+            let mut channels = owner.channels;
             channels.sort();
             channels.dedup();
             PreemptedInstance {

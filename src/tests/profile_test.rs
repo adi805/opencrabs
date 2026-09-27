@@ -12,10 +12,12 @@ use std::path::PathBuf;
 
 use crate::config::profile::{
     ProfileEntry, ProfileRegistry, acquire_token_lock, active_profile, base_opencrabs_dir,
-    create_profile, delete_profile, export_profile, hash_token, import_profile, list_profiles,
-    migrate_profile, release_all_locks, release_token_lock, resolve_profile_home,
-    set_active_profile, validate_profile_name,
+    create_profile, delete_profile, export_profile, foreign_lock_owners, hash_token,
+    import_profile, list_profiles, migrate_profile, parse_lock_owner_pid, release_all_locks,
+    release_token_lock, resolve_profile_home, set_active_profile, split_pid_ticks,
+    validate_profile_name,
 };
+use tempfile::tempdir;
 
 /// Serialize all tests that read or write under the $HOME-resolved
 /// ~/.opencrabs (profiles.toml, locks/). This must be the SAME lock the
@@ -487,13 +489,20 @@ fn filesystem_operations_sequential() {
     let contents = fs::read_to_string(&lf1).unwrap();
     assert!(contents.contains(&pid.to_string()), "contains our PID");
 
-    // Format: "profile:pid"
-    let parts: Vec<&str> = contents.splitn(2, ':').collect();
-    assert_eq!(parts.len(), 2, "lock file should be 'profile:pid' format");
-    // active_profile() may return a name set by another test's OnceLock
-    // Just verify the profile field is non-empty and PID matches
-    assert!(!parts[0].is_empty(), "profile name should not be empty");
-    assert_eq!(parts[1], pid.to_string());
+    // Format: "profile:pid", with a Windows-only ":ticks" tail that records
+    // the owner's creation time for the preempt path's ownership proof.
+    // Assert the shape both platforms share rather than the exact string,
+    // so this test does not silently only pass off Windows.
+    let (profile_field, pid_field) = contents
+        .trim()
+        .split_once(':')
+        .expect("lock file should be 'profile:pid' format");
+    assert!(
+        !profile_field.is_empty(),
+        "profile name should not be empty"
+    );
+    let (stamped_pid, _ticks) = split_pid_ticks(pid_field).expect("PID field must parse");
+    assert_eq!(stamped_pid, pid);
 
     release_token_lock(ch1, &th1);
     assert!(!lf1.exists(), "lock file removed after release");
@@ -1643,4 +1652,99 @@ fn invalid_name_error_names_first_offending_char_only() {
         "second offender (dot) not named, got: {}",
         msg
     );
+}
+
+/// Round 7, PR #3. The Windows lock stamp is `profile:pid:creation-ticks`, and
+/// the token-lock reader parsed that whole third field as a number. A failed
+/// parse is read as "corrupt, take it over", so on Windows a live instance's
+/// token lock was silently handed to whoever arrived second -- destroying the
+/// one-credential-one-instance guarantee that `acquire_token_lock` exists for.
+#[test]
+fn lock_owner_pid_survives_the_windows_ticks_field() {
+    assert_eq!(parse_lock_owner_pid("103104"), Some(103104));
+    assert_eq!(
+        parse_lock_owner_pid("103104:133700000000000000"),
+        Some(103104)
+    );
+    assert_eq!(parse_lock_owner_pid(" 103104:7 "), Some(103104));
+    // Tolerance ends at the PID half. A field that does not *start* with a
+    // usable pid is still corruption and is still taken over (issue #192).
+    assert_eq!(parse_lock_owner_pid("101528ops:103104family:101507"), None);
+    assert_eq!(parse_lock_owner_pid("notapid:123"), None);
+    assert_eq!(parse_lock_owner_pid("0:123"), None);
+}
+
+/// Round 7, PR #3: several stamps can name one PID after a reuse, and they
+/// disagree about its creation time. The scan must resolve them the same way
+/// regardless of which entry it sees first -- the live owner is the most
+/// recent process to hold the PID, so its creation time wins. Under
+/// first-wins, a stale stamp that happened to come back first made
+/// `terminate` reject the real owner and the handover spun forever.
+///
+/// `read_dir` order cannot be forced from here, so this varies the *write*
+/// order instead and relies on the merge being a maximum: the property under
+/// test is that no arrival order can change the answer.
+#[test]
+fn foreign_lock_owner_resolves_a_reused_pid_to_the_newest_creation_time() {
+    use std::process::{Command, Stdio};
+    let _guard = fs_lock();
+    let profile = active_profile().unwrap_or("default");
+    // A made-up pid cannot exercise this path: the scan drops owners that are
+    // not alive, so the pid has to belong to a real process.
+    let spawned = if cfg!(windows) {
+        Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    } else {
+        Command::new("/bin/sleep")
+            .args(["60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    };
+    let mut child = spawned.expect("spawn a helper process to own a live pid");
+    let live = child.id();
+
+    let stale = format!("{profile}:{live}:1000");
+    let fresh = format!("{profile}:{live}:9000");
+    let legacy = format!("{profile}:{live}");
+    for order in [
+        [("telegram_aaa.lock", &stale), ("whatsapp_bbb.lock", &fresh)],
+        [("telegram_aaa.lock", &fresh), ("whatsapp_bbb.lock", &stale)],
+        // A legacy stamp with no creation time must never outrank a real one.
+        [
+            ("telegram_aaa.lock", &legacy),
+            ("whatsapp_bbb.lock", &fresh),
+        ],
+        [
+            ("telegram_aaa.lock", &fresh),
+            ("whatsapp_bbb.lock", &legacy),
+        ],
+    ] {
+        let dir = tempdir().expect("tempdir");
+        for (name, contents) in order {
+            fs::write(dir.path().join(name), contents).expect("write stamp");
+        }
+        let owners = foreign_lock_owners(dir.path());
+        let Some(owner) = owners.get(&live) else {
+            panic!("live owner {live} missing for profile {profile:?}");
+        };
+        assert_eq!(
+            owner.creation_ticks,
+            Some(9000),
+            "newest creation time must win for order {order:?}"
+        );
+        let mut channels = owner.channels.clone();
+        channels.sort();
+        assert_eq!(
+            channels,
+            vec!["telegram".to_string(), "whatsapp".to_string()]
+        );
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
