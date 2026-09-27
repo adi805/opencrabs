@@ -1674,18 +1674,19 @@ fn lock_owner_pid_survives_the_windows_ticks_field() {
     assert_eq!(parse_lock_owner_pid("0:123"), None);
 }
 
-/// Round 7, PR #3: several stamps can name one PID after a reuse, and they
-/// disagree about its creation time. The scan must resolve them the same way
-/// regardless of which entry it sees first -- the live owner is the most
-/// recent process to hold the PID, so its creation time wins. Under
-/// first-wins, a stale stamp that happened to come back first made
-/// `terminate` reject the real owner and the handover spun forever.
+/// Round 7, PR #3, restated by round 9: several stamps can name one PID
+/// after a reuse, and they disagree about its creation time. The scan must
+/// resolve them the same way regardless of which entry it sees first. On
+/// Windows the only claim that can win is the kernel's own reading of the
+/// live process -- an exact match, so a wall clock that stepped backward
+/// cannot make a corpse's stamp outrank its living owner. Off Windows no
+/// such reading exists, so the newest recorded claim wins. Either way, no
+/// arrival order can change the answer.
 ///
 /// `read_dir` order cannot be forced from here, so this varies the *write*
-/// order instead and relies on the merge being a maximum: the property under
-/// test is that no arrival order can change the answer.
+/// order instead, across a matched expectation and an unmatched one.
 #[test]
-fn foreign_lock_owner_resolves_a_reused_pid_to_the_newest_creation_time() {
+fn foreign_lock_owner_resolves_a_reused_pid_against_the_live_process() {
     use std::process::{Command, Stdio};
     let _guard = fs_lock();
     let profile = active_profile().unwrap_or("default");
@@ -1709,21 +1710,53 @@ fn foreign_lock_owner_resolves_a_reused_pid_to_the_newest_creation_time() {
     let mut child = spawned.expect("spawn a helper process to own a live pid");
     let live = child.id();
 
-    let stale = format!("{profile}:{live}:1000");
-    let fresh = format!("{profile}:{live}:9000");
+    // Round 9, PR #3: the fake ticks this test used predates the exact-match
+    // rule and cannot win it on Windows -- no real process is born at tick
+    // 9000 -- so the stamps must be shaped to the rule each platform uses.
+    // On Windows the claims are built from the kernel's own reading of the
+    // live child, with a decoy made *newer* than the real time: under the
+    // old max rule the decoy won and `terminate` then refused the real
+    // owner forever, and only the exact match can still tell them apart.
+    // Off Windows there is no reading to match, so the newest recorded
+    // claim is the correct answer and the old fake ticks express it.
+    #[cfg(windows)]
+    let (low, high, matched, unmatched) = {
+        let real = crate::config::winlock::creation_ticks_of(live)
+            .expect("kernel reports a creation time for a live pid");
+        (real, real.saturating_add(1000), Some(real), None)
+    };
+    #[cfg(not(windows))]
+    let (low, high, matched, unmatched) = (1000_u64, 9000_u64, Some(9000_u64), Some(9000_u64));
+
+    let stale = format!("{profile}:{live}:{low}");
+    let fresh = format!("{profile}:{live}:{high}");
     let legacy = format!("{profile}:{live}");
-    for order in [
-        [("telegram_aaa.lock", &stale), ("whatsapp_bbb.lock", &fresh)],
-        [("telegram_aaa.lock", &fresh), ("whatsapp_bbb.lock", &stale)],
-        // A legacy stamp with no creation time must never outrank a real one.
-        [
-            ("telegram_aaa.lock", &legacy),
-            ("whatsapp_bbb.lock", &fresh),
-        ],
-        [
-            ("telegram_aaa.lock", &fresh),
-            ("whatsapp_bbb.lock", &legacy),
-        ],
+    for (order, expect) in [
+        (
+            [("telegram_aaa.lock", &stale), ("whatsapp_bbb.lock", &fresh)],
+            matched,
+        ),
+        (
+            [("telegram_aaa.lock", &fresh), ("whatsapp_bbb.lock", &stale)],
+            matched,
+        ),
+        // A legacy stamp carries no creation time. On Windows nothing then
+        // agrees with the kernel and the scan must refuse to pick; off
+        // Windows it falls through to the newest recorded claim.
+        (
+            [
+                ("telegram_aaa.lock", &legacy),
+                ("whatsapp_bbb.lock", &fresh),
+            ],
+            unmatched,
+        ),
+        (
+            [
+                ("telegram_aaa.lock", &fresh),
+                ("whatsapp_bbb.lock", &legacy),
+            ],
+            unmatched,
+        ),
     ] {
         let dir = tempdir().expect("tempdir");
         for (name, contents) in order {
@@ -1734,9 +1767,8 @@ fn foreign_lock_owner_resolves_a_reused_pid_to_the_newest_creation_time() {
             panic!("live owner {live} missing for profile {profile:?}");
         };
         assert_eq!(
-            owner.creation_ticks,
-            Some(9000),
-            "newest creation time must win for order {order:?}"
+            owner.creation_ticks, expect,
+            "resolution must be order-independent for {order:?}"
         );
         let mut channels = owner.channels.clone();
         channels.sort();
