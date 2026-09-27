@@ -24,8 +24,9 @@
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-// `Instant` paces the flock wait loop below, which is unix-only.
-#[cfg(unix)]
+// `Instant` paces the wait loops below: flock's on unix, LockFileEx's on
+// Windows. Neither arm may wait forever; a crashed holder costs a pause.
+#[cfg(any(unix, windows))]
 use std::time::Instant;
 
 /// How long to wait for another writer before going ahead regardless. Long
@@ -137,7 +138,38 @@ pub(crate) fn acquire_at(lock_path: &Path) -> Option<PathWriteLock> {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // The no-op fallback below is honest (callers see held:false and
+        // append the contention notice), but Windows is not actually unable
+        // to lock: LockFileEx is the direct analogue of the unix arm and
+        // same wait-then-proceed policy.
+        use std::os::windows::io::AsRawHandle;
+        let handle = file.as_raw_handle();
+        let deadline = Instant::now() + WAIT_FOR_HOLDER;
+        loop {
+            match crate::config::winlock::exclusive(handle, true) {
+                crate::config::winlock::LockOutcome::Acquired => {
+                    return Some(PathWriteLock { file, held: true });
+                }
+                crate::config::winlock::LockOutcome::Held => {
+                    if Instant::now() >= deadline {
+                        return Some(PathWriteLock { file, held: false });
+                    }
+                    std::thread::sleep(RETRY_EVERY);
+                }
+                crate::config::winlock::LockOutcome::Failed(e) => {
+                    tracing::debug!(
+                        "path lock: cannot lock {}: {e} — writing without it",
+                        lock_path.display()
+                    );
+                    return Some(PathWriteLock { file, held: false });
+                }
+            }
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         Some(PathWriteLock { file, held: false })
     }
