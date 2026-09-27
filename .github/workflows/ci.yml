@@ -342,6 +342,13 @@ jobs:
       #   tests::utils_shell_test          the shell_pair probe contract
       #   tests::utils_cwd_test            drive-letter + lookalike dirs
       #   tests::browser_default_windows_test  browser path detection
+      #   tests::profile_test                  lock-owner stamp parsing and
+      #                        reused-PID resolution: 67 tests that exist on
+      #                        THIS base, so Windows gives real receipts on
+      #                        day 1 instead of a zero-match tripwire. The
+      #                        round-9 finding (a Windows-only test failure)
+      #                        lived in exactly this module, and no CI job
+      #                        could have seen it: Windows ran no tests.
       # The first two do not exist on this branch's base: the per-filter
       # tripwire below reports them as ZERO-MATCH until #3/#9 merge,
       # rather than pretending green. That silence-is-failure property is
@@ -367,7 +374,8 @@ jobs:
           # so parsing `$out` must not assume the ok-form.
           status=0
           for m in config::winlock cli::service_windows tests::utils_shell_test \
-                   tests::utils_cwd_test tests::browser_default_windows_test; do
+                   tests::utils_cwd_test tests::browser_default_windows_test \
+                   tests::profile_test; do
             set +e
             out=$(cargo test --locked --profile ci --target x86_64-pc-windows-msvc \
                     --lib -- "$m" 2>&1)
