@@ -379,9 +379,15 @@ mod tests {
     // that both break this test: `Path::is_absolute()` is false, and `\` is
     // not a separator so `file_name()` returns the whole string. Asserting
     // either there fails for the wrong reason and takes the Linux `Test` job
-    // down with it. The assertion belongs where it is meaningful, and it is
-    // not lost: the Windows platform-behaviour slice runs
-    // `cargo test --target x86_64-pc-windows-msvc --lib -- cli::service_windows`.
+    // down with it. Where it does run, stated exactly, because "somewhere in
+    // CI" is not a guarantee: nothing on THIS branch executes it. The Windows
+    // job here builds and smoke-tests only. The scoped slice that would run
+    // `cargo test --target x86_64-pc-windows-msvc --lib -- cli::service_windows`
+    // is PR #11's, on a branch that does not contain this module yet, so until
+    // the two land together the assertion is exercised only on a Windows
+    // developer box via that same command. That is a real coverage gap in this
+    // PR, and naming it here is cheaper than the next reader assuming a green
+    // check mark means someone watched this path.
     #[cfg(windows)]
     #[test]
     fn shell_program_is_an_absolute_trusted_path() {
