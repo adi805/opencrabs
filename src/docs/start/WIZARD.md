@@ -10,7 +10,7 @@ sidebarTitle: "Onboarding: CLI"
 # Opencrab Onboarding Wizard (CLI)
 
 The onboarding wizard is the **recommended** way to set up OpenCrabs on macOS,
-Linux, or Windows (via WSL2; strongly recommended).
+Linux, or Windows (native; WSL2 also works if you prefer it).
 It configures a local Gateway or a remote Gateway connection, plus channels, skills,
 and workspace defaults in one guided flow.
 
