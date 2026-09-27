@@ -105,14 +105,21 @@ pub fn stop_script(task: &str) -> String {
 /// both `restart` (IgnoreNew would reject the new launch while the old
 /// one still holds the instance lock) and `uninstall` (an unregistered
 /// task cannot be addressed again, orphaning the live process) need the
-/// exit itself, not the signal. A vanished task counts as stopped.
+/// exit itself, not the signal. A vanished task counts as stopped. Any OTHER
+/// query failure must not, though: it exits 2 so `run_script` reports Failed
+/// rather than Missing, because an error we cannot classify is not evidence
+/// that the daemon stopped -- and `uninstall` would unregister a task whose
+/// process is still holding the instance lock.
 pub fn stop_and_wait_script(task: &str) -> String {
     format!(
         "$ErrorActionPreference='Stop'; Stop-ScheduledTask -TaskName {t} -ErrorAction SilentlyContinue; \
          $deadline=(Get-Date).AddSeconds(30); \
          while ($true) {{ \
            try {{ $t = Get-ScheduledTask -TaskName {t} -ErrorAction Stop }} \
-           catch {{ exit 0 }} \
+           catch {{ \
+             if ($_.CategoryInfo.Category -eq 'ObjectNotFound') {{ exit 0 }} \
+             [Console]::Error.WriteLine('cannot query task state: ' + $_.Exception.Message); exit 2 \
+           }} \
            if ($t.State -ne 'Running') {{ exit 0 }} \
            if ((Get-Date) -gt $deadline) {{ exit 1 }} \
            Start-Sleep -Milliseconds 250 \
@@ -380,5 +387,34 @@ mod tests {
     fn run_script_is_inert_off_windows() {
         #[cfg(not(windows))]
         assert!(matches!(run_script("x"), TaskResult::Failed(_)));
+    }
+
+    /// The wait loop must distinguish "the task is gone" from "I could not ask".
+    /// Exit 0 means stopped to the caller, so every unclassifiable query error
+    /// has to land on a different code -- otherwise `service uninstall`
+    /// unregisters a task whose daemon is still holding the instance lock, and
+    /// nothing can address that process afterwards.
+    #[test]
+    fn stop_and_wait_treats_only_a_missing_task_as_stopped() {
+        let s = stop_and_wait_script("com.opencrabs.daemon");
+        assert!(
+            s.contains("$_.CategoryInfo.Category -eq 'ObjectNotFound'"),
+            "the not-found case must be discriminated explicitly: {s}"
+        );
+        // The not-found branch exits 0; the catch-all must not.
+        let catch_all = s
+            .split("[Console]::Error.WriteLine")
+            .nth(1)
+            .expect("catch-all branch present");
+        assert!(
+            catch_all.contains("exit 2"),
+            "an unclassifiable query failure must not exit 0: {s}"
+        );
+        assert!(
+            s.contains("if ((Get-Date) -gt $deadline) { exit 1 }"),
+            "the timeout path exits 1 so callers can refuse to proceed: {s}"
+        );
+        // The task name is a single-quoted literal, never interpolated raw.
+        assert!(s.contains("-TaskName 'com.opencrabs.daemon'"), "{s}");
     }
 }
