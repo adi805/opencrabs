@@ -1910,7 +1910,11 @@ fn service_identifiers() -> (String, String, String) {
 }
 
 /// Build the daemon arguments, including `-p <profile>` when a named profile is active.
-fn daemon_args() -> Vec<String> {
+///
+/// `pub(crate)` because the onboarding wizard's Windows arm registers the same
+/// task action the `service install` verb does, and it must not invent its own
+/// argument list.
+pub(crate) fn daemon_args() -> Vec<String> {
     let mut args = Vec::new();
     if let Some(name) = crate::config::profile::active_profile()
         && name != "default"
@@ -2222,12 +2226,31 @@ pub(crate) async fn cmd_service(operation: ServiceCommands) -> Result<()> {
                 );
             }
 
-            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            #[cfg(target_os = "windows")]
+            {
+                use crate::cli::service_windows as st;
+                let desc = format!(
+                    "OpenCrabs daemon [{profile_label}]. Managed by the opencrabs service command."
+                );
+                match st::run_script(&st::install_script(&plist_name, &binary, &args, &desc)) {
+                    st::TaskResult::Ok(_) => {
+                        println!("✅ Installed Scheduled Task [{profile_label}]: {plist_name}");
+                        println!("   Autostart arms at next logon; start now:");
+                        println!("   Run: opencrabs service start");
+                    }
+                    st::TaskResult::Missing => {
+                        return Err(anyhow::anyhow!("task scheduler rejected the registration"));
+                    }
+                    st::TaskResult::Failed(e) => return Err(anyhow::anyhow!(e)),
+                }
+            }
+
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
             return Err(anyhow::anyhow!(
                 "Service install not supported on this platform"
             ));
 
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             Ok(())
         }
         ServiceCommands::Start => {
@@ -2263,6 +2286,24 @@ pub(crate) async fn cmd_service(operation: ServiceCommands) -> Result<()> {
                 println!("✅ Started OpenCrabs daemon [{profile_label}]");
             }
 
+            #[cfg(target_os = "windows")]
+            {
+                use crate::cli::service_windows as st;
+                match st::run_script(&st::start_script(&plist_name)) {
+                    st::TaskResult::Ok(_) => {
+                        println!("✅ Started OpenCrabs daemon [{profile_label}]")
+                    }
+                    st::TaskResult::Missing => {
+                        println!("⬚  Not installed: run opencrabs service install first");
+                        return Err(anyhow::anyhow!("scheduled task not registered"));
+                    }
+                    st::TaskResult::Failed(e) => {
+                        eprintln!("❌ {e}");
+                        return Err(anyhow::anyhow!(e));
+                    }
+                }
+            }
+
             Ok(())
         }
         ServiceCommands::Stop => {
@@ -2291,6 +2332,24 @@ pub(crate) async fn cmd_service(operation: ServiceCommands) -> Result<()> {
                 println!("✅ Stopped OpenCrabs daemon [{profile_label}]");
             }
 
+            #[cfg(target_os = "windows")]
+            {
+                use crate::cli::service_windows as st;
+                match st::run_script(&st::stop_script(&plist_name)) {
+                    st::TaskResult::Ok(_) => {
+                        println!("✅ Stopped OpenCrabs daemon [{profile_label}]")
+                    }
+                    st::TaskResult::Missing => {
+                        println!("⬚  Not installed: run opencrabs service install first");
+                        return Err(anyhow::anyhow!("scheduled task not registered"));
+                    }
+                    st::TaskResult::Failed(e) => {
+                        eprintln!("❌ {e}");
+                        return Err(anyhow::anyhow!(e));
+                    }
+                }
+            }
+
             Ok(())
         }
         ServiceCommands::Restart => {
@@ -2317,6 +2376,36 @@ pub(crate) async fn cmd_service(operation: ServiceCommands) -> Result<()> {
                     return Err(e);
                 }
                 println!("✅ Restarted OpenCrabs daemon [{profile_label}]");
+            }
+            #[cfg(target_os = "windows")]
+            {
+                use crate::cli::service_windows as st;
+                // Stop AND wait for the old daemon to exit before starting
+                // a new one: the task policy is IgnoreNew, so a start that
+                // arrives while the old process still runs is silently
+                // rejected, and even a racing shutdown holding the instance
+                // lock (#3) would bounce the newcomer. The stop result is
+                // only ignorable when it is "already not running"; a
+                // timeout waiting for exit is a hard stop for restart.
+                if let st::TaskResult::Failed(e) =
+                    st::run_script(&st::stop_and_wait_script(&plist_name))
+                {
+                    eprintln!("❌ Old daemon did not exit in time: {e}");
+                    return Err(anyhow::anyhow!("restart aborted before start: {e}"));
+                }
+                match st::run_script(&st::start_script(&plist_name)) {
+                    st::TaskResult::Ok(_) => {
+                        println!("✅ Restarted OpenCrabs daemon [{profile_label}]")
+                    }
+                    st::TaskResult::Missing => {
+                        println!("⬚  Not installed: run opencrabs service install first");
+                        return Err(anyhow::anyhow!("scheduled task not registered"));
+                    }
+                    st::TaskResult::Failed(e) => {
+                        eprintln!("❌ {e}");
+                        return Err(anyhow::anyhow!(e));
+                    }
+                }
             }
             Ok(())
         }
@@ -2347,6 +2436,44 @@ pub(crate) async fn cmd_service(operation: ServiceCommands) -> Result<()> {
                 print!("{}", String::from_utf8_lossy(&output.stdout));
                 if output.stdout.is_empty() {
                     eprint!("{}", String::from_utf8_lossy(&output.stderr));
+                }
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                use crate::cli::service_windows as st;
+                match st::run_script(&st::status_script(&plist_name)) {
+                    st::TaskResult::Ok(raw) => match st::parse_status(&raw) {
+                        Ok(info) => {
+                            let mark = if info.state == "Running" {
+                                "✅"
+                            } else {
+                                "⬚"
+                            };
+                            println!(
+                                "{mark} OpenCrabs daemon [{profile_label}] — Scheduled Task {plist_name}"
+                            );
+                            println!("   state     {}", info.state);
+                            println!(
+                                "   autostart {}",
+                                if info.enabled {
+                                    "armed (at logon)"
+                                } else {
+                                    "disarmed"
+                                }
+                            );
+                            println!("   action    {}", info.action);
+                            println!("   last run  {} (exit {})", info.last_run, info.last_result);
+                            println!("   next run  {}", info.next_run);
+                        }
+                        Err(e) => {
+                            println!("⚠️  Task {plist_name} reported unreadable state: {e}")
+                        }
+                    },
+                    st::TaskResult::Missing => println!(
+                        "⬚  OpenCrabs daemon [{profile_label}] is not installed as a Scheduled Task"
+                    ),
+                    st::TaskResult::Failed(e) => println!("❌ {e}"),
                 }
             }
 
@@ -2395,6 +2522,32 @@ pub(crate) async fn cmd_service(operation: ServiceCommands) -> Result<()> {
                     );
                 } else {
                     println!("⬚  Systemd unit [{profile_label}] not found");
+                }
+            }
+            #[cfg(target_os = "windows")]
+            {
+                use crate::cli::service_windows as st;
+                // Never unregister a live task: Unregister while the daemon
+                // runs leaves a process no service verb can address any
+                // more (macOS and Linux arms stop the unit first). Stop,
+                // wait for real exit, only then remove the registration.
+                if let st::TaskResult::Failed(e) =
+                    st::run_script(&st::stop_and_wait_script(&plist_name))
+                {
+                    eprintln!("❌ Refusing to uninstall: daemon would not stop ({e})");
+                    return Err(anyhow::anyhow!("uninstall aborted: {e}"));
+                }
+                match st::run_script(&st::uninstall_script(&plist_name)) {
+                    st::TaskResult::Ok(_) => {
+                        println!("✅ Removed Scheduled Task [{profile_label}]: {plist_name}")
+                    }
+                    st::TaskResult::Missing => {
+                        println!("⬚  Scheduled Task [{profile_label}] not found")
+                    }
+                    st::TaskResult::Failed(e) => {
+                        eprintln!("❌ {e}");
+                        return Err(anyhow::anyhow!(e));
+                    }
                 }
             }
 

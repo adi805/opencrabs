@@ -625,7 +625,7 @@ This solves the core UX problem in mention-only groups: previously, tagging the 
 | `opencrabs db clear` | Clear all sessions and messages (`--force` to skip confirmation) |
 | `opencrabs cron add\|list\|remove\|enable\|disable\|test` | Manage scheduled cron jobs |
 | `opencrabs logs status\|view\|clean\|open` | Log management |
-| `opencrabs service install\|start\|stop\|restart\|status\|uninstall` | OS service management (launchd on macOS, systemd on Linux) |
+| `opencrabs service install\|start\|stop\|restart\|status\|uninstall` | OS service management (launchd on macOS, systemd on Linux, a per-profile Scheduled Task on Windows) |
 | `opencrabs daemon` | Run in headless daemon mode — channels only, no TUI |
 | `opencrabs evolve` | Update to the latest release binary and hot-restart, the same path as the `/evolve` command and the automatic 24h check. `--check-only` reports whether an update exists without installing it |
 | `opencrabs completions <shell>` | Generate shell completions (bash, zsh, fish, powershell) |
@@ -889,7 +889,7 @@ needs nothing installed locally either.
 Run profiles as background services:
 
 ```bash
-# Install as system service (macOS launchd / Linux systemd)
+# Install as system service (macOS launchd / Linux systemd / Windows Scheduled Task)
 opencrabs -p hermes service install
 opencrabs -p hermes service start
 
@@ -905,7 +905,7 @@ opencrabs -p hermes service uninstall
 
 Multiple profiles can run as simultaneous daemon services with full isolation.
 
-> **Strongly recommended for everyday users.** If you plan to use OpenCrabs daily, ask it to set itself up as a system service that starts and stops with your machine. Just say something like *"set yourself up to start with my computer"* or *"remove the auto-start service"* — the agent handles the launchd (macOS) or systemd (Linux) setup and removal for you automatically. This way OpenCrabs starts on boot, shuts down cleanly with the system, channels stay connected, and cron jobs keep ticking without you having to remember to start or stop it.
+> **Strongly recommended for everyday users.** If you plan to use OpenCrabs daily, ask it to set itself up as a system service that starts and stops with your machine. Just say something like *"set yourself up to start with my computer"* or *"remove the auto-start service"* — the agent handles the launchd (macOS), systemd (Linux), or Scheduled Task (Windows, starts at logon) setup and removal for you automatically. This way OpenCrabs starts on boot, shuts down cleanly with the system, channels stay connected, and cron jobs keep ticking without you having to remember to start or stop it.
 
 **Environment variable:** Set `OPENCRABS_PROFILE=hermes` to select a profile without the `-p` flag. Useful for systemd services, cron jobs, and daemon mode.
 
@@ -4410,6 +4410,8 @@ launchctl unload ~/Library/LaunchAgents/com.opencrabs.agent.plist
 > Update the path in `ProgramArguments` to match your install. For cargo installs: `~/.cargo/bin/opencrabs`. For source builds: `/path/to/target/release/opencrabs`.
 
 #### Windows (Task Scheduler)
+
+> Since the `service` subcommands learned Windows support, `opencrabs -p <profile> service install` registers this exact task for you (at-logon trigger, crash restart, per-profile name) and `service start|stop|restart|status|uninstall` manage its lifecycle. The manual route below remains for anyone who prefers the GUI or runs a build without that support.
 
 1. Press `Win + R`, type `taskschd.msc`, hit Enter
 2. Click **Create Basic Task** in the right panel
