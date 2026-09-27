@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use crate::config::profile::{
     ProfileEntry, ProfileRegistry, acquire_token_lock, active_profile, base_opencrabs_dir,
     create_profile, delete_profile, export_profile, hash_token, import_profile, list_profiles,
-    migrate_profile, release_all_locks, release_token_lock, resolve_profile_home,
-    set_active_profile, split_pid_ticks, validate_profile_name,
+    migrate_profile, parse_lock_owner_pid, release_all_locks, release_token_lock,
+    resolve_profile_home, set_active_profile, split_pid_ticks, validate_profile_name,
 };
 
 /// Serialize all tests that read or write under the $HOME-resolved
@@ -1650,4 +1650,24 @@ fn invalid_name_error_names_first_offending_char_only() {
         "second offender (dot) not named, got: {}",
         msg
     );
+}
+
+/// Round 7, PR #3. The Windows lock stamp is `profile:pid:creation-ticks`, and
+/// the token-lock reader parsed that whole third field as a number. A failed
+/// parse is read as "corrupt, take it over", so on Windows a live instance's
+/// token lock was silently handed to whoever arrived second -- destroying the
+/// one-credential-one-instance guarantee that `acquire_token_lock` exists for.
+#[test]
+fn lock_owner_pid_survives_the_windows_ticks_field() {
+    assert_eq!(parse_lock_owner_pid("103104"), Some(103104));
+    assert_eq!(
+        parse_lock_owner_pid("103104:133700000000000000"),
+        Some(103104)
+    );
+    assert_eq!(parse_lock_owner_pid(" 103104:7 "), Some(103104));
+    // Tolerance ends at the PID half. A field that does not *start* with a
+    // usable pid is still corruption and is still taken over (issue #192).
+    assert_eq!(parse_lock_owner_pid("101528ops:103104family:101507"), None);
+    assert_eq!(parse_lock_owner_pid("notapid:123"), None);
+    assert_eq!(parse_lock_owner_pid("0:123"), None);
 }
