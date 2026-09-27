@@ -1184,6 +1184,17 @@ struct ForeignOwner {
     channels: Vec<String>,
 }
 
+/// Resolve two creation-time claims for one PID down to the one that can
+/// belong to the live process. `Option::max` is the whole rule and it is the
+/// right one: a process that dies holding a PID leaves its stamp behind, and
+/// whoever inherits that PID is created strictly later, so the greatest
+/// creation time is the live owner's. `None` -- a legacy or non-Windows stamp
+/// -- sorts below every real creation time, so it never wins and never erases
+/// a value that was already recorded.
+fn newest_ticks(current: Option<u64>, candidate: Option<u64>) -> Option<u64> {
+    current.max(candidate)
+}
+
 /// Map every *live, foreign* lock owner for the active profile to the
 /// channels it holds, reading lock files from `lock_dir`. "Foreign" = a PID
 /// other than this process. Pure file inspection, no side effects. The dir is
@@ -1232,12 +1243,15 @@ pub(crate) fn foreign_lock_owners(
             .map(|(c, _)| c.to_string())
             .unwrap_or(fname);
         let owner = owners.entry(pid).or_default();
-        // Several locks can name one PID; they are all the same process, so
-        // the first recorded creation time is the answer (a later legacy
-        // stamp without ticks must not erase it).
-        if owner.creation_ticks.is_none() {
-            owner.creation_ticks = ticks;
-        }
+        // Several locks can name one PID. When that PID was reused, one stamp
+        // belongs to a process that died holding it and another to the live
+        // owner, and they disagree about the creation time. Keeping whichever
+        // file `read_dir` happens to return first makes the answer depend on
+        // directory order: `terminate` then gets the dead process's creation
+        // time, its creation-time proof rejects the real owner, and the
+        // handover never completes. The maximum is order-independent and is
+        // the live owner by the argument on [`newest_ticks`].
+        owner.creation_ticks = newest_ticks(owner.creation_ticks, ticks);
         owner.channels.push(channel);
     }
     owners
