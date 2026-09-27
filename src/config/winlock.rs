@@ -129,6 +129,16 @@ impl Filetime {
 /// 1601-01-01 → 1970-01-01 in 100ns ticks (369 years).
 const WINDOWS_TICKS_BEFORE_UNIX: u64 = 116_444_736_000_000_000;
 
+/// Slack for the birth check, in 100ns ticks (2 s). A file's LastWriteTime
+/// is not guaranteed to be as fine as the process creation time it is
+/// compared against: FAT carries 2 s DOS time, and SMB plus some filter
+/// drivers coarsen what the API reports. Without this slack a stamp
+/// written microseconds after the owner started can read as OLDER than the
+/// owner, and the check then refuses the handover it exists to perform.
+/// The image-path match still gates on "same executable", so a recycled
+/// PID has to reappear within the slack to be mistaken for the owner.
+const MTIME_COARSENESS_TICKS: u64 = 20_000_000;
+
 fn system_time_ticks(t: io::Result<std::time::SystemTime>) -> Option<u64> {
     let d = t.ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
     Some(WINDOWS_TICKS_BEFORE_UNIX + d.as_secs() * 10_000_000 + (d.subsec_nanos() as u64) / 100)
@@ -180,6 +190,8 @@ pub fn unlock(handle: RawHandle) -> io::Result<()> {
 ///     cannot have written it; so whatever it is, it is not the owner, and
 ///     the PID was recycled under a stale stamp. (The range lock proves
 ///     nothing about who holds it; the file stamp is not an OS lock.)
+///     Because an mtime can be coarser than a process creation time, the
+///     comparison allows MTIME_COARSENESS_TICKS before concluding reuse.
 /// Anything unverifiable (unreadable image, failed time query, missing
 /// mtime) we do NOT kill. "Leaves a stubborn instance running" always
 /// beats "kills something unrelated the user is doing".
@@ -223,7 +235,7 @@ pub fn terminate(pid: u32, stamped_at: std::time::SystemTime) -> io::Result<()> 
                     Err(io::Error::last_os_error())
                 } else {
                     match system_time_ticks(Ok(stamped_at)) {
-                        Some(stamp) if creation.ticks() <= stamp => {
+                        Some(stamp) if creation.ticks() <= stamp.saturating_add(MTIME_COARSENESS_TICKS) => {
                             if unsafe { TerminateProcess(h, 1) } != 0 {
                                 Ok(())
                             } else {
