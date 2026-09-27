@@ -212,7 +212,11 @@ jobs:
     # cmake C++ + ~15 for the thin-LTO link of a 4-vCPU runner); warm runs
     # from rust-cache land near 10. The original 40 cap killed a build that
     # was minutes from linking. Keep a cap so a true hang can't burn 360.
-    timeout-minutes: 60
+    # 90 (not 60) while the scoped-test step rides along: the cfg(test) lib
+    # compiles on top of the build. The job is NOT in the required gate, so
+    # the extra ceiling is a priced trade for the first-ever Windows
+    # execution receipts, not silent drift.
+    timeout-minutes: 90
     steps:
       # fetch-depth 0: the path filter below diffs against the PR base sha.
       - uses: actions/checkout@v5
@@ -327,6 +331,52 @@ jobs:
           echo "exit=$status version=$ver"
           [ "$status" -eq 0 ] || exit 1
           echo "$ver" | grep -qi opencrabs
+
+      # Scoped execution: only the modules whose tests assert platform
+      # behaviour. Full-suite Windows was rejected twice (#627 cost, and
+      # POSIX-semantics failures that are not bugs). Slice members:
+      #   config::winlock      (from #3) cross-handle contention +
+      #                        fail-closed terminate proof -- cfg(windows):
+      #                        these run NOWHERE ELSE
+      #   cli::service_windows (from #9) PS builders, parser, injection
+      #   tests::utils_shell_test          the shell_pair probe contract
+      #   tests::utils_cwd_test            drive-letter + lookalike dirs
+      #   tests::browser_default_windows_test  browser path detection
+      # The first two do not exist on this branch's base: the per-filter
+      # tripwire below reports them as ZERO-MATCH until #3/#9 merge,
+      # rather than pretending green. That silence-is-failure property is
+      # the point of looping filters instead of one combined cargo test.
+      # fail-soft by design: the honest day-1 state is "unknown until run".
+      # Flip continue-on-error once the receipts are green, not before.
+      - name: "Scoped tests (windows): platform-behaviour slice"
+        if: steps.relevant.outputs.run == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          # One filter per module, each individually judged. A combined
+          # `cargo test -- a b c` that silently matches nothing looks green;
+          # per-module zero-detection here is a SCREAM (module renamed, not
+          # yet merged, or renamed by a sibling PR), not a pass -- the same
+          # anti-fake-green principle the footgun gate's --self-test enforces.
+          status=0
+          for m in config::winlock cli::service_windows tests::utils_shell_test \
+                   tests::utils_cwd_test tests::browser_default_windows_test; do
+            out=$(cargo test --locked --profile ci --target x86_64-pc-windows-msvc \
+                    --lib -- "$m" 2>&1)
+            rc=$?
+            n=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | head -n1)
+            if [ $rc -ne 0 ]; then
+              echo "::warning::Windows slice FAILS ($rc): $m"
+              printf '%s\n' "$out" | tail -20
+              status=1
+            elif [ -z "$n" ] || [ "$n" -eq 0 ]; then
+              echo "::warning::Windows slice ZERO-MATCH: $m names no tests here (renamed or not yet merged)"
+              status=1
+            else
+              echo "Windows slice PASS: $m ($n tests)"
+            fi
+          done
+          exit $status
 
   # ── Windows footgun gate (seconds, every PR, no path filter) ──────
   # The windows-build job is deliberately path-filtered to keep #627's
