@@ -157,6 +157,25 @@ pub fn own_creation_ticks() -> Option<u64> {
     (ok != 0).then(|| creation.ticks())
 }
 
+/// Creation time of ANOTHER process, in Win32 100ns ticks, or `None` when the
+/// process cannot be opened or the query fails. The lock readers use it to
+/// pick, out of several stamps naming one live PID, the one that process
+/// itself wrote: an exact match against the kernel's own reading cannot be
+/// fooled by the wall clock moving backward between the two births. Compare
+/// [`own_creation_ticks`], the same reading for this process.
+pub fn creation_ticks_of(pid: u32) -> Option<u64> {
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if h.is_null() {
+        return None;
+    }
+    let mut creation = Filetime { low: 0, high: 0 };
+    let mut ignored = Filetime { low: 0, high: 0 };
+    let ok = unsafe { GetProcessTimes(h, &mut creation, &mut ignored, &mut ignored, &mut ignored) };
+    unsafe { CloseHandle(h) };
+    (ok != 0).then(|| creation.ticks())
+}
+
 /// Exclusive whole-file lock on `handle`, mirroring `flock::exclusive`
 /// argument-for-argument: `nb == true` behaves like `LOCK_NB` — a contended
 /// lock returns [`LockOutcome::Held`] immediately instead of waiting.
@@ -329,6 +348,25 @@ mod tests {
         let b = own_creation_ticks().expect("GetProcessTimes must work on Windows");
         assert_eq!(a, b, "a process's creation time must not change");
         assert!(a > 0, "a creation time of zero means the query lied");
+    }
+
+    /// The reader the lock scan uses to tell a live owner from a stale stamp
+    /// must return, for a process, the SAME number that process reads for
+    /// itself -- the two sides of `terminate`'s equality check. It must also
+    /// refuse rather than guess when the handle cannot be taken.
+    #[test]
+    fn creation_ticks_of_matches_the_own_reading_and_refuses_a_bogus_pid() {
+        let me = std::process::id();
+        assert_eq!(
+            creation_ticks_of(me),
+            own_creation_ticks(),
+            "the reader and the writer must share one clock"
+        );
+        assert_eq!(
+            creation_ticks_of(u32::MAX),
+            None,
+            "an invalid PID has no creation time to report"
+        );
     }
 
     /// Range-lock contention is per-HANDLE, so a second handle to the same
