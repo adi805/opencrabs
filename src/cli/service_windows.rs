@@ -151,7 +151,7 @@ pub struct TaskStatus {
 /// `-` rather than failing the report (a half-readable status beats an
 /// error dialog).
 pub fn parse_status(raw: &str) -> Result<TaskStatus, String> {
-    let mut get = |key: &str| -> String {
+    let get = |key: &str| -> String {
         raw.lines()
             .find_map(|l| l.split_once('|').filter(|(k, _)| *k == key).map(|(_, v)| v.trim().to_string()))
             .unwrap_or_else(|| "-".to_string())
