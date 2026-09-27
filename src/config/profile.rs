@@ -1268,6 +1268,10 @@ pub(crate) fn parse_launchctl_labels(output: &str) -> Vec<String> {
 }
 
 pub(crate) fn preempt_instances_in(lock_dir: &Path, stop_services: bool) -> Vec<PreemptedInstance> {
+    // The only mutation of `owners` lives in the Windows handover block
+    // below; on every other target the `mut` genuinely is unused, so the
+    // lint is silenced exactly where it is wrong, never across all targets.
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut owners = foreign_lock_owners(lock_dir);
 
     // Windows handover gap (tracked as #6): a daemon with NO enabled
