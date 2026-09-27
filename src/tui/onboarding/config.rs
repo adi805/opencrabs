@@ -1327,10 +1327,11 @@ WantedBy=default.target
 }
 
 /// Windows autostart for the daemon the wizard was asked to install: the same
-/// Scheduled Task the `service install` verb registers. This platform used to
-/// fall through to an Err that the caller only logged as a warning, so a user
-/// who ticked "install daemon" finished onboarding with nothing installed and
-/// no message saying so.
+/// Scheduled Task the `service install` verb registers, then started, so the
+/// daemon is running when onboarding ends rather than waiting for the next
+/// logon. This platform used to fall through to an Err that the caller only
+/// logged as a warning, so a user who ticked "install daemon" finished
+/// onboarding with nothing installed and no message saying so.
 #[cfg(target_os = "windows")]
 fn install_scheduled_task() -> Result<(), String> {
     use crate::cli::service_windows as st;
@@ -1347,8 +1348,25 @@ fn install_scheduled_task() -> Result<(), String> {
     let desc = format!("OpenCrabs daemon [{label}]. Registered by the onboarding wizard.");
 
     match st::run_script(&st::install_script(&task, &exe, &args, &desc)) {
+        st::TaskResult::Ok(_) => {}
+        st::TaskResult::Missing => {
+            return Err("the task scheduler rejected the registration".to_string());
+        }
+        st::TaskResult::Failed(e) => return Err(e),
+    }
+
+    // Registering is not starting. The task carries an AtLogOn trigger, so a
+    // fresh registration stays stopped until the NEXT logon: the wizard would
+    // report success and the user would get no daemon for the rest of this
+    // session. The Linux arm does not have this gap -- it runs "enable" and
+    // "start" in one breath -- so start here too, and return a failure to
+    // start through the same channel the install step already uses, rather
+    // than reporting an install that is not running.
+    match st::run_script(&st::start_script(&task)) {
         st::TaskResult::Ok(_) => Ok(()),
-        st::TaskResult::Missing => Err("the task scheduler rejected the registration".to_string()),
+        st::TaskResult::Missing => {
+            Err("the task was registered but could not be started".to_string())
+        }
         st::TaskResult::Failed(e) => Err(e),
     }
 }
