@@ -412,15 +412,33 @@ impl EvolveTool {
         // rollback (which renames the backup copy back) keeps working
         // unchanged. The .old sibling is cleaned up next to the backup.
         #[cfg(windows)]
+        let aside_path = {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let mut p = exe_path.clone().into_os_string();
+            p.push(format!(".old-{stamp}"));
+            std::path::PathBuf::from(p)
+        };
+        #[cfg(windows)]
         {
-            let aside_path = {
-                let mut p = exe_path.clone().into_os_string();
-                p.push(".old");
-                std::path::PathBuf::from(p)
-            };
-            // A previous interrupted evolve can leave .old behind, and
-            // rename() does not overwrite on Windows.
-            let _ = std::fs::remove_file(&aside_path);
+            // Past interrupted evolves leave .old-* siblings behind, and
+            // rename() does not overwrite on Windows. Sweep first: deleting
+            // an image another live process is running from fails with a
+            // sharing violation, which we ignore; only truly dead orphans
+            // get collected, so this can never pull a running binary's rug.
+            if let (Some(dir), Some(name)) = (exe_path.parent(), exe_path.file_name()) {
+                let prefix = format!("{name}.old");
+                if let Ok(rd) = std::fs::read_dir(dir) {
+                    for entry in rd.flatten() {
+                        let fname = entry.file_name();
+                        if fname.to_string_lossy().starts_with(&prefix) {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
             if let Err(e) = std::fs::rename(&exe_path, &aside_path) {
                 tracing::warn!(
                     target: "evolve",
@@ -460,8 +478,35 @@ impl EvolveTool {
                 "evolve: atomic rename of tmp -> exe failed"
             );
             let _ = std::fs::remove_file(&tmp_path);
+            // The Windows move-aside above means exe_path is EMPTY right
+            // now: the live image sits at aside_path. Restore it before
+            // returning, or a failed swap takes the installation offline
+            // until a human notices. The running process keeps executing
+            // from its mapped image either way; this is about the next
+            // launch, not this one.
+            #[cfg(windows)]
+            {
+                if let Err(re) = std::fs::rename(&aside_path, &exe_path) {
+                    tracing::error!(
+                        target: "evolve",
+                        exe_path = %exe_path.display(),
+                        aside = %aside_path.display(),
+                        swap_error = %e,
+                        restore_error = %re,
+                        session_id = %sid,
+                        "evolve: swap failed AND the move-aside restore failed; manual recovery required"
+                    );
+                    return Ok(ToolResult::error(format!(
+                        "Failed to replace binary at {}: {e}. Restore ALSO failed ({re}): \
+                     the previous executable is at {} and must be moved back manually.",
+                        exe_path.display(),
+                        aside_path.display(),
+                    )));
+                }
+            }
             return Ok(ToolResult::error(format!(
-                "Failed to replace binary at {}: {e}",
+                "Failed to replace binary at {}: {e}. Previous executable was restored to its \
+                 path; re-run evolve to retry the swap.",
                 exe_path.display()
             )));
         }
@@ -526,9 +571,7 @@ impl EvolveTool {
         // beyond one file.
         #[cfg(windows)]
         {
-            let mut p = exe_path.clone().into_os_string();
-            p.push(".old");
-            let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+            let _ = std::fs::remove_file(&aside_path);
         }
 
         // Extract the bundled RTK binary from the same archive.
