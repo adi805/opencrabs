@@ -1279,7 +1279,7 @@ pub(crate) fn preempt_instances_in(lock_dir: &Path, stop_services: bool) -> Vec<
     #[cfg(windows)]
     {
         if owners.is_empty() {
-            let profile = active_profile().unwrap_or_else(|| "default".to_string());
+            let profile = active_profile().unwrap_or("default");
             let ipath = lock_dir.join("instance").join(format!("{profile}.lock"));
             if let (Ok(contents), Ok(meta)) = (fs::read_to_string(&ipath), ipath.metadata()) {
                 if let Some(pid) = contents.trim().parse::<u32>().ok() {
@@ -1383,7 +1383,7 @@ pub(crate) fn preempt_instances_in(lock_dir: &Path, stop_services: bool) -> Vec<
     // stopped-flag computation is already platform-agnostic.
     #[cfg(windows)]
     {
-        let profile = active_profile().unwrap_or_else(|| "default".to_string());
+        let profile = active_profile().unwrap_or("default");
         for &pid in owners.keys() {
             // Feed terminate the newest mtime among this profile's stamps
             // naming the PID; no readable stamp mtime degrades to
