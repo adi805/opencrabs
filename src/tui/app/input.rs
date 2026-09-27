@@ -775,50 +775,60 @@ impl App {
                 if let Some(stdin) = child.stdin.as_mut() {
                     let _ = stdin.write_all(&utf16);
                 }
+                // Close the pipe before waiting: clip.exe reads to EOF, and
+                // the child handle keeps stdin open until dropped, so a
+                // wait-with-pipe-open hangs the TUI on the last-resort path.
+                drop(child.stdin.take());
                 return child.wait().is_ok_and(|s| s.success());
             }
             return false;
         }
 
-        // Try pbcopy (macOS)
-        if let Ok(mut child) = Command::new("pbcopy")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
+        // Legacy Unix backends, now gated: on Windows the arm above always
+        // returns, and these spawns can never exist here. Compiling them
+        // un-gated produced unreachable-code warnings in windows builds.
+        #[cfg(not(windows))]
         {
-            if let Some(ref mut stdin) = child.stdin {
-                let _ = stdin.write_all(text.as_bytes());
+            // Try pbcopy (macOS)
+            if let Ok(mut child) = Command::new("pbcopy")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                if let Some(ref mut stdin) = child.stdin {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                return child.wait().is_ok_and(|s| s.success());
             }
-            return child.wait().is_ok_and(|s| s.success());
-        }
 
-        // Try xclip (Linux)
-        if let Ok(mut child) = Command::new("xclip")
-            .args(["-selection", "clipboard"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            if let Some(ref mut stdin) = child.stdin {
-                let _ = stdin.write_all(text.as_bytes());
+            // Try xclip (Linux)
+            if let Ok(mut child) = Command::new("xclip")
+                .args(["-selection", "clipboard"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                if let Some(ref mut stdin) = child.stdin {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                return child.wait().is_ok_and(|s| s.success());
             }
-            return child.wait().is_ok_and(|s| s.success());
-        }
 
-        // Try xsel (Linux fallback)
-        if let Ok(mut child) = Command::new("xsel")
-            .args(["--clipboard", "--input"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            if let Some(ref mut stdin) = child.stdin {
-                let _ = stdin.write_all(text.as_bytes());
+            // Try xsel (Linux fallback)
+            if let Ok(mut child) = Command::new("xsel")
+                .args(["--clipboard", "--input"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                if let Some(ref mut stdin) = child.stdin {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                return child.wait().is_ok_and(|s| s.success());
             }
-            return child.wait().is_ok_and(|s| s.success());
         }
 
         false
@@ -1095,7 +1105,11 @@ impl App {
             let path =
                 std::env::temp_dir().join(format!("oc-paste-txt-{}.txt", std::process::id()));
             let ps = format!(
-                "Get-Clipboard -Raw | Out-File -LiteralPath '{}' -Encoding utf8",
+                // -NoNewline: Out-File appends a line terminator by default,
+                // which the reader preserves as a phantom trailing newline in
+                // the user's pasted text. -Raw already carries the exact
+                // clipboard content; do not mutate it.
+                "Get-Clipboard -Raw | Out-File -LiteralPath '{}' -Encoding utf8 -NoNewline",
                 path.display().to_string().replace('\'', "''")
             );
             let ran = {
@@ -1117,9 +1131,11 @@ impl App {
                     .is_ok_and(|s| s.success())
             };
             let text = if ran {
-                std::fs::read(&path)
-                    .ok()
-                    .map(|b| String::from_utf8_lossy(&b).trim_start_matches('\u{FEFF}').to_string())
+                std::fs::read(&path).ok().map(|b| {
+                    String::from_utf8_lossy(&b)
+                        .trim_start_matches('\u{FEFF}')
+                        .to_string()
+                })
             } else {
                 None
             };
