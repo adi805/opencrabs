@@ -429,11 +429,19 @@ impl EvolveTool {
             // sharing violation, which we ignore; only truly dead orphans
             // get collected, so this can never pull a running binary's rug.
             if let (Some(dir), Some(name)) = (exe_path.parent(), exe_path.file_name()) {
-                let prefix = format!("{}.old", name.to_string_lossy());
+                // Only the exact shape this code writes: "<name>.old-<nanos>",
+                // where the suffix is a decimal stamp. A bare `starts_with`
+                // on ".old" would also collect an operator's own
+                // `opencrabs.exe.old.bak` sitting beside the binary.
+                let prefix = format!("{}.old-", name.to_string_lossy());
                 if let Ok(rd) = std::fs::read_dir(dir) {
                     for entry in rd.flatten() {
                         let fname = entry.file_name();
-                        if fname.to_string_lossy().starts_with(&prefix) {
+                        let f = fname.to_string_lossy();
+                        let ours = f.strip_prefix(&prefix).is_some_and(|stamp| {
+                            !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit())
+                        });
+                        if ours {
                             let _ = std::fs::remove_file(entry.path());
                         }
                     }
