@@ -194,8 +194,12 @@ jobs:
   # hardcode in four child-spawn sites lived for months with CI green,
   # because tests run on Linux (where `sh` exists) and Windows was never
   # built here (#627 — the old job chronically hit the 40m cap with
-  # --all-features and cold caches). Build-only, no tests: the point is to
-  # catch spawn-path and cfg(windows) compile breakage at PR time. The
+  # --all-features and cold caches). It catches spawn-path and cfg(windows) compile breakage at
+  # PR time, and since this commit it also EXECUTES the artifact once: the
+  # --version smoke step below is the first signal in this repo's history
+  # that opencrabs.exe actually starts. Compiling was never evidence of
+  # that (#1759). Still no full test suite here: the ci-gate job comment
+  # carries the #627 cost history behind that decision. The
   # release recipe (CMake + NASM) compiles the llama-cpp-sys-2 C++ wrapper;
   # `--profile ci` (thin LTO, 16 codegen units) plus rust-cache keep the
   # wall-clock inside the cap that killed the original job.
@@ -300,6 +304,29 @@ jobs:
         # This job uses the release-shaped profile, where the linker
         # doesn't pull the esaxx object — the shape that ships releases.
         run: cargo build --locked --profile ci --target x86_64-pc-windows-msvc --all-features
+
+      # compile-green was never starts-green: a binary that dies on DLL
+      # load, console init, or allocator config at startup sails through a
+      # build-only job. This step runs the ci-profile binary THIS job just
+      # built: proof that a Windows-linked opencrabs.exe starts and answers
+      # --version. It is not the release artifact (release.yml links its own
+      # release-profile binary) — the claim is deliberately bounded. #1759
+      # shipped into a pipeline that could not distinguish the two.
+      - name: "Smoke (windows): execute the binary it built"
+        if: steps.relevant.outputs.run == 'true'
+        shell: bash
+        run: |
+          # Actions' bash runs with -e: without the guard, a failing exe
+          # would die AT the substitution and the echo below would never
+          # run — the exact case whose diagnostic we want. stderr rides in
+          # too (DLL-load failures land there).
+          set +e
+          ver=$(./target/x86_64-pc-windows-msvc/ci/opencrabs.exe --version 2>&1)
+          status=$?
+          set -e
+          echo "exit=$status version=$ver"
+          [ "$status" -eq 0 ] || exit 1
+          echo "$ver" | grep -qi opencrabs
 
   # ── Stage 3: Test on Linux (gated on lint + audit, parallel with build) ──
   # Tests run on Linux only — macOS gets build verification via
