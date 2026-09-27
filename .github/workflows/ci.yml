@@ -301,6 +301,24 @@ jobs:
         # doesn't pull the esaxx object — the shape that ships releases.
         run: cargo build --locked --profile ci --target x86_64-pc-windows-msvc --all-features
 
+  # ── Windows footgun gate (seconds, every PR, no path filter) ──────
+  # The windows-build job is deliberately path-filtered to keep #627's
+  # bill down, which means a spawn-path or POSIX-API regression in an
+  # unlisted file surfaces for the first time at RELEASE time -- that is
+  # literally how #1759 shipped. This gate covers the lexically detectable
+  # half of that class on every push for the cost of one python run:
+  # self-test first (a linter that learned to find nothing fails loudly),
+  # then the tree.
+  windows-footguns:
+    name: Windows footguns
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'self-hosted' }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Linter proves its own teeth
+        run: python3 scripts/check-windows-footguns.py --self-test
+      - name: Scan the tree
+        run: python3 scripts/check-windows-footguns.py --root src
+
   # ── Stage 3: Test on Linux (gated on lint + audit, parallel with build) ──
   # Tests run on Linux only — macOS gets build verification via
   # the `build` job above. ZeroClaw uses the same split because the
