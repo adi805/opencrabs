@@ -2235,7 +2235,7 @@ pub(crate) async fn cmd_service(operation: ServiceCommands) -> Result<()> {
                         println!("   Run: opencrabs service start");
                     }
                     st::TaskResult::Missing => {
-                        return Err(anyhow::anyhow!("task scheduler rejected the registration"))
+                        return Err(anyhow::anyhow!("task scheduler rejected the registration"));
                     }
                     st::TaskResult::Failed(e) => return Err(anyhow::anyhow!(e)),
                 }
@@ -2376,9 +2376,19 @@ pub(crate) async fn cmd_service(operation: ServiceCommands) -> Result<()> {
             #[cfg(target_os = "windows")]
             {
                 use crate::cli::service_windows as st;
-                // Best-effort stop, like the launchd arm: already-stopped is
-                // not an error; the start result is the one that matters.
-                let _ = st::run_script(&st::stop_script(&plist_name));
+                // Stop AND wait for the old daemon to exit before starting
+                // a new one: the task policy is IgnoreNew, so a start that
+                // arrives while the old process still runs is silently
+                // rejected, and even a racing shutdown holding the instance
+                // lock (#3) would bounce the newcomer. The stop result is
+                // only ignorable when it is "already not running"; a
+                // timeout waiting for exit is a hard stop for restart.
+                if let st::TaskResult::Failed(e) =
+                    st::run_script(&st::stop_and_wait_script(&plist_name))
+                {
+                    eprintln!("❌ Old daemon did not exit in time: {e}");
+                    return Err(anyhow::anyhow!("restart aborted before start: {e}"));
+                }
                 match st::run_script(&st::start_script(&plist_name)) {
                     st::TaskResult::Ok(_) => {
                         println!("✅ Restarted OpenCrabs daemon [{profile_label}]")
@@ -2431,14 +2441,22 @@ pub(crate) async fn cmd_service(operation: ServiceCommands) -> Result<()> {
                 match st::run_script(&st::status_script(&plist_name)) {
                     st::TaskResult::Ok(raw) => match st::parse_status(&raw) {
                         Ok(info) => {
-                            let mark = if info.state == "Running" { "✅" } else { "⬚" };
+                            let mark = if info.state == "Running" {
+                                "✅"
+                            } else {
+                                "⬚"
+                            };
                             println!(
                                 "{mark} OpenCrabs daemon [{profile_label}] — Scheduled Task {plist_name}"
                             );
                             println!("   state     {}", info.state);
                             println!(
                                 "   autostart {}",
-                                if info.enabled { "armed (at logon)" } else { "disarmed" }
+                                if info.enabled {
+                                    "armed (at logon)"
+                                } else {
+                                    "disarmed"
+                                }
                             );
                             println!("   action    {}", info.action);
                             println!("   last run  {} (exit {})", info.last_run, info.last_result);
@@ -2505,6 +2523,16 @@ pub(crate) async fn cmd_service(operation: ServiceCommands) -> Result<()> {
             #[cfg(target_os = "windows")]
             {
                 use crate::cli::service_windows as st;
+                // Never unregister a live task: Unregister while the daemon
+                // runs leaves a process no service verb can address any
+                // more (macOS and Linux arms stop the unit first). Stop,
+                // wait for real exit, only then remove the registration.
+                if let st::TaskResult::Failed(e) =
+                    st::run_script(&st::stop_and_wait_script(&plist_name))
+                {
+                    eprintln!("❌ Refusing to uninstall: daemon would not stop ({e})");
+                    return Err(anyhow::anyhow!("uninstall aborted: {e}"));
+                }
                 match st::run_script(&st::uninstall_script(&plist_name)) {
                     st::TaskResult::Ok(_) => {
                         println!("✅ Removed Scheduled Task [{profile_label}]: {plist_name}")
