@@ -724,14 +724,26 @@ pub fn migrate_profile(from: &str, to: &str, force: bool) -> Result<Vec<String>>
 
 // ─── Token Lock ──────────────────────────────────────────────────────
 
-/// Parse the owner PID from the second field of a lock file (`profile:pid`).
+/// Parse the owner PID from the second field of a lock file.
+///
+/// The field is `pid` for every non-Windows writer and `pid:creation-ticks` on
+/// Windows (see [`owner_stamp`]), so the PID is the *leading* `:`-separated
+/// half. Reading the whole field as a number is not a style question: a live
+/// Windows owner's stamp then fails to parse, the caller reads that as
+/// corruption, and it overwrites a lock that was protecting a running instance
+/// -- exactly the double-start this file exists to prevent.
 ///
 /// Returns `None` when the field names no live owner: a missing/zero PID, or a
 /// corrupted value (e.g. an external in-place edit concatenated entries, so the
 /// field is `"101528ops:103104"`). Callers treat `None` as a stale lock to take
 /// over, rather than coercing it to PID 0 (issue #192).
 pub(crate) fn parse_lock_owner_pid(field: &str) -> Option<u32> {
-    field.trim().parse::<u32>().ok().filter(|&p| p != 0)
+    let field = field.trim();
+    let head = match field.split_once(':') {
+        Some((head, _)) => head,
+        None => field,
+    };
+    head.trim().parse::<u32>().ok().filter(|&p| p != 0)
 }
 
 /// Split a stamp's PID field into `(pid, creation_ticks)`, tolerating both the
@@ -1177,7 +1189,9 @@ struct ForeignOwner {
 /// other than this process. Pure file inspection, no side effects. The dir is
 /// a parameter so tests can point it at a TempDir and never read the real
 /// workspace.
-fn foreign_lock_owners(lock_dir: &Path) -> std::collections::BTreeMap<u32, ForeignOwner> {
+pub(crate) fn foreign_lock_owners(
+    lock_dir: &Path,
+) -> std::collections::BTreeMap<u32, ForeignOwner> {
     let current_profile = active_profile().unwrap_or("default");
     let self_pid = std::process::id();
     let mut owners: std::collections::BTreeMap<u32, ForeignOwner> = Default::default();
