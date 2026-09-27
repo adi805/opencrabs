@@ -10,8 +10,13 @@
 //! a couple dozen lines of signatures the codebase already writes this way.
 //!
 //! Semantics mirrored from Unix:
-//! * Whole-file advisory lock (flock has no byte ranges) = `LockFileEx`
-//!   spanning the entire file with `LOCKFILE_EXCLUSIVE_LOCK`.
+//! * Mutual-exclusion lock = `LockFileEx` with `LOCKFILE_EXCLUSIVE_LOCK`
+//!   over a *sentinel range* (1 MiB and beyond, past any stamp), not the
+//!   literal whole file: an exclusive range also blocks READS by other
+//!   handles inside it, and the lock-file's `profile:pid` stamp at offset 0
+//!   must stay readable by the contender that reports `Held` (the owner-PID
+//!   message depends on it). Ranges past EOF are lockable by design, so the
+//!   contention semantics are identical while the stamp stays visible.
 //! * `LOCK_NB` = `LOCKFILE_FAIL_IMMEDIATELY`; contention reports `Held`,
 //!   exactly like `FlockOutcome::Held`, so callers keep identical arms.
 //! * Release on handle drop: the OS clears range locks when the file handle
@@ -45,8 +50,8 @@ const ERROR_LOCK_VIOLATION: i32 = 33;
 /// `ULONG_PTR Internal; ULONG_PTR InternalHigh;`
 /// `union { struct { DWORD Offset; DWORD OffsetHigh; }; PVOID Pointer; };`
 /// `HANDLE hEvent;`
-/// We always lock from offset 0 with a NULL event (synchronous), so the
-/// union is a zeroed u64 and the struct is valid as all-zeros.
+/// We always lock from the sentinel offset with a NULL event
+/// (synchronous), so the union carries that offset and the rest is zero.
 #[repr(C)]
 struct Overlapped {
     internal: usize,
@@ -55,12 +60,19 @@ struct Overlapped {
     event: RawHandle,
 }
 
+/// Lock start offset: a sentinel 1 MiB into the file. The stamp (a short
+/// `profile:pid` line) lives at offset 0 and stays readable by contenders;
+/// everything past 1 MiB is "nowhere near the data but always conflicting",
+/// since a range lock there succeeds iff no other handle holds it, and file
+/// size is irrelevant (ranges past EOF are lockable).
+const SENTINEL_OFFSET_LOW: u32 = 1 << 20;
+
 impl Overlapped {
-    fn whole_file() -> Self {
+    fn sentinel() -> Self {
         Self {
             internal: 0,
             internal_high: 0,
-            offset_union: 0,
+            offset_union: SENTINEL_OFFSET_LOW as u64,
             event: ptr::null_mut(),
         }
     }
@@ -91,16 +103,45 @@ unsafe extern "system" {
         exe_name: *mut u16,
         size: *mut u32,
     ) -> i32;
+    fn GetProcessTimes(
+        process: RawHandle,
+        creation: *mut Filetime,
+        exit: *mut Filetime,
+        kernel: *mut Filetime,
+        user: *mut Filetime,
+    ) -> i32;
+}
+
+/// Win32 `FILETIME`: 64-bit count of 100-nanosecond intervals since
+/// 1601-01-01 UTC, laid out low-then-high on disk.
+#[repr(C)]
+struct Filetime {
+    low: u32,
+    high: u32,
+}
+
+impl Filetime {
+    fn ticks(self) -> u64 {
+        ((self.high as u64) << 32) | self.low as u64
+    }
+}
+
+/// 1601-01-01 → 1970-01-01 in 100ns ticks (369 years).
+const WINDOWS_TICKS_BEFORE_UNIX: u64 = 116_444_736_000_000_000;
+
+fn system_time_ticks(t: io::Result<std::time::SystemTime>) -> Option<u64> {
+    let d = t.ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(WINDOWS_TICKS_BEFORE_UNIX + d.as_secs() * 10_000_000 + (d.subsec_nanos() as u64) / 100)
 }
 
 /// Exclusive whole-file lock on `handle`, mirroring `flock::exclusive`
 /// argument-for-argument: `nb == true` behaves like `LOCK_NB` — a contended
 /// lock returns [`LockOutcome::Held`] immediately instead of waiting.
 pub fn exclusive(handle: RawHandle, nb: bool) -> LockOutcome {
-    let ov = Overlapped::whole_file();
+    let ov = Overlapped::sentinel();
     let flags = LOCKFILE_EXCLUSIVE_LOCK | if nb { LOCKFILE_FAIL_IMMEDIATELY } else { 0 };
-    // low = high = 0xFFFFFFFF locks "to EOF", covering every byte, the
-    // byte-range analogue of flock(fd, LOCK_EX) on the whole file.
+    // Sentinel range [1 MiB, +16 EB): contends exactly like a whole-file
+    // flock while leaving the offset-0 stamp readable (see module docs).
     let ok = unsafe { LockFileEx(handle, flags, 0, u32::MAX, u32::MAX, &ov) };
     if ok != 0 {
         return LockOutcome::Acquired;
@@ -117,7 +158,7 @@ pub fn exclusive(handle: RawHandle, nb: bool) -> LockOutcome {
 /// underlying `File` also releases (the OS cleans up on handle close); this
 /// exists so a caller can see the error when the release itself fails.
 pub fn unlock(handle: RawHandle) -> io::Result<()> {
-    let ov = Overlapped::whole_file();
+    let ov = Overlapped::sentinel();
     if unsafe { UnlockFileEx(handle, 0, u32::MAX, u32::MAX, &ov) } != 0 {
         Ok(())
     } else {
@@ -131,12 +172,18 @@ pub fn unlock(handle: RawHandle) -> io::Result<()> {
 /// Windows console process has no signal channel at all, so this is the rude
 /// rung only. That is exactly why a PID alone must not pull the trigger:
 /// Windows recycles PIDs, and a stale lock stamp can name an unrelated
-/// process holding the number now. So we open the process, ask kernel32 for
-/// its FULL IMAGE PATH, and compare it (case-insensitively) against this
-/// process's own `current_exe()`. Not us — or unreadable — we do NOT kill.
-/// "Leaves a stubborn instance running" always beats "kills something
-/// unrelated the user is doing".
-pub fn terminate(pid: u32) -> io::Result<()> {
+/// process holding the number now. Two independent proofs, both required:
+///  1. IMAGE PATH: kernel32's full image path of the target, compared
+///     (case-insensitively) against this process's own `current_exe()`.
+///  2. BIRTH TIME: `GetProcessTimes` creation vs the stamp file's
+///     `stamped_at` mtime. A process born AFTER the stamp was last written
+///     cannot have written it; so whatever it is, it is not the owner, and
+///     the PID was recycled under a stale stamp. (The range lock proves
+///     nothing about who holds it; the file stamp is not an OS lock.)
+/// Anything unverifiable (unreadable image, failed time query, missing
+/// mtime) we do NOT kill. "Leaves a stubborn instance running" always
+/// beats "kills something unrelated the user is doing".
+pub fn terminate(pid: u32, stamped_at: std::time::SystemTime) -> io::Result<()> {
     const PROCESS_TERMINATE: u32 = 0x0001;
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 
@@ -164,10 +211,40 @@ pub fn terminate(pid: u32) -> io::Result<()> {
         let path = String::from_utf16_lossy(&buf[..size as usize]);
         match normalize_exe_path(std::path::Path::new(&path)) {
             Some(target) if target == self_exe => {
-                if unsafe { TerminateProcess(h, 1) } != 0 {
-                    Ok(())
-                } else {
+                // Image matches; now prove the process is older than the
+                // stamp it supposedly wrote. All four time outputs are
+                // required by the API shape; only creation is read.
+                let mut creation = Filetime { low: 0, high: 0 };
+                let mut ignored = Filetime { low: 0, high: 0 };
+                if unsafe {
+                    GetProcessTimes(h, &mut creation, &mut ignored, &mut ignored, &mut ignored)
+                } == 0
+                {
                     Err(io::Error::last_os_error())
+                } else {
+                    match system_time_ticks(Ok(stamped_at)) {
+                        Some(stamp) if creation.ticks() <= stamp => {
+                            if unsafe { TerminateProcess(h, 1) } != 0 {
+                                Ok(())
+                            } else {
+                                Err(io::Error::last_os_error())
+                            }
+                        }
+                        Some(_) => Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!(
+                                "refusing to terminate PID {pid}: same image, but the process \
+                                 was created after the lock stamp was written (PID reuse)"
+                            ),
+                        )),
+                        None => Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "refusing to terminate PID {pid}: stamp mtime unreadable, \
+                                 PID reuse cannot be ruled out"
+                            ),
+                        )),
+                    }
                 }
             }
             Some(_) => Err(io::Error::new(
@@ -188,7 +265,12 @@ pub fn terminate(pid: u32) -> io::Result<()> {
 /// compare case-insensitively (short paths and the current one can differ in
 /// case and separator style while naming the same file).
 fn normalize_exe_path(p: &std::path::Path) -> Option<String> {
-    Some(p.to_string_lossy().to_lowercase().trim_end_matches('\\').to_string())
+    Some(
+        p.to_string_lossy()
+            .to_lowercase()
+            .trim_end_matches('\\')
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -229,6 +311,12 @@ mod tests {
             exclusive(b.as_raw_handle(), true),
             LockOutcome::Acquired
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        // Windows cannot remove a file while a handle is open on it, and
+        // cannot remove a non-empty dir either: drop every handle first,
+        // then assert the cleanup itself. Ignoring this result let the
+        // temp dir leak on every run without anyone noticing.
+        drop(a);
+        drop(b);
+        std::fs::remove_dir_all(&dir).expect("test temp dir cleanup");
     }
 }
