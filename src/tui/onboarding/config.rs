@@ -1362,6 +1362,17 @@ fn install_scheduled_task() -> Result<(), String> {
     // "start" in one breath -- so start here too, and return a failure to
     // start through the same channel the install step already uses, rather
     // than reporting an install that is not running.
+    //
+    // Starting while the wizard's own TUI is still alive is deliberate parity,
+    // and it carries a cost that is not Windows-specific: the daemon can lose
+    // the race for a channel token lock held by this process, and a channel it
+    // cannot acquire is skipped rather than retried. The Linux arm one screen
+    // above (`for op in ["enable", "start"]`) and macOS (`RunAtLoad` plus
+    // `launchctl load`) start from inside the same wizard and have the same
+    // property. So the fix for that race is a serialised handover in the
+    // wizard, for all three platforms at once -- deferring the start in this
+    // arm alone would re-open the "installed but never running" gap above and
+    // make Windows the only platform that starts late.
     match st::run_script(&st::start_script(&task)) {
         st::TaskResult::Ok(_) => Ok(()),
         st::TaskResult::Missing => {
