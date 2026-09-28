@@ -153,6 +153,16 @@ pub const WM_MBUTTONUP: u32 = 0x0208;
 pub const WM_KEYDOWN: u32 = 0x0100;
 pub const WM_KEYUP: u32 = 0x0101;
 pub const WM_CHAR: u32 = 0x0102;
+/// Ask a window to close itself, through its own message queue.
+///
+/// This is deliberately not `TerminateProcess`. A window that is asked to
+/// close may still refuse because it has unsaved work, and that refusal is
+/// the documented behaviour of every normal application. Killing by process id
+/// is not even available to us here for a console we spawned: the pid carried
+/// by a window is the one belonging to the console *host*, and on this runner
+/// more than one window shares that host, so terminating it would take the
+/// job's own console down with it.
+pub const WM_CLOSE: u32 = 0x0010;
 
 /// A point in physical screen pixels: the same coordinate space
 /// [`super::Rect`] and `GetWindowRect` use.

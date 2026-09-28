@@ -49,24 +49,63 @@ pub(crate) fn note(line: &str) {
 
 /// Open a console that prints its marker and then sits at its own prompt.
 ///
-/// The prompt is the point, and it cost one red run to learn it. The first
-/// version of this helper kept the window alive with `ping -n 120 127.0.0.1`,
-/// which is a *running program*: with nothing reading the console, Windows
-/// parks typed characters in conhost's typeahead buffer and paints none of
-/// them, so both typing receipts compared two frames of a window that could
-/// not change and blamed the input lane. `cmd /K` with builtins only leaves the
-/// shell in line-input mode with echo on, which is the state where an injected
-/// character reaches the screen buffer at all.
+/// The prompt is the point, and it cost two red runs to learn how to get one.
 ///
-/// No receipt here sends Enter to that prompt unless it says so in its own
-/// name, so a stray character never becomes a command by accident.
+/// First attempt: keep the window alive with `ping -n 120 127.0.0.1`. That is a
+/// *running program*, so nothing reads the console, and Windows parks typed
+/// characters in the typeahead buffer and paints none of them. Both typing
+/// receipts compared two frames of a window that could not change, and blamed
+/// the input lane.
+///
+/// Second attempt: drop the `ping` and let `cmd /K` reach its prompt. Measured
+/// by `desktop_input_probe_test` on the runner, that console's process was
+/// already `EXITED` within a hundred milliseconds, and a third variant with
+/// null standard handles never produced a window at all. The reason is that our
+/// stdin is the job's, which is a pipe at end-of-file: a shell reading its
+/// prompt from a dead pipe gets EOF and quits. Two different-looking failures,
+/// one cause, and the capture lane was innocent both times.
+///
+/// So we let `cmd` launch the console instead of spawning it ourselves. `start`
+/// creates the process without handing it our standard handles, which means its
+/// stdin is the input buffer of its own console: the prompt waits for keyboard
+/// input, an injected character is echoed by the shell, and Enter submits a
+/// line. The `Child` returned here is the launcher, which exits at once and is
+/// no longer the thing keeping the window open.
+///
+/// That has one cost we accept knowingly: nothing kills the console when a test
+/// panics, so a red run leaves its windows on screen until the job ends. The
+/// runner is disposable and every marker title carries this process's id, so a
+/// leftover cannot be mistaken for another test's window. `close_window` exists
+/// for the paths that do reach their end.
 pub(crate) fn spawn_marker_window(marker: &str) -> Child {
+    // A title argument is mandatory in `start`'s grammar and would otherwise be
+    // eaten as the window title, so the launcher passes one it does not care
+    // about and the inner shell sets the real title.
     let script = format!("title {marker} & mode con cols=100 lines=20 & echo {marker}");
     Command::new("cmd.exe")
-        .args(["/K", script.as_str()])
+        .args([
+            "/C",
+            "start",
+            "opencrabs-input-probe",
+            "cmd.exe",
+            "/K",
+            script.as_str(),
+        ])
         .creation_flags(CREATE_NEW_CONSOLE)
         .spawn()
-        .expect("spawn cmd.exe in a new console")
+        .expect("spawn cmd.exe through start, in its own console")
+}
+
+/// Ask a console to close itself by handle, the polite route.
+///
+/// Not a process kill: see [`crate::desktop::WM_CLOSE`] for why the pid on a
+/// console window belongs to the host and must never be terminated from here.
+pub(crate) fn close_window(hwnd: isize) {
+    let posted = crate::desktop::post_close(hwnd);
+    note(&format!(
+        "closed window {hwnd}: {}",
+        if posted { "posted WM_CLOSE" } else { "refused" }
+    ));
 }
 
 /// Every top-level window, as one line each, for the diagnostic output.

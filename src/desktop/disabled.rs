@@ -116,6 +116,15 @@ pub fn inject_key(_key: super::input_events::Key) -> io::Result<super::input::De
 
 /// See [`super::input_windows::inject_text_as_keys`]: refused here because there
 /// is no keyboard to press, not because the question was unreasonable.
+/// Fail closed: there is no window to ask.
+///
+/// `false` rather than an error because the Windows half of this pair answers
+/// the same question ("did the message get in") with a bool, and a caller
+/// written against `bool` must not be able to read a Linux run as a success.
+pub fn post_close(_hwnd: isize) -> bool {
+    false
+}
+
 pub fn inject_text_as_keys(_text: &str) -> io::Result<super::input::Delivery> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,

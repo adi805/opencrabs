@@ -186,6 +186,21 @@ fn inject(events: &[Input]) -> io::Result<Delivery> {
 ///
 /// Stops at the first refusal and reports how many landed, for the same reason
 /// [`inject`] does: a partially delivered press/release pair is a held button.
+/// Ask one window to close itself, by posting `WM_CLOSE` to its queue.
+///
+/// Returns whether the message got in, not whether the window went away. A
+/// window is free to ignore a close request it has not finished earning, so a
+/// caller that needs the disappearance confirmed looks for that separately.
+///
+/// This exists because the alternative is wrong here in a way that is easy to
+/// miss: the pid attached to a console window belongs to the console *host*
+/// process, which on this runner owns several windows including the job's own.
+/// Terminating that pid would take the agent's console down with the window we
+/// were tidying up.
+pub fn post_close(hwnd: isize) -> bool {
+    unsafe { PostMessageW(hwnd, super::input::WM_CLOSE, 0, 0) != 0 }
+}
+
 fn post(hwnd: isize, messages: &[super::input_events::PostedMessage]) -> io::Result<Delivery> {
     if hwnd == 0 {
         return Err(io::Error::new(

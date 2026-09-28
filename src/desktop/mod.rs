@@ -88,7 +88,7 @@ pub use input::{
     MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
     MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
     MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MouseButton, MouseInput, ScreenPoint, VK_CONTROL,
-    VK_MENU, VK_SHIFT, VKS_ALT, VKS_CONTROL, VKS_SHIFT, WM_CHAR, WM_KEYDOWN, WM_KEYUP,
+    VK_MENU, VK_SHIFT, VKS_ALT, VKS_CONTROL, VKS_SHIFT, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WinPoint, char_units, keyboard_input, mouse_input, mouse_lparam, normalize_axis,
 };
@@ -104,11 +104,11 @@ pub use input_events::{
 #[cfg(windows)]
 pub use input_windows::{
     click_window, cursor_position, inject_click, inject_key, inject_text, inject_text_as_keys,
-    press_key_in_window, type_into_window, virtual_desktop,
+    post_close, press_key_in_window, type_into_window, virtual_desktop,
 };
 
 #[cfg(not(windows))]
 pub use disabled::{
     click_window, cursor_position, inject_click, inject_key, inject_text, inject_text_as_keys,
-    press_key_in_window, type_into_window, virtual_desktop,
+    post_close, press_key_in_window, type_into_window, virtual_desktop,
 };

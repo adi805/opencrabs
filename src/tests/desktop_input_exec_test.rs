@@ -30,7 +30,8 @@
 use crate::desktop::Key;
 use crate::desktop::{Delivery, inject_key, inject_text, interactive_session};
 use crate::tests::desktop_input_util::{
-    capture_stable, note, spawn_marker_window, stop, wait_for_title, wait_for_window, write_png,
+    capture_stable, close_window, note, spawn_marker_window, stop, wait_for_title, wait_for_window,
+    write_png,
 };
 
 /// The typed command, with the pid in the new title so two runs cannot read each
@@ -113,6 +114,11 @@ fn input_dump_a_typed_command_changes_the_window_title() {
     };
     let _ = write_png("exec-before.png", &before);
     let _ = write_png("exec-after.png", &after);
+    // The console we drove has earned its close, and this is the one path that
+    // reaches it: close_window is the polite request, and stop() takes back the
+    // launcher (already gone). Panic paths above skip this on purpose, which is
+    // why the marker title carries this process's pid.
+    close_window(window.hwnd);
     stop(&mut child);
 
     let Delivery::Injected { events } = typed else {
