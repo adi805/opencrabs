@@ -261,3 +261,67 @@ fn a_summary_of_input_with_no_action_does_not_panic() {
     let line = policy::summarize(&value);
     assert!(line.contains("missing"), "got {line:?}");
 }
+
+#[test]
+fn a_seat_with_no_screen_refuses_every_action_that_could_be_misread() {
+    // The invariant, not one example per action: a name added to the Windows half
+    // later gets refused on a dead seat by default, exactly like the ones here.
+    for action in policy::KNOWN_ACTIONS {
+        let outcome = policy::check_seat(action, false);
+        if *action == "seat_report" {
+            assert!(
+                outcome.is_ok(),
+                "{action} is the question about the seat, so it has to answer even without one"
+            );
+        } else {
+            let reason = outcome.unwrap_err();
+            assert!(
+                reason.contains("seat_report"),
+                "{action} was refused without naming the action that can explain the refusal: {reason}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_seat_that_exists_does_not_make_anything_free() {
+    // The seat gate answers "is this possible here". It must never quietly
+    // become the approval gate too, or a human at a real desktop stops being
+    // asked and starts being surprised.
+    for action in policy::KNOWN_ACTIONS {
+        assert!(
+            policy::check_seat(action, true).is_ok(),
+            "{action} was refused on a seat that has a desktop"
+        );
+    }
+}
+
+#[test]
+fn the_seat_gate_and_the_approval_gate_hold_at_the_same_time() {
+    // Two independent facts about one invocation, checked together because the
+    // tool asks them in this order and a change to either list can break the
+    // combination silently.
+    assert!(
+        policy::requires_approval("click_window"),
+        "moving a human's mouse has to be asked"
+    );
+    assert!(
+        policy::check_seat("click_window", false).is_err(),
+        "and it cannot be done where there is no screen"
+    );
+    assert!(policy::check_seat("click_window", true).is_ok());
+
+    assert!(
+        !policy::requires_approval("list_windows"),
+        "looking does not interrupt anyone"
+    );
+    assert!(
+        policy::check_seat("list_windows", false).is_err(),
+        "but an empty answer from a seat with no desktop is the lie this gate exists to stop"
+    );
+
+    assert!(
+        policy::check_seat("seat_report", false).is_ok(),
+        "asking about the seat is how a refusal like the one above gets explained"
+    );
+}

@@ -55,6 +55,36 @@ pub fn requires_approval(action: &str) -> bool {
     !READ_ONLY.contains(&action)
 }
 
+/// The one action that can still be answered when there is no screen to look at.
+const SEAT_FREE: &[&str] = &["seat_report"];
+
+/// Whether this action may be attempted from a session that has no desktop.
+///
+/// `interactive` is the platform lane's reading: our own session id, the console
+/// session id, and the window station, in that order. A `false` there is not a
+/// failure to retry, it is the reason an empty window list cannot be trusted.
+///
+/// This refusal exists to stop the worst misreading the surface allows. An agent
+/// that called `list_windows` from a Session 0 service would get nothing back,
+/// conclude that nothing is open, and act on that. So the read-only actions are
+/// refused here for the same reason as the touching ones: not because they are
+/// dangerous, but because on a seat with no screen they cannot be answered
+/// honestly at all.
+///
+/// The other half of the seat posture is deliberately not in this function: a
+/// human sitting at a real desktop who has not agreed to have their mouse moved
+/// is what [`requires_approval`] is for, and every name outside the read-only
+/// list already pays it. A seat that exists does not make an action free.
+pub fn check_seat(action: &str, interactive: bool) -> Result<(), String> {
+    if interactive || SEAT_FREE.contains(&action) {
+        return Ok(());
+    }
+    Err(format!(
+        "{action} needs a desktop a person could see, and this process is not attached to one; \
+         call seat_report for the session reading"
+    ))
+}
+
 /// The actions that name one particular window, and so are meaningless without
 /// a handle to name it with.
 ///
