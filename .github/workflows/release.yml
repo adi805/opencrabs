@@ -252,9 +252,18 @@ jobs:
           # The ci.yml smoke runs the ci-profile binary; this one runs the
           # release-profile binary that actually ships in
           # opencrabs-v<version>-windows-amd64.zip (different LTO/codegen
-          # shape, different link). If it dies on DLL load or console
-          # init, stop before packaging so a dead artifact never reaches
-          # the download page. Greptile P1 finding on the #2 smoke.
+          # shape, different link). Greptile P1 finding on the #2 smoke.
+          #
+          # Scope, stated exactly: this proves the packaged image LOADS and
+          # that its CLI parses -- a missing DLL, a broken link, an
+          # import-table failure all stop here. It does NOT prove normal
+          # startup: --version returns from argument parsing before profile
+          # setup and logging init run, so an init-time failure would still
+          # reach the download page. Driving a non-TUI subcommand
+          # (e.g. `status`) is the follow-up that covers it, and it is not
+          # in this step because no Windows host was available to validate
+          # it -- an unvalidated probe in the release path can block a
+          # release, which is worse than a check with a stated edge.
           set +e
           ver=$(./target/${{ matrix.target }}/release/${{ matrix.artifact_name }} --version 2>&1)
           status=$?

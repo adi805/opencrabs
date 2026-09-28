@@ -6,6 +6,8 @@ pub(crate) mod alias_merge;
 mod current;
 #[cfg(unix)]
 pub(crate) mod flock;
+#[cfg(windows)]
+pub(crate) mod winlock;
 pub mod guard;
 pub mod health;
 pub(crate) mod live_home_guard;

@@ -1288,9 +1288,70 @@ fn install_daemon_service() -> Result<(), String> {
         install_launchagent()
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        install_scheduled_task()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         Err("Daemon installation not supported on this platform".to_string())
+    }
+}
+
+/// Windows autostart for the daemon the wizard was asked to install: the same
+/// Scheduled Task the `service install` verb registers, then started, so the
+/// daemon is running when onboarding ends rather than waiting for the next
+/// logon. This platform used to fall through to an Err that the caller only
+/// logged as a warning, so a user who ticked "install daemon" finished
+/// onboarding with nothing installed and no message saying so.
+#[cfg(target_os = "windows")]
+fn install_scheduled_task() -> Result<(), String> {
+    use crate::cli::service_windows as st;
+
+    let exe = std::env::current_exe().map_err(|e| format!("Failed to get exe path: {e}"))?;
+    let args = crate::cli::commands::daemon_args();
+    let profile = crate::config::profile::active_profile();
+    let suffix = match profile {
+        Some(name) if name != "default" => format!(".{name}"),
+        _ => String::new(),
+    };
+    let task = format!("com.opencrabs.daemon{suffix}");
+    let label = profile.unwrap_or("default");
+    let desc = format!("OpenCrabs daemon [{label}]. Registered by the onboarding wizard.");
+
+    match st::run_script(&st::install_script(&task, &exe, &args, &desc)) {
+        st::TaskResult::Ok(_) => {}
+        st::TaskResult::Missing => {
+            return Err("the task scheduler rejected the registration".to_string());
+        }
+        st::TaskResult::Failed(e) => return Err(e),
+    }
+
+    // Registering is not starting. The task carries an AtLogOn trigger, so a
+    // fresh registration stays stopped until the NEXT logon: the wizard would
+    // report success and the user would get no daemon for the rest of this
+    // session. The Linux arm does not have this gap -- it runs "enable" and
+    // "start" in one breath -- so start here too, and return a failure to
+    // start through the same channel the install step already uses, rather
+    // than reporting an install that is not running.
+    //
+    // Starting while the wizard's own TUI is still alive is deliberate parity,
+    // and it carries a cost that is not Windows-specific: the daemon can lose
+    // the race for a channel token lock held by this process, and a channel it
+    // cannot acquire is skipped rather than retried. The Linux arm one screen
+    // above (`for op in ["enable", "start"]`) and macOS (`RunAtLoad` plus
+    // `launchctl load`) start from inside the same wizard and have the same
+    // property. So the fix for that race is a serialised handover in the
+    // wizard, for all three platforms at once -- deferring the start in this
+    // arm alone would re-open the "installed but never running" gap above and
+    // make Windows the only platform that starts late.
+    match st::run_script(&st::start_script(&task)) {
+        st::TaskResult::Ok(_) => Ok(()),
+        st::TaskResult::Missing => {
+            Err("the task was registered but could not be started".to_string())
+        }
+        st::TaskResult::Failed(e) => Err(e),
     }
 }
 

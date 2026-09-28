@@ -95,11 +95,21 @@ impl TriggerRunner {
         Self { timeout }
     }
 
-    /// Run the given shell command under `/bin/sh -c` with the configured timeout.
+    /// Run the given shell command under the platform shell with the
+    /// configured timeout. This is the repo's own shell contract
+    /// ([`crate::utils::shell::shell_pair`] + `PushShellCommand`), not a
+    /// hand-rolled `.arg()`: cmd.exe does not parse MSVCRT-escaped argv, so
+    /// a quoted payload like `dir "C:\Program Files"` must ride through as
+    /// raw text (raw_arg), while unix keeps plain .arg semantics.
+    /// Hardcoding `/bin/sh -c` here compiles green on the windows build but
+    /// fails at runtime on every trigger -- exactly the "starts vs ships"
+    /// class the footgun gate exists to catch. The POSIX-vs-cmd dialect
+    /// gap for trigger snippets is tracked as #7.
     pub async fn run(&self, cmd: &str) -> Result<TriggerResult, String> {
-        let child = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(cmd)
+        use crate::utils::shell::PushShellCommand;
+        let (shell, shell_arg) = crate::utils::shell::shell_pair();
+        let child = Command::new(shell)
+            .push_shell_command(shell_arg, cmd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             // On timeout the future below is dropped, and a tokio Child does
