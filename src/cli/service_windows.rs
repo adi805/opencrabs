@@ -202,7 +202,11 @@ pub fn parse_status(raw: &str) -> Result<TaskStatus, String> {
 /// candidates sit under package-manager ACLs a plain user cannot swap
 /// a binary into. PATH-discovered pwsh installs lose here on purpose;
 /// every cmdlet this module emits exists in 5.1.
-fn shell_program() -> std::path::PathBuf {
+/// `pub(crate)` rather than private only because the extracted test in
+/// `crate::tests::service_windows_test` reaches it: every other item this module
+/// exports is part of the CLI surface. Same shape as `norm_key` in the Discord
+/// handler, which the repo widened when its own inline block was extracted.
+pub(crate) fn shell_program() -> std::path::PathBuf {
     let sys_root = std::env::var("SystemRoot")
         .or_else(|_| std::env::var("windir"))
         .unwrap_or_else(|_| r"C:\Windows".to_string());
@@ -279,159 +283,5 @@ pub fn run_script(script: &str) -> TaskResult {
             }
         }
         Err(e) => TaskResult::Failed(format!("could not start the powershell host: {e}")),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn task_name_tracks_the_launchd_identifier() {
-        assert_eq!(task_name("com.opencrabs.daemon"), "com.opencrabs.daemon");
-    }
-
-    #[test]
-    fn ps_str_quotes_and_escapes_literals() {
-        assert_eq!(
-            ps_str(r"C:\Users\joe\opencrabs.exe"),
-            r"'C:\Users\joe\opencrabs.exe'"
-        );
-        assert_eq!(ps_str("it's"), "'it''s'");
-        assert_eq!(ps_str("$env:x"), "'$env:x'");
-        assert_eq!(ps_str("a; Remove-Item *"), "'a; Remove-Item *'");
-    }
-
-    #[test]
-    fn join_arguments_quotes_only_what_needs_it() {
-        assert_eq!(join_arguments(&["daemon".into()]), "daemon");
-        assert_eq!(
-            join_arguments(&["-p".into(), "work".into(), "daemon".into()]),
-            "-p work daemon"
-        );
-        assert_eq!(
-            join_arguments(&["-p".into(), "es cap e".into(), "daemon".into()]),
-            "-p 'es cap e' daemon"
-        );
-    }
-
-    /// The apostrophe-in-path case that would otherwise break PS parsing
-    /// and inject script: it must arrive doubled inside the literal.
-    #[test]
-    fn install_script_survives_hostile_paths() {
-        let s = install_script(
-            "com.opencrabs.daemon",
-            &PathBuf::from(r"C:\Users\O'Brien\opencrabs.exe"),
-            &["daemon".into()],
-            "don't; do this",
-        );
-        assert!(
-            s.contains(r#"-Execute 'C:\Users\O''Brien\opencrabs.exe'"#),
-            "{s}"
-        );
-        assert!(s.contains(r#"-Description 'don''t; do this'"#), "{s}");
-        assert!(s.contains("-ExecutionTimeLimit ([TimeSpan]::Zero)"));
-        assert!(s.contains("-MultipleInstances IgnoreNew"));
-        assert!(s.contains("-Force"));
-    }
-
-    #[test]
-    fn status_parses_line_protocol() {
-        let raw = "state|Running\nenabled|True\naction|C:\\a\\opencrabs.exe daemon\nlastrun\nnextrun|1/1/2026 1:00 AM\nresult|0";
-        let st = parse_status(raw).unwrap();
-        assert_eq!(st.state, "Running");
-        assert!(st.enabled);
-        assert_eq!(st.next_run, "1/1/2026 1:00 AM");
-        // A line missing its value separator still yields the field default.
-        assert_eq!(st.last_run, "-");
-        assert_eq!(st.last_result, "0");
-    }
-
-    #[test]
-    fn status_rejects_foreign_output() {
-        assert!(parse_status("garbage without protocol").is_err());
-    }
-
-    #[test]
-    fn lifecycle_scripts_target_the_task_by_literal() {
-        assert!(uninstall_script("t").contains("-Confirm:$false"));
-        assert!(stop_script("t").contains("Stop-ScheduledTask"));
-        // quoting must survive a hostile task name in the wait loop too
-        let w = stop_and_wait_script("t'x");
-        assert!(w.contains("Stop-ScheduledTask -TaskName 't''x'"));
-        assert!(w.contains("Get-ScheduledTask -TaskName 't''x'"));
-        assert!(w.contains("exit 1"));
-    }
-
-    #[test]
-    fn install_settings_restart_crashes_and_never_expire() {
-        let s = install_script("t", std::path::Path::new("C:\\bin\\oc.exe"), &[], "d");
-        assert!(s.contains("-RestartCount 3"));
-        assert!(s.contains("-RestartInterval (New-TimeSpan -Minutes 1)"));
-        assert!(s.contains("-ExecutionTimeLimit ([TimeSpan]::Zero)"));
-    }
-
-    // Windows-only: `shell_program()` is the one function in this module
-    // whose result is platform-specific. Off Windows the module still
-    // compiles (its script builders are pure), but the `SystemRoot` fallback
-    // below is a `C:\Windows\...` path, and a Unix host reads it two ways
-    // that both break this test: `Path::is_absolute()` is false, and `\` is
-    // not a separator so `file_name()` returns the whole string. Asserting
-    // either there fails for the wrong reason and takes the Linux `Test` job
-    // down with it. Where it does run, stated exactly, because "somewhere in
-    // CI" is not a guarantee: nothing on THIS branch executes it. The Windows
-    // job here builds and smoke-tests only. The scoped slice that would run
-    // `cargo test --target x86_64-pc-windows-msvc --lib -- cli::service_windows`
-    // is PR #11's, on a branch that does not contain this module yet, so until
-    // the two land together the assertion is exercised only on a Windows
-    // developer box via that same command. That is a real coverage gap in this
-    // PR, and naming it here is cheaper than the next reader assuming a green
-    // check mark means someone watched this path.
-    #[cfg(windows)]
-    #[test]
-    fn shell_program_is_an_absolute_trusted_path() {
-        let p = shell_program();
-        assert!(p.is_absolute(), "must never be a bare PATH name: {p:?}");
-        let leaf = p.file_name().map(|f| f.to_string_lossy().into_owned());
-        assert!(matches!(
-            leaf.as_deref(),
-            Some("pwsh.exe") | Some("powershell.exe")
-        ));
-    }
-
-    #[test]
-    fn run_script_is_inert_off_windows() {
-        #[cfg(not(windows))]
-        assert!(matches!(run_script("x"), TaskResult::Failed(_)));
-    }
-
-    /// The wait loop must distinguish "the task is gone" from "I could not ask".
-    /// Exit 0 means stopped to the caller, so every unclassifiable query error
-    /// has to land on a different code -- otherwise `service uninstall`
-    /// unregisters a task whose daemon is still holding the instance lock, and
-    /// nothing can address that process afterwards.
-    #[test]
-    fn stop_and_wait_treats_only_a_missing_task_as_stopped() {
-        let s = stop_and_wait_script("com.opencrabs.daemon");
-        assert!(
-            s.contains("$_.CategoryInfo.Category -eq 'ObjectNotFound'"),
-            "the not-found case must be discriminated explicitly: {s}"
-        );
-        // The not-found branch exits 0; the catch-all must not.
-        let catch_all = s
-            .split("[Console]::Error.WriteLine")
-            .nth(1)
-            .expect("catch-all branch present");
-        assert!(
-            catch_all.contains("exit 2"),
-            "an unclassifiable query failure must not exit 0: {s}"
-        );
-        assert!(
-            s.contains("if ((Get-Date) -gt $deadline) { exit 1 }"),
-            "the timeout path exits 1 so callers can refuse to proceed: {s}"
-        );
-        // The task name is a single-quoted literal, never interpolated raw.
-        assert!(s.contains("-TaskName 'com.opencrabs.daemon'"), "{s}");
     }
 }

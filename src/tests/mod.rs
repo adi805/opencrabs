@@ -423,6 +423,7 @@ pub mod secret_hygiene_oc05_test;
 pub mod seen_skills_test;
 #[cfg(target_os = "linux")]
 pub mod service_scope_test;
+pub mod service_windows_test;
 pub mod services_context_test;
 pub mod services_file_test;
 pub mod services_message_test;
@@ -486,6 +487,7 @@ pub mod telegram_voice_thread_test;
 pub mod timeout_resolution_test;
 pub mod tool_search_child_registry_test;
 pub mod tools_md_regression_test;
+pub mod winlock_test;
 pub mod work_status_output_full_test;
 pub mod work_status_parent_binding_test;
 pub mod write_opencrabs_file_inline_test;
