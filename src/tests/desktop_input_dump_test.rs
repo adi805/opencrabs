@@ -28,6 +28,17 @@
 //!    than read characters can see at all. Without a job for it, the fallback
 //!    would only be claimed to exist.
 //!
+//! A photograph carries two claims at once, and the first run of this file
+//! learned that the hard way: a flat frame is exactly what "the keystrokes never
+//! arrived" looks like, and also exactly what "the capture cannot see this window
+//! repaint" looks like, and those two need opposite fixes. So the pixel floor
+//! here is measured against a control (two photographs of the same window with
+//! nothing typed between them, which prices the caret honestly) instead of
+//! against a constant I would have to invent on a machine with no console cell,
+//! and the claim that needs no camera at all (type a command, watch the shell
+//! rename its own window through `GetWindowTextW`) lives in
+//! `desktop_input_exec_test`.
+//!
 //! Each job drives a console window it opened itself, for the reason the capture
 //! dump gives: a hosted runner's desktop is not ours to depend on, and a window
 //! we own is one whose contents we can predict.
@@ -38,121 +49,46 @@
 //! Run locally:
 //! `cargo test --locked --profile ci --target x86_64-pc-windows-msvc --lib \
 //!  input_dump -- --ignored --nocapture`
-
-use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
-use std::process::{Child, Command};
-use std::time::{Duration, Instant};
-
 use crate::desktop::{
-    Delivery, MIN_INK_RATIO, MouseButton, ScreenPoint, WindowInfo, capture_window, click_window,
-    cursor_position, inject_click, inject_text, inject_text_as_keys, interactive_session,
-    list_windows,
+    Delivery, MouseButton, ScreenPoint, click_window, cursor_position, inject_click, inject_text,
+    inject_text_as_keys, interactive_session,
+};
+use crate::tests::desktop_input_util::{
+    PAINT_SETTLE, capture_stable, lit_pixels, note, spawn_marker_window, stop, wait_for_window,
+    write_png,
 };
 
-/// `CREATE_NEW_CONSOLE`: without it `cmd.exe` inherits this process's console and
-/// there is no separate window to drive.
-const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-
-/// How long to wait for the console to appear and to settle.
-const WINDOW_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// A short pause so conhost has repainted before the second photograph. Not a
-/// synchronisation primitive: Windows gives no way to ask a window whether it
-/// has finished painting, so the honest options are a delay or a retry loop on
-/// the measurement itself. This retries on the measurement (see
-/// `capture_until_more_ink`) and the delay only sets the floor.
-const PAINT_SETTLE: Duration = Duration::from_millis(250);
-
-/// What gets typed, chosen for its pixel count rather than its meaning.
+/// The unit of what gets typed, chosen for its pixel count rather than meaning.
 ///
-/// Nineteen characters is several hundred lit pixels at any console cell size,
-/// which puts the change an order of magnitude above what a blinking caret can
-/// account for on its own. Nothing here is a command: no Enter is ever sent, so
-/// the shell keeps it as a half-typed line and throws it away when the window
-/// dies.
-const TYPED: &str = "ZOOM7-INPUT-RECEIPT";
+/// Nothing here is a command: no Enter is ever sent on this route, so the shell
+/// keeps it as a half-typed line and throws it away when the window dies.
+const TYPED: &str = "ZOOM7-INPUT-RECEIPT-";
 
-fn out_dir() -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("input-dump");
-    std::fs::create_dir_all(&dir).expect("create target/input-dump");
-    dir
-}
-
-fn note(line: &str) {
-    println!("[input-dump] {line}");
-}
-
-/// Open a console that prints a line, waits for input, and stays alive.
-fn spawn_marker_window(marker: &str) -> Child {
-    let script = format!(
-        "title {marker} & mode con cols=100 lines=20 & echo {marker} & ping -n 120 127.0.0.1 > nul"
-    );
-    Command::new("cmd.exe")
-        .args(["/K", script.as_str()])
-        .creation_flags(CREATE_NEW_CONSOLE)
-        .spawn()
-        .expect("spawn cmd.exe in a new console")
-}
-
-fn stop(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-/// Find the window this job opened, by the title only it carries.
+/// How many times [`TYPED`] goes into the same prompt in one go.
 ///
-/// Polling instead of a single read: the window does not exist the instant
-/// `spawn` returns, and "the console never appeared" is a different finding from
-/// "the title was not what we asked for".
-fn wait_for_window(marker: &str) -> Result<WindowInfo, String> {
-    let deadline = Instant::now() + WINDOW_TIMEOUT;
-    let mut last = String::from("(no listing yet)");
-    while Instant::now() < deadline {
-        let list = list_windows().map_err(|e| format!("enumerate: {e}"))?;
-        if let Some(window) = list.windows.iter().find(|w| w.title.contains(marker)) {
-            return Ok(window.clone());
-        }
-        last = format!("{} windows: {}", list.windows.len(), list);
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    Err(format!(
-        "no window titled *{marker}* appeared within {}s; last listing {last}",
-        WINDOW_TIMEOUT.as_secs()
-    ))
-}
+/// Sixty characters still fits the 100-column console this job asks for, and it
+/// matters because the receipt below is a ratio against the window's own jitter:
+/// the longer the signal, the smaller the multiplier has to be to be sure.
+const TYPED_REPEATS: usize = 3;
 
-/// Capture until the frame carries at least `floor` inked-ratio, or give up.
-fn capture_stable(hwnd: isize) -> Result<crate::desktop::Capture, String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let capture = capture_window(hwnd).map_err(|e| format!("capture: {e}"))?;
-        if Instant::now() >= deadline {
-            return Ok(capture);
-        }
-        // A console mid-paint can come back partly drawn; retry while it is
-        // blank, and stop the moment there is something to measure.
-        if capture.ink_ratio > 0.0 {
-            return Ok(capture);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
+/// How much further the typed frame must move than the same window moving by
+/// itself, and why that is a ratio and not a pixel count.
+///
+/// The adversary is a blinking caret, and what a caret costs in pixels is a
+/// function of font, cell size, and whether the blink happens to fall between
+/// the two photographs. None of those are knowable from the Linux box I write
+/// this on, so any constant I could type in would be a guess dressed as a
+/// threshold. What is knowable: two photographs of the same window with the same
+/// delay and no input between them measure exactly what "nothing happened" looks
+/// like on this machine, caret included. Requiring eight times that is a claim
+/// about the window's behaviour, not about my arithmetic.
+const SIGNAL_OVER_NOISE: usize = 8;
 
-fn write_png(name: &str, capture: &crate::desktop::Capture) -> Result<(), String> {
-    let path = out_dir().join(name);
-    let png = capture
-        .to_png()
-        .map_err(|e| format!("encode {name}: {e}"))?;
-    std::fs::write(&path, png).map_err(|e| format!("write {}: {e}", path.display()))?;
-    note(&format!(
-        "{name}: {}x{} ink={:.6}",
-        capture.width, capture.height, capture.ink_ratio
-    ));
-    Ok(())
-}
+/// The floor when the window turns out to be perfectly still between two
+/// photographs, because a ratio against zero would accept one stray pixel.
+/// Sixty-odd characters is several console cells of light; this is only there to
+/// stop a noiseless window and a single antialiasing difference counting.
+const MIN_SIGNAL_PIXELS: usize = 120;
 
 /// 1. A keystroke reaches the window and our own capture sees it.
 #[test]
@@ -191,7 +127,27 @@ fn input_dump_a_keystroke_changes_the_captured_frame() {
             panic!("{why} before typing");
         }
     };
-    let delivery = match inject_text(TYPED) {
+    // The control: this same window, the same delay, nothing typed. Whatever it
+    // measures is the window's idle behaviour, caret included, and the receipt
+    // below is expressed against that measurement instead of against a pixel
+    // count I would have to invent on a machine that has no console cell here.
+    std::thread::sleep(PAINT_SETTLE);
+    let control = match capture_stable(window.hwnd) {
+        Ok(capture) => capture,
+        Err(why) => {
+            stop(&mut child);
+            panic!("{why} with nothing typed");
+        }
+    };
+    let noise = match before.changed_pixels(&control) {
+        Some(moved) => moved,
+        None => {
+            stop(&mut child);
+            panic!("the window changed geometry while nothing was being done to it");
+        }
+    };
+    let typed = TYPED.repeat(TYPED_REPEATS);
+    let delivery = match inject_text(&typed) {
         Ok(delivery) => delivery,
         Err(why) => {
             stop(&mut child);
@@ -207,6 +163,7 @@ fn input_dump_a_keystroke_changes_the_captured_frame() {
         }
     };
     let _ = write_png("before-type.png", &before);
+    let _ = write_png("control-type.png", &control);
     let _ = write_png("after-type.png", &after);
     stop(&mut child);
 
@@ -216,27 +173,39 @@ fn input_dump_a_keystroke_changes_the_captured_frame() {
     };
     assert_eq!(
         events,
-        TYPED.len() * 2,
+        typed.chars().count() * 2,
         "{} characters are {} press/release pairs",
-        TYPED.len(),
+        typed.chars().count(),
         events
+    );
+    let moved = control
+        .changed_pixels(&after)
+        .expect("the same window photographed at the same size");
+    let needed = noise
+        .saturating_mul(SIGNAL_OVER_NOISE)
+        .max(MIN_SIGNAL_PIXELS);
+    assert!(
+        moved > needed,
+        "typing {typed:?} moved {moved} pixels, while this same console moved {noise} of its own \
+         accord between two photographs with nothing typed in. A signal that does not clear its \
+         own control by {SIGNAL_OVER_NOISE}x is not a receipt: either the characters never \
+         reached this window, or the window never painted them. Note that a console with no \
+         reader paints nothing at all, which is what the first version of this job measured.",
     );
     assert!(
-        after.ink_ratio - before.ink_ratio > MIN_INK_RATIO,
-        "typing {TYPED:?} changed the frame by {:.6} of ink ratio (before {:.6}, after {:.6}): \
-         a blinking caret moves that number by a fraction of what {MIN_INK_RATIO} allows, so a \
-         smaller change is not evidence that the characters arrived. Either they never reached \
-         the console, or the capture is not seeing what the window paints.",
-        after.ink_ratio - before.ink_ratio,
-        before.ink_ratio,
-        after.ink_ratio
+        lit_pixels(&after) > lit_pixels(&control),
+        "typing {typed:?} moved {moved} pixels but the frame gained no light \
+         ({} -> {} lit pixels): that is a repaint without text, which is what a selection or a \
+         scroll looks like and not what an echo looks like.",
+        lit_pixels(&control),
+        lit_pixels(&after)
     );
     note(&format!(
-        "typed {TYPED:?}: ink {:.6} -> {:.6}, delta {:.6}, {} injected events",
-        before.ink_ratio,
-        after.ink_ratio,
-        after.ink_ratio - before.ink_ratio,
-        events
+        "typed {} characters: {events} injected events, control noise {noise} px, moved {moved} px \
+         (needed {needed}), light {} -> {} lit px",
+        typed.chars().count(),
+        lit_pixels(&control),
+        lit_pixels(&after)
     ));
 }
 
@@ -394,9 +363,27 @@ fn input_dump_the_scan_code_route_also_reaches_the_console() {
             panic!("{why} before pressing keys");
         }
     };
+    // The control, for the same reason as in the unicode job: the floor has to
+    // be measured on this window, not assumed from a cell size I cannot see.
+    std::thread::sleep(PAINT_SETTLE);
+    let control = match capture_stable(window.hwnd) {
+        Ok(capture) => capture,
+        Err(why) => {
+            stop(&mut child);
+            panic!("{why} with nothing pressed");
+        }
+    };
+    let noise = match before.changed_pixels(&control) {
+        Some(moved) => moved,
+        None => {
+            stop(&mut child);
+            panic!("the window changed geometry while nothing was being done to it");
+        }
+    };
+    let typed = TYPED.repeat(TYPED_REPEATS);
     // The fallback path, not the unicode one: every character here is a key on
     // the installed layout, with Shift held where the layout says it must be.
-    let delivery = match inject_text_as_keys(TYPED) {
+    let delivery = match inject_text_as_keys(&typed) {
         Ok(delivery) => delivery,
         Err(why) => {
             stop(&mut child);
@@ -412,6 +399,7 @@ fn input_dump_the_scan_code_route_also_reaches_the_console() {
         }
     };
     let _ = write_png("before-keys.png", &before);
+    let _ = write_png("control-keys.png", &control);
     let _ = write_png("after-keys.png", &after);
     stop(&mut child);
 
@@ -423,30 +411,43 @@ fn input_dump_the_scan_code_route_also_reaches_the_console() {
     // more. What is layout-independent is the floor of one pair per character,
     // and that the count is even, since a lone press is a held key.
     assert!(
-        events >= TYPED.chars().count() * 2,
+        events >= typed.chars().count() * 2,
         "{} events for {} characters is fewer than a press and a release each",
         events,
-        TYPED.chars().count()
+        typed.chars().count()
     );
     assert_eq!(
         events % 2,
         0,
         "{events} events means a key was left pressed: presses and releases are unbalanced"
     );
+    let moved = control
+        .changed_pixels(&after)
+        .expect("the same window photographed at the same size");
+    let needed = noise
+        .saturating_mul(SIGNAL_OVER_NOISE)
+        .max(MIN_SIGNAL_PIXELS);
     assert!(
-        after.ink_ratio - before.ink_ratio > MIN_INK_RATIO,
-        "pressing keys changed the frame by only {:.6} of ink ratio (before {:.6}, after {:.6}), \
-         which a blinking caret accounts for on its own: the scan-code route delivered events and \
-         the console ignored them, which is the difference between this job and the unicode one.",
-        after.ink_ratio - before.ink_ratio,
-        before.ink_ratio,
-        after.ink_ratio
+        moved > needed,
+        "the scan-code route sent {events} events and the frame moved {moved} pixels, while the \
+         same untouched console moved {noise} between two photographs. This is the job that \
+         separates the two keyboard contracts: the unicode route is a `WM_CHAR` to whoever holds \
+         focus, while this one is a key on the keyboard, which is the only thing an application \
+         that polls keys instead of reading characters can see. Events that arrive and paint \
+         nothing are exactly what this message exists to catch.",
+    );
+    assert!(
+        lit_pixels(&after) > lit_pixels(&control),
+        "the scan-code route moved {moved} pixels but the frame gained no light ({} -> {} lit \
+         pixels): a repaint without text is a selection or a scroll, not an echo.",
+        lit_pixels(&control),
+        lit_pixels(&after)
     );
     note(&format!(
-        "scan-code route typed {TYPED:?}: {} events, ink {:.6} -> {:.6}, delta {:.6}",
-        events,
-        before.ink_ratio,
-        after.ink_ratio,
-        after.ink_ratio - before.ink_ratio
+        "scan-code route typed {} characters: {events} events, control noise {noise} px, moved \
+         {moved} px (needed {needed}), light {} -> {} lit px",
+        typed.chars().count(),
+        lit_pixels(&control),
+        lit_pixels(&after)
     ));
 }
