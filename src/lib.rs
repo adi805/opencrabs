@@ -76,6 +76,7 @@ pub mod cli;
 pub mod config;
 pub mod db;
 pub mod decisions;
+pub mod desktop;
 pub mod error;
 pub mod logging;
 pub mod memory;
