@@ -97,3 +97,127 @@ jobs:
           path: target/ui-dump
           if-no-files-found: warn
           retention-days: 30
+
+  # The render dump proves what the app writes into the terminal buffer. It does
+  # not prove what a user sees in a window. A probe run (PR#14) settled the open
+  # question with receipts: a hosted Windows runner really does have a desktop
+  # session (SessionId 2, UserInteractive True, 1024x768 virtual screen), and a
+  # console window it launched came back from the capture with legible text
+  # ("PROBE_MARKER_12345", "Waiting for 51 seconds"). So photographs are
+  # possible here without anybody's PC, and this job takes them: it runs the exe
+  # we just built in a visible console sized to the app's own request, drives it
+  # with real keystrokes, and shoots the screen after each step.
+  #
+  # Deliberately fail-soft. Whatever the app happens to show is the finding; an
+  # empty capture is still a frame to read, so the job must not go red before the
+  # images are uploaded.
+  desktop-capture:
+    name: Photograph the app on a real Windows desktop
+    needs: windows-exe
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch the exe this run built
+        uses: actions/download-artifact@v4
+        with:
+          name: opencrabs-windows-x64
+          path: app
+
+      - name: Launch it in a console window and shoot every step
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          $shots = Join-Path $PWD 'shots'
+          New-Item -ItemType Directory -Force -Path $shots | Out-Null
+          $exe = (Resolve-Path (Join-Path $PWD 'app\opencrabs.exe')).Path
+          "exe: $exe"
+
+          # The window is found by title, so the capture cannot silently shoot
+          # some other process's window.
+          $sig = @"
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+          public class U {
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+            [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+          }
+          "@
+          Add-Type -TypeDefinition $sig -Language CSharp
+
+          function FindTarget {
+            Get-Process | Where-Object { $_.MainWindowTitle -like '*OCAP*' } |
+              Select-Object -First 1
+          }
+
+          function Shoot([string]$tag) {
+            $t = FindTarget
+            if ($null -eq $t) { "  $tag : no OCAP window found, skipped"; return }
+            [void][U]::SetForegroundWindow($t.MainWindowHandle)
+            Start-Sleep -Milliseconds 500
+            $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+            try {
+              $bmp = New-Object System.Drawing.Bitmap($vs.Width, $vs.Height)
+              $g = [System.Drawing.Graphics]::FromImage($bmp)
+              $g.CopyFromScreen($vs.X, $vs.Y, 0, 0, $bmp.Size)
+              $file = Join-Path $shots "$tag.png"
+              $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
+              $g.Dispose(); $bmp.Dispose()
+              "  $tag : $((Get-Item $file).Length) bytes (fg=$([U]::GetForegroundWindow()), title='$($t.MainWindowTitle)')"
+            } catch { "  $tag : capture FAILED $($_.Exception.Message)" }
+          }
+
+          function Send([string]$keys) {
+            $t = FindTarget
+            if ($null -eq $t) { "  no window, key dropped: $keys"; return }
+            [void][U]::SetForegroundWindow($t.MainWindowHandle)
+            Start-Sleep -Milliseconds 300
+            try { [System.Windows.Forms.SendKeys]::SendWait($keys) }
+            catch { "  send FAILED $($_.Exception.Message)" }
+            Start-Sleep -Milliseconds 900
+          }
+
+          # mode con sizes the buffer BEFORE the app starts, which is the one
+          # thing Wine could not do and the reason its frames were garbage.
+          $p = Start-Process cmd.exe -ArgumentList '/K', "title OCAP && mode con cols=150 lines=45 && `"$exe`"" -PassThru
+          Start-Sleep -Seconds 9
+          "started pid=$($p.Id)"
+          Shoot "00-boot"
+
+          # A fresh install lands in the wizard. Enter walks it; each press is a
+          # frame, so onboarding is photographed even if it never completes.
+          for ($i = 1; $i -le 8; $i++) {
+            $tag = "{0:d2}-wizard-{1:d}" -f (1 + $i), $i
+            Send "{ENTER}"
+            Shoot $tag
+          }
+
+          # The chat-mode menus. ESC first so an open dialog cannot eat the slash.
+          $menus = @('help', 'menu', 'status', 'usage', 'sessions', 'profiles',
+                     'providers', 'models', 'health', 'audit')
+          $n = 10
+          foreach ($m in $menus) {
+            $n++
+            Send "{ESC}"
+            Send "/$m{ENTER}"
+            Shoot ("{0:d2}-menu-{1}" -f $n, $m)
+          }
+
+          "frames: $((Get-ChildItem $shots -Filter *.png | Measure-Object).Count)"
+          Get-ChildItem $shots -Filter *.png | ForEach-Object { "  $($_.Name) $($_.Length)" }
+          try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch { "stop: $($_.Exception.Message)" }
+          Get-Process opencrabs -ErrorAction SilentlyContinue | ForEach-Object {
+            try { Stop-Process -Id $_.Id -Force } catch { "child stop failed" }
+          }
+
+      - name: Upload the frames
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencrabs-windows-desktop
+          path: shots
+          if-no-files-found: warn
+          retention-days: 30
