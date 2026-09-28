@@ -13,7 +13,7 @@ name: Windows binary (artifact)
 on:
   workflow_dispatch:
   push:
-    branches: [feat/windows-artifact]
+    branches: [feat/windows-artifact, feat/windows-desktop]
 
 jobs:
   windows-exe:
@@ -95,5 +95,43 @@ jobs:
         with:
           name: opencrabs-ui-dump
           path: target/ui-dump
+          if-no-files-found: warn
+          retention-days: 30
+
+      # The other half of the same gap, and the one the UI dump cannot close: a
+      # render dump is the app's own buffer, not a photograph of a window on a
+      # desktop. This asks the OS to paint a window and reads the pixels back, so
+      # the artifact is what the window manager actually drew.
+      #
+      # It opens its own console window (CREATE_NEW_CONSOLE) rather than
+      # photographing whatever is on screen: a window the test owns carries known
+      # text, so "ink > 0" is a statement about the capture path instead of about
+      # the runner's wallpaper. The test measures the ink ratio of every frame and
+      # FAILS on a blank one, which is the whole point - PrintWindow returns TRUE
+      # for windows it did not paint.
+      #
+      # It asserts an interactive seat, because a hosted runner was measured to
+      # have one (SessionId 2, UserInteractive True) and a silent empty directory
+      # would be indistinguishable from a broken capture.
+      - name: Capture a real window to PNG
+        shell: bash
+        env:
+          AWS_LC_SYS_CMAKE_BUILDER: '1'
+        run: |
+          set +e
+          cargo test --locked --profile ci --target x86_64-pc-windows-msvc --all-features \
+            --lib capture_dump -- --ignored --nocapture
+          status=$?
+          set -e
+          echo "capture-dump exit=$status"
+          ls -la target/capture-dump || echo "no target/capture-dump produced"
+          exit $status
+
+      - name: Upload the window captures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencrabs-windows-captures
+          path: target/capture-dump
           if-no-files-found: warn
           retention-days: 30

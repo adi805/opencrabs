@@ -244,6 +244,9 @@ jobs:
       # toolchain, the platform abstraction, the spawn and read paths, and
       # this workflow itself. Anything we cannot determine builds anyway, and
       # a `windows` label forces a build for the cases this list misses.
+      # `src/desktop/` and the desktop tests are listed because that module is
+      # Windows-only by construction: its whole backend is behind cfg(windows),
+      # so a change there is exactly the case this filter must not miss.
       # Deliberate gap: a new cfg(windows) block in an unlisted file is not
       # caught here. release.yml's matrix still builds Windows before any tag
       # ships, which is the coverage #627 relied on; this job only moves that
@@ -272,7 +275,7 @@ jobs:
           files=$(git diff --name-only "$base" HEAD)
           echo "changed files:"
           echo "$files"
-          pattern='^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|build\.rs|\.github/workflows/ci\.yml|src/utils/(shell|cwd)\.rs|src/brain/tools/(bash|read)\.rs|src/tui/app/input\.rs|src/config/(winlock|profile)\.rs|src/cli/service_windows\.rs)$'
+          pattern='^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|build\.rs|\.github/workflows/ci\.yml|src/utils/(shell|cwd)\.rs|src/brain/tools/(bash|read)\.rs|src/tui/app/input\.rs|src/config/(winlock|profile)\.rs|src/cli/service_windows\.rs|src/desktop/.*\.rs|src/tests/desktop_.*_test\.rs)$'
           if echo "$files" | grep -qE "$pattern"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
@@ -355,6 +358,12 @@ jobs:
       #                        applied, and enumeration still succeeds when
       #                        there is nothing to show. None of it is
       #                        checkable on any other OS.
+      #   tests::desktop_capture_test      the ink measurement and the blank
+      #                        verdict. Cross-platform arithmetic, but the
+      #                        pixel format it guards is the Windows one: a
+      #                        DIB arrives BGRA with a zero alpha byte, and
+      #                        that is the shape that decides whether a capture
+      #                        is evidence or a black rectangle.
       # The first two do not exist on this branch's base: the per-filter
       # tripwire below reports them as ZERO-MATCH until #3/#9 merge,
       # rather than pretending green. That silence-is-failure property is
@@ -381,7 +390,8 @@ jobs:
           status=0
           for m in config::winlock cli::service_windows tests::utils_shell_test \
                    tests::utils_cwd_test tests::browser_default_windows_test \
-                   tests::profile_test tests::desktop_windows_test; do
+                   tests::profile_test tests::desktop_windows_test \
+                   tests::desktop_capture_test; do
             set +e
             out=$(cargo test --locked --profile ci --target x86_64-pc-windows-msvc \
                     --lib -- "$m" 2>&1)
