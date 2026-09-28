@@ -22,7 +22,7 @@ jobs:
     # Same ceiling as ci.yml's windows-build: a COLD run needs ~48 min (33
     # compile incl. llama's cmake C++ plus ~15 for the thin-LTO link), warm
     # from rust-cache lands near 10.
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
 
@@ -65,4 +65,35 @@ jobs:
           name: opencrabs-windows-x64
           path: target/x86_64-pc-windows-msvc/ci/opencrabs.exe
           if-no-files-found: error
+          retention-days: 30
+
+      # The gap this series was opened to close: nothing in the repo could show
+      # what the TUI actually renders on Windows. These tests drive the real
+      # `render` / `switch_mode` / `open_usage_dashboard` path into ratatui's
+      # TestBackend - no desktop, no screen-scraping, no Wine emulation - and
+      # write one frame per screen to target/ui-dump as a character grid plus
+      # run-length style runs. They are #[ignore]d, so they must be asked for
+      # explicitly, and they run only after the exe has already been proven to
+      # start.
+      - name: Dump the real UI (one frame per screen)
+        shell: bash
+        env:
+          AWS_LC_SYS_CMAKE_BUILDER: '1'
+        run: |
+          set +e
+          cargo test --locked --profile ci --target x86_64-pc-windows-msvc --all-features \
+            --lib ui_snapshot_dump -- --ignored --nocapture
+          status=$?
+          set -e
+          echo "ui-dump exit=$status"
+          ls -la target/ui-dump || echo "no target/ui-dump produced"
+          exit $status
+
+      - name: Upload the UI dump
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencrabs-ui-dump
+          path: target/ui-dump
+          if-no-files-found: warn
           retention-days: 30
