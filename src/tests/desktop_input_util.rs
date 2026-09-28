@@ -79,23 +79,22 @@ pub(crate) fn note(line: &str) {
 /// for the paths that do reach their end.
 pub(crate) fn spawn_marker_window(marker: &str) -> Child {
     // `start`'s grammar is `start ["title"] program [args...]`, decided by
-    // position: a bare word in the title slot is read as the program to run, so
-    // this line used to ask Windows for a program named "opencrabs-input-probe",
-    // which does not exist. Windows answered with a #32770 error dialog,
-    // `cmd.exe` was never started, and every receipt failed in wait_for_window
-    // against a window nobody had opened. The title has to be quoted to be a
-    // title; that one character pair is the difference between a console and an
-    // error box.
+    // position, and the title slot is not writable in the shape that looks
+    // obvious: an argument containing quote characters is escaped by the
+    // standard library the way `CommandLineToArgvW` wants, which `cmd.exe` does
+    // not speak. So `start` got a token beginning with a backslash, read it as
+    // the program to run, and asked Windows for a file named
+    // "opencrabs-input-probe" that does not exist. Measured on the runner: the
+    // answer was a #32770 dialog whose caption named that file, `cmd.exe` never
+    // started, and every receipt failed here against a window nobody had opened.
+    //
+    // Hence no title slot at all. `start` takes its first unquoted word as the
+    // program, which is `cmd.exe`, and the console's own `title` command below
+    // is what puts the marker in the caption. One quoting layer less to be wrong
+    // about, and the marker still lands where `wait_for_window` looks.
     let script = format!("title {marker} & mode con cols=100 lines=20 & echo {marker}");
     Command::new("cmd.exe")
-        .args([
-            "/C",
-            "start",
-            "\"opencrabs-input-probe\"",
-            "cmd.exe",
-            "/K",
-            script.as_str(),
-        ])
+        .args(["/C", "start", "cmd.exe", "/K", script.as_str()])
         .creation_flags(CREATE_NEW_CONSOLE)
         .spawn()
         .expect("spawn cmd.exe through start, in its own console")
@@ -146,17 +145,26 @@ pub(crate) fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Find the window this job opened, by the title only it carries.
-///
 /// Polling instead of a single read: the window does not exist the instant
 /// `spawn` returns, and "the console never appeared" is a different finding
 /// from "the title was not what we asked for".
+///
+/// The class is part of the match, and that is not decoration. A `start` that
+/// cannot find its program answers with a #32770 dialog whose caption contains
+/// the very word it was handed, so matching on the title alone can be satisfied
+/// by the operating system complaining at us. [`crate::desktop::app::is_console_host`]
+/// is the rule that closes that hole, and it runs in the Linux test job because
+/// a receipt nobody can execute is not a receipt.
 pub(crate) fn wait_for_window(marker: &str) -> Result<WindowInfo, String> {
     let deadline = Instant::now() + WINDOW_TIMEOUT;
     let mut last = String::from("(no listing yet)");
     while Instant::now() < deadline {
         let list = list_windows().map_err(|e| format!("enumerate: {e}"))?;
-        if let Some(window) = list.windows.iter().find(|w| w.title.contains(marker)) {
+        if let Some(window) = list
+            .windows
+            .iter()
+            .find(|w| w.title.contains(marker) && crate::desktop::app::is_console_host(&w.class))
+        {
             return Ok(window.clone());
         }
         last = format!("{} windows: {}", list.windows.len(), list);

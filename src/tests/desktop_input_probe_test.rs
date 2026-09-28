@@ -59,25 +59,52 @@ struct Shape {
 }
 
 /// `start`'s grammar is `start ["title"] program [args...]`, and it decides by
-/// position. A bare word in the title slot is read as the program to run, so
-/// `Bare` asks Windows to launch a program that does not exist: it answers with
-/// a `#32770` error dialog and never starts the shell at all. `Bare` is in the
-/// list only as the negative control for `Quoted`, which is what the receipts
-/// actually ship.
+/// position, so the three ways of writing the first slot are three different
+/// programs. Measured on the runner, and the measurement corrected two of the
+/// expectations written here:
+///
+/// * `Bare` puts a word Windows then tries to *run*. It answers with a `#32770`
+///   dialog and the shell never starts.
+/// * `Quoted` was expected to be the console. It is not: the quote characters
+///   are escaped by the standard library for `CommandLineToArgvW`, which `cmd`
+///   does not speak, so `start` saw a token beginning with a backslash and took
+///   it as the program, dialog again. The probe recorded it as `marker_found=true`
+///   because the dialog's caption contained the marker: a title-only match is
+///   satisfied by the operating system complaining at us, which is why
+///   `wait_for_window` now insists on the window class as well.
+/// * `NoTitle` is what the receipts ship: no first slot at all, so `start` runs
+///   the first unquoted word (`cmd.exe`) and the console's own `title` command
+///   puts the marker in the caption.
 #[derive(PartialEq)]
 enum ViaStart {
     No,
+    /// Title slot written with quote characters (the shape that looked right).
     Quoted,
+    /// No title slot: `start` takes the first unquoted word as the program.
+    NoTitle,
+    /// A word in the title slot with nothing quoting it, so it is run instead.
     Bare,
 }
 
 const SHAPES: &[Shape] = &[
+    // The shape the receipts ship, first so a truncated run still reports it.
+    // Expectation, written down before the run: `start-no-title` is the only one
+    // of the three `start` shapes that reaches a prompt, because it is the only
+    // one that does not hand `start` a token to misinterpret. If it comes back
+    // `EXITED` while `running-ping` is alive, the marker never made it into the
+    // caption and the `title` command inside the script is what to blame, not
+    // `start`. If it is alive but `marker_found=false`, then `list_windows` is
+    // not seeing the window at all, which is the tab-merging hazard.
+    Shape {
+        name: "start-no-title",
+        script: "title {m} & mode con cols=100 lines=20 & echo {m}",
+        settle: Duration::from_millis(3_000),
+        null_stdio: false,
+        via_start: ViaStart::NoTitle,
+    },
     // The two shapes that answer the question the previous probe never asked: it
     // spawned `cmd.exe` directly in all five cases, so the `start` route the
-    // receipts ship was never on the table, and the console shape it measured
-    // was the shape of a command nobody runs. Expectation, written down before
-    // the run: `start-bare-title` exits with a dialog window, `start-quoted-
-    // title` sits alive at its prompt with its marker in the listing.
+    // receipts ship was never on the table.
     Shape {
         name: "start-quoted-title",
         script: "title {m} & mode con cols=100 lines=20 & echo {m}",
@@ -132,7 +159,7 @@ const SHAPES: &[Shape] = &[
 /// The reading for one shape, in the order the questions matter.
 fn describe(shape: &Shape, marker: &str, fresh_console: bool) -> String {
     let script = shape.script.replace("{m}", marker);
-    // Quoted, and that is the whole fix: see `ViaStart`.
+    // Only the two shapes with a title slot read this; `NoTitle` has none.
     let title = match shape.via_start {
         ViaStart::Quoted => format!("\"{marker}\""),
         _ => marker.to_string(),
@@ -141,6 +168,9 @@ fn describe(shape: &Shape, marker: &str, fresh_console: bool) -> String {
     match shape.via_start {
         ViaStart::No => {
             spawn.args(["/K", script.as_str()]);
+        }
+        ViaStart::NoTitle => {
+            spawn.args(["/C", "start", "cmd.exe", "/K", script.as_str()]);
         }
         ViaStart::Quoted | ViaStart::Bare => {
             spawn.args([
@@ -170,11 +200,15 @@ fn describe(shape: &Shape, marker: &str, fresh_console: bool) -> String {
     // Poll until the marker shows up or the settle window closes, so a shape that
     // is merely slow is not recorded as a shape that never appears.
     let deadline = Instant::now() + shape.settle;
-    let mut found = false;
+    let mut found: Option<crate::desktop::WindowInfo> = None;
     while Instant::now() < deadline {
         if let Ok(list) = crate::desktop::list_windows() {
-            found = list.windows.iter().any(|w| w.title.contains(marker));
-            if found {
+            found = list
+                .windows
+                .iter()
+                .find(|w| w.title.contains(marker))
+                .cloned();
+            if found.is_some() {
                 break;
             }
         }
@@ -199,8 +233,20 @@ fn describe(shape: &Shape, marker: &str, fresh_console: bool) -> String {
         })
         .unwrap_or_else(|why| format!("enumeration failed: {why}"));
 
+    // What the match actually landed on. The class is the half that matters: a
+    // #32770 error dialog carries the marker in its caption too, so a bare
+    // "found" is not enough to tell a console from a complaint.
+    let what = match &found {
+        Some(w) => format!(
+            "marker_found=true class={:?} console={} hwnd={}",
+            w.class,
+            crate::desktop::app::is_console_host(&w.class),
+            w.hwnd
+        ),
+        None => String::from("marker_found=false"),
+    };
     let report = format!(
-        "[probe] {}: fresh_console={} child={alive} marker_found={found} {listed}",
+        "[probe] {}: fresh_console={} child={alive} {what} {listed}",
         shape.name, fresh_console,
     );
     let _ = child.kill();
