@@ -1,59 +1,21 @@
 //! Windows desktop backend: which seat are we on, and what windows does it
 //! have.
 //!
-//! Bindings are declared by hand, following `config::winlock`: this needs a
-//! dozen signatures, and adding `windows-sys` as a direct dependency would
-//! churn `Cargo.lock`, which CI pins with `--locked`. Same trade-off, same
-//! reasoning, so there is one convention for raw Win32 in this crate.
-//!
-//! Types are the ABI-shaped ones, not the crate's: `HWND`/`HWINSTA` arrive as
-//! pointer-sized values, so they are `isize`, and `BOOL` is a 32-bit int where
-//! only zero means false. `Rect`/`WindowInfo` are built from the raw shapes at
-//! the boundary, so nothing above this file sees a Win32 type.
+//! Bindings live in [`super::win32`] and are shared with the capture backend,
+//! which needs `GetWindowRect` for the same reason this file does. Types are the
+//! ABI-shaped ones, not the crate's: `HWND`/`HWINSTA` arrive as pointer-sized
+//! values, so they are `isize`, and `BOOL` is a 32-bit int where only zero means
+//! false. `Rect`/`WindowInfo` are built from the raw shapes at the boundary, so
+//! nothing above this file sees a Win32 type.
 
 use super::model::{MAX_WINDOWS, Rect, WindowInfo, WindowList, keep_candidate};
+use super::win32::{
+    EnumWindows, GetClassNameW, GetCurrentProcessId, GetForegroundWindow, GetProcessWindowStation,
+    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    NO_ACTIVE_CONSOLE_SESSION, ProcessIdToSessionId, TEXT_BUF_CHARS, WTSGetActiveConsoleSessionId,
+    WinRect,
+};
 use std::io;
-
-/// `WTSGetActiveConsoleSessionId` returns this when no session is attached to
-/// the physical console: RDP disconnected, or a headless host. It is a valid
-/// `u32` session id nowhere else, which is why the API can use it as "none".
-const NO_ACTIVE_CONSOLE_SESSION: u32 = 0xFFFF_FFFF;
-
-/// Cap for a title or class we read back. Windows truncates at the requested
-/// length and reports the characters copied, so this bounds memory instead of
-/// requiring a length-then-allocate round trip.
-const TEXT_BUF_CHARS: usize = 512;
-
-#[repr(C)]
-struct WinRect {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-}
-
-unsafe extern "system" {
-    /// Walks top-level windows in z-order, front first. Returns FALSE either
-    /// on failure *or* because the callback returned 0, so callers must not
-    /// read `0` as "error" without checking why (see [`list_windows`]).
-    fn EnumWindows(
-        callback: Option<unsafe extern "system" fn(hwnd: isize, param: isize) -> i32>,
-        param: isize,
-    ) -> i32;
-    fn GetForegroundWindow() -> isize;
-    fn GetWindowRect(hwnd: isize, rect: *mut WinRect) -> i32;
-    fn GetWindowTextW(hwnd: isize, buffer: *mut u16, max_chars: i32) -> i32;
-    fn GetClassNameW(hwnd: isize, buffer: *mut u16, max_chars: i32) -> i32;
-    fn GetWindowThreadProcessId(hwnd: isize, process_id: *mut u32) -> u32;
-    fn IsWindowVisible(hwnd: isize) -> i32;
-    /// The window station this process is attached to. `NULL` means there is
-    /// no interactive station: a service, or a process spawned from a
-    /// non-interactive logon.
-    fn GetProcessWindowStation() -> isize;
-    fn GetCurrentProcessId() -> u32;
-    fn ProcessIdToSessionId(process_id: u32, session_id: *mut u32) -> i32;
-    fn WTSGetActiveConsoleSessionId() -> u32;
-}
 
 /// Decode a UTF-16 buffer written by one of the `...W` calls, which return the
 /// number of characters copied (excluding the terminating NUL).

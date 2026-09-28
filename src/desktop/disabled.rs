@@ -10,8 +10,9 @@
 //! Linux (X11/Wayland) and macOS (CoreGraphics) backends are real future work;
 //! when one lands it replaces this file's `#[cfg]` arm, not the API.
 
-use super::model::WindowList;
+use super::model::{Capture, WindowList};
 use std::io;
+use std::path::Path;
 
 /// Fail-closed: no backend, so no claim about the seat can be verified.
 pub fn interactive_session() -> bool {
@@ -22,5 +23,22 @@ pub fn list_windows() -> io::Result<WindowList> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "desktop control has no backend on this platform yet",
+    ))
+}
+
+/// Same fail-closed shape as [`list_windows`]: a stub that returned a black
+/// `Capture` would be indistinguishable from a window that genuinely painted
+/// nothing, and the caller would save an empty PNG and call it a screenshot.
+pub fn capture_window(_hwnd: isize) -> io::Result<Capture> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "window capture has no backend on this platform yet",
+    ))
+}
+
+pub fn capture_window_to_png(_hwnd: isize, _path: &Path) -> io::Result<Capture> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "window capture has no backend on this platform yet",
     ))
 }
