@@ -42,3 +42,74 @@ pub fn capture_window_to_png(_hwnd: isize, _path: &Path) -> io::Result<Capture> 
         "window capture has no backend on this platform yet",
     ))
 }
+
+// The input lane's stand-ins. Same fail-closed reasoning as above, with one
+// addition worth stating: these are the *dangerous* functions, and a stub that
+// returned `Ok` would let a caller on Linux believe it had clicked something.
+
+/// No desktop to report, so no claim about the pointer can be verified either.
+pub fn cursor_position() -> io::Result<super::input::ScreenPoint> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "desktop input has no backend on this platform yet",
+    ))
+}
+
+pub fn virtual_desktop() -> io::Result<super::model::Rect> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "desktop input has no backend on this platform yet",
+    ))
+}
+
+pub fn click_window(
+    _hwnd: isize,
+    _button: super::input::MouseButton,
+    _at: super::input::ScreenPoint,
+) -> io::Result<super::input::Delivery> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "desktop input has no backend on this platform yet",
+    ))
+}
+
+pub fn type_into_window(_hwnd: isize, _text: &str) -> io::Result<super::input::Delivery> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "desktop input has no backend on this platform yet",
+    ))
+}
+
+pub fn press_key_in_window(
+    _hwnd: isize,
+    _key: super::input_events::Key,
+) -> io::Result<super::input::Delivery> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "desktop input has no backend on this platform yet",
+    ))
+}
+
+pub fn inject_click(
+    _button: super::input::MouseButton,
+    _at: super::input::ScreenPoint,
+) -> io::Result<super::input::Delivery> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "desktop input has no backend on this platform yet",
+    ))
+}
+
+pub fn inject_text(_text: &str) -> io::Result<super::input::Delivery> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "desktop input has no backend on this platform yet",
+    ))
+}
+
+pub fn inject_key(_key: super::input_events::Key) -> io::Result<super::input::Delivery> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "desktop input has no backend on this platform yet",
+    ))
+}
