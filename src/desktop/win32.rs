@@ -99,6 +99,16 @@ unsafe extern "system" {
         param: isize,
     ) -> i32;
     pub fn GetForegroundWindow() -> isize;
+    /// Brings a window to the foreground. Returns whether the request was
+    /// *accepted*, which is not the same fact as the window being in front:
+    /// Windows refuses focus changes from a process that is not already there
+    /// (the foreground lock), so a caller that wants the truth reads
+    /// [`GetForegroundWindow`] back instead of trusting this value.
+    pub fn SetForegroundWindow(hwnd: isize) -> i32;
+    /// Whether a handle still names a window. Asked instead of re-walking the
+    /// enumeration, because that list is filtered: a window dropped by our own
+    /// rules is not a window that closed.
+    pub fn IsWindow(hwnd: isize) -> i32;
     pub fn GetWindowTextW(hwnd: isize, buffer: *mut u16, max_chars: i32) -> i32;
     pub fn GetClassNameW(hwnd: isize, buffer: *mut u16, max_chars: i32) -> i32;
     pub fn GetWindowThreadProcessId(hwnd: isize, process_id: *mut u32) -> u32;

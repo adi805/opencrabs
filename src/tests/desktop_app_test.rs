@@ -276,3 +276,92 @@ fn the_console_classes_listed_are_the_two_this_project_measured() {
         &["ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS"]
     );
 }
+
+/// A window whose owner and size are the only things this file cares about.
+fn sized(hwnd: isize, pid: u32, width: i32, height: i32) -> WindowInfo {
+    WindowInfo {
+        hwnd,
+        pid,
+        title: String::from("whatever"),
+        class: String::from("ConsoleWindowClass"),
+        rect: Rect {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        },
+        foreground: false,
+    }
+}
+
+#[test]
+fn the_window_of_a_started_process_is_the_biggest_one_it_owns() {
+    // A program's first windows are usually the ones a person never sees: a
+    // message-only window, a tray host, an IME bridge. Picking the largest is
+    // picking the one that was actually painted.
+    let ours = vec![
+        sized(11, 700, 4, 4),
+        sized(12, 700, 1044, 635),
+        sized(13, 700, 200, 200),
+        sized(14, 701, 1600, 1200),
+    ];
+    let found = app::window_of_pid(&ours, 700).expect("this pid owns windows");
+    assert_eq!(
+        found.hwnd, 12,
+        "the largest window of the pid we asked about wins, not another process's"
+    );
+    assert_eq!(
+        app::window_of_pid(&ours, 999),
+        None,
+        "a pid that owns nothing owns nothing"
+    );
+}
+
+#[test]
+fn a_window_we_could_not_measure_is_not_a_target() {
+    // Two shapes the enumeration can really produce, and neither is something to
+    // act on. The negative-span rect is the one that matters: its area is a
+    // positive product of two negative spans, so a rule that reduced a rect to an
+    // area before checking it would pick this window as the target. That is the
+    // shape this project already shipped once and had to undo.
+    let mut windows = vec![
+        sized(21, 800, -40, -40),
+        sized(0, 800, 300, 300),
+        sized(23, 0, 900, 900),
+    ];
+    assert_eq!(
+        app::window_of_pid(&windows, 800),
+        None,
+        "a garbage rect and a zero handle are not windows to act on"
+    );
+    windows.push(sized(22, 800, 300, 200));
+    assert_eq!(
+        app::window_of_pid(&windows, 800).map(|w| w.hwnd),
+        Some(22),
+        "adding one measurable window makes the process findable again"
+    );
+    assert_eq!(
+        app::window_of_pid(&windows, 0),
+        None,
+        "0 is what a failed owner query reports, not an owner; treating it as one \
+         would match every window whose query failed"
+    );
+}
+
+#[test]
+fn the_poll_interval_is_shorter_than_every_budget_it_polls_inside() {
+    // The interval is what turns one reading into a wait. A poll as long as its
+    // budget is a single look with extra steps, and the "not yet" that the budget
+    // exists to resolve gets reported as the answer instead.
+    for (label, budget) in [
+        ("launch", app::LAUNCH_WINDOW_SETTLE),
+        ("focus", app::FOCUS_SETTLE),
+        ("close", app::CLOSE_SETTLE),
+    ] {
+        assert!(
+            app::WINDOW_POLL < budget,
+            "{label}: a {:?} poll is not shorter than its {budget:?} budget",
+            app::WINDOW_POLL
+        );
+    }
+}

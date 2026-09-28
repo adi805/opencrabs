@@ -32,6 +32,7 @@
 //! one use case that matters, a path with a space or a bracket in it.
 
 use std::fmt;
+use std::time::Duration;
 
 use super::model::WindowInfo;
 
@@ -301,4 +302,66 @@ pub fn close_target_allowed(target: &WindowInfo, our_pid: u32) -> Result<(), Str
         ));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Waiting, and which window belongs to the child we started
+// ---------------------------------------------------------------------------
+
+/// How long the syscall lane waits before looking at the desktop again.
+///
+/// One look is never enough. A process exists before any window it will create
+/// exists, and a window that has been asked to close stays up until its owner
+/// reads its queue, so a reading taken at the wrong moment reports the opposite
+/// of the truth. This interval is what turns "not yet" into a measured answer
+/// instead of a guess.
+pub const WINDOW_POLL: Duration = Duration::from_millis(100);
+
+/// How long a launched program has to produce a window.
+///
+/// Sized to a program starting rather than to this crate's own build. The
+/// consoles measured on the runner appear in under a second, and a program with
+/// a splash screen takes longer than that on purpose. Past this the honest
+/// answer is "it started and showed nothing", not a longer wait.
+pub const LAUNCH_WINDOW_SETTLE: Duration = Duration::from_secs(25);
+
+/// How long to keep re-reading the foreground window after asking for it.
+///
+/// The request and the move are not one instant, so a single read taken
+/// immediately could catch the change before the desktop made it and report a
+/// refusal that was only a delay.
+pub const FOCUS_SETTLE: Duration = Duration::from_secs(2);
+
+/// How long to wait for a window to stop existing after it was asked to close.
+///
+/// Short on purpose. Past it the answer is "still here", which is true whether
+/// the application is showing a save prompt, is wedged, or is ignoring the
+/// message, and all three belong to whoever reads the receipt rather than to a
+/// longer wait.
+pub const CLOSE_SETTLE: Duration = Duration::from_secs(10);
+
+/// The window belonging to a process we started.
+///
+/// Matching by owner rather than by title is the point. A title is whatever the
+/// application decided to call itself: it may not be set yet, it may carry a
+/// document name, and it is localised, while the pid is exact from the moment
+/// the process exists.
+///
+/// `pid == 0` is refused, for the same reason [`close_target_allowed`] refuses
+/// it. That is the value the backend reports when the owner query failed, so
+/// treating it as an owner would match every window whose query failed and
+/// return the first of them.
+///
+/// The largest eligible window wins, because a program that creates several
+/// usually creates the invisible ones first: a message-only window, a tray host,
+/// or an IME bridge. The one with real area and a real span is the one a person
+/// would point at.
+pub fn window_of_pid<'a>(windows: &'a [WindowInfo], pid: u32) -> Option<&'a WindowInfo> {
+    if pid == 0 {
+        return None;
+    }
+    windows
+        .iter()
+        .filter(|window| window.pid == pid && window.hwnd != 0 && window.rect.has_positive_span())
+        .max_by_key(|window| window.rect.area())
 }

@@ -62,6 +62,18 @@ mod disabled;
 /// the Linux job runs tests.
 pub mod app;
 
+/// The app-control calls: start a program, move the foreground, ask a window to
+/// close. Split the same way the rest of this tree is, so a caller never has to
+/// know which target it was built for.
+#[cfg(windows)]
+mod app_windows;
+
+#[cfg(windows)]
+pub use app_windows::{close_target, focus_target, launch_app, launch_to_window};
+
+#[cfg(not(windows))]
+pub use disabled::{close_target, focus_target, launch_app, launch_to_window};
+
 mod input;
 mod input_events;
 

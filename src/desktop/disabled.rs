@@ -131,3 +131,33 @@ pub fn inject_text_as_keys(_text: &str) -> io::Result<super::input::Delivery> {
         "desktop input has no backend on this platform yet",
     ))
 }
+
+// The app-control lane's stand-ins. `focus_target` is why this half of the pair
+// returns a `Result` at all: `FocusVerdict` has no value meaning "this platform
+// cannot look", so a verdict-returning signature would force a caller to read a
+// fabricated answer about a window that was never asked about. `Unsupported` is
+// the only honest thing to say here, and a launch that returned a pid would be
+// the same lie with more consequences.
+
+pub fn launch_app(_program: &str, _args: &[String]) -> Result<u32, String> {
+    Err("desktop control has no backend on this platform yet".to_string())
+}
+
+pub fn launch_to_window(
+    _plan: &super::app::LaunchPlan,
+    _settle: std::time::Duration,
+) -> Result<(u32, Option<super::model::WindowInfo>), String> {
+    Err("desktop control has no backend on this platform yet".to_string())
+}
+
+pub fn focus_target(_hwnd: isize) -> Result<super::app::FocusVerdict, String> {
+    Err("desktop control has no backend on this platform yet".to_string())
+}
+
+pub fn close_target(
+    _target: &super::model::WindowInfo,
+    _our_pid: u32,
+    _settle: std::time::Duration,
+) -> Result<super::app::CloseVerdict, String> {
+    Err("desktop control has no backend on this platform yet".to_string())
+}
