@@ -40,8 +40,8 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use crate::desktop::{
-    Delivery, MouseButton, ScreenPoint, WindowInfo, capture_window, click_window, cursor_position,
-    inject_click, inject_text, interactive_session, list_windows,
+    Delivery, MIN_INK_RATIO, MouseButton, ScreenPoint, WindowInfo, capture_window, click_window,
+    cursor_position, inject_click, inject_text, interactive_session, list_windows,
 };
 
 /// `CREATE_NEW_CONSOLE`: without it `cmd.exe` inherits this process's console and
@@ -58,10 +58,14 @@ const WINDOW_TIMEOUT: Duration = Duration::from_secs(20);
 /// `capture_until_more_ink`) and the delay only sets the floor.
 const PAINT_SETTLE: Duration = Duration::from_millis(250);
 
-/// What gets typed. Five plain characters: enough that the change in ink is far
-/// above the noise of a blinking caret, and nothing that could be mistaken for a
-/// command when it lands in a shell.
-const TYPED: &str = "ZOOM7";
+/// What gets typed, chosen for its pixel count rather than its meaning.
+///
+/// Nineteen characters is several hundred lit pixels at any console cell size,
+/// which puts the change an order of magnitude above what a blinking caret can
+/// account for on its own. Nothing here is a command: no Enter is ever sent, so
+/// the shell keeps it as a half-typed line and throws it away when the window
+/// dies.
+const TYPED: &str = "ZOOM7-INPUT-RECEIPT";
 
 fn out_dir() -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -207,18 +211,26 @@ fn input_dump_a_keystroke_changes_the_captured_frame() {
     assert_eq!(
         events,
         TYPED.len() * 2,
-        "five characters are five press/release pairs"
+        "{} characters are {} press/release pairs",
+        TYPED.len(),
+        events
     );
     assert!(
-        after.ink_ratio > before.ink_ratio,
-        "typing {TYPED:?} did not add ink: before={:.6} after={:.6}. Either the keystrokes \
-         never reached the console, or the capture is not seeing what the window paints.",
+        after.ink_ratio - before.ink_ratio > MIN_INK_RATIO,
+        "typing {TYPED:?} changed the frame by {:.6} of ink ratio (before {:.6}, after {:.6}): \
+         a blinking caret moves that number by a fraction of what {MIN_INK_RATIO} allows, so a \
+         smaller change is not evidence that the characters arrived. Either they never reached \
+         the console, or the capture is not seeing what the window paints.",
+        after.ink_ratio - before.ink_ratio,
         before.ink_ratio,
         after.ink_ratio
     );
     note(&format!(
-        "typed {TYPED:?}: ink {:.6} -> {:.6} ({} injected events)",
-        before.ink_ratio, after.ink_ratio, events
+        "typed {TYPED:?}: ink {:.6} -> {:.6}, delta {:.6}, {} injected events",
+        before.ink_ratio,
+        after.ink_ratio,
+        after.ink_ratio - before.ink_ratio,
+        events
     ));
 }
 
