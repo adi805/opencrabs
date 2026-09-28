@@ -356,7 +356,7 @@ pub const CLOSE_SETTLE: Duration = Duration::from_secs(10);
 /// usually creates the invisible ones first: a message-only window, a tray host,
 /// or an IME bridge. The one with real area and a real span is the one a person
 /// would point at.
-pub fn window_of_pid<'a>(windows: &'a [WindowInfo], pid: u32) -> Option<&'a WindowInfo> {
+pub fn window_of_pid(windows: &[WindowInfo], pid: u32) -> Option<&WindowInfo> {
     if pid == 0 {
         return None;
     }
