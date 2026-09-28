@@ -283,6 +283,7 @@ pub mod desktop_capture_test;
 pub mod desktop_input_dump_test;
 pub mod desktop_input_exec_test;
 pub mod desktop_input_posted_test;
+pub mod desktop_input_probe_test;
 pub mod desktop_input_test;
 pub mod desktop_input_util;
 pub mod desktop_model_test;

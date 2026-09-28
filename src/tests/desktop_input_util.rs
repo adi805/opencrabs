@@ -69,6 +69,31 @@ pub(crate) fn spawn_marker_window(marker: &str) -> Child {
         .expect("spawn cmd.exe in a new console")
 }
 
+/// Every top-level window, as one line each, for the diagnostic output.
+pub(crate) fn window_table() -> String {
+    match crate::desktop::list_windows() {
+        Ok(list) => list
+            .windows
+            .iter()
+            .map(|w| {
+                format!(
+                    "    hwnd={} pid={} {}x{} +{},{} [{}] {:?}",
+                    w.hwnd,
+                    w.pid,
+                    w.rect.width(),
+                    w.rect.height(),
+                    w.rect.left,
+                    w.rect.top,
+                    w.class,
+                    w.title
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(why) => format!("    (enumeration failed: {why})"),
+    }
+}
+
 /// Kill the console this job opened. Windows does not clean up a child spawned
 /// with `CREATE_NEW_CONSOLE` when the parent panics, so every exit path here
 /// goes through this.
