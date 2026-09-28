@@ -63,6 +63,33 @@ pub enum Key {
 }
 
 impl Key {
+    /// Read a key back from the name an agent would type.
+    ///
+    /// Names are the lowercase variant, because that is what reads naturally in
+    /// a tool argument (`"enter"`, `"pageup"`) and what the schema lists. Case
+    /// is ignored so `"PageUp"` and `"pageup"` cannot be two different things
+    /// that one of them fails as.
+    pub fn parse(name: &str) -> Option<Self> {
+        let folded = name.to_ascii_lowercase();
+        match folded.as_str() {
+            "enter" | "return" => Some(Self::Enter),
+            "tab" => Some(Self::Tab),
+            "escape" | "esc" => Some(Self::Escape),
+            "backspace" => Some(Self::Backspace),
+            "delete" | "del" => Some(Self::Delete),
+            "insert" | "ins" => Some(Self::Insert),
+            "home" => Some(Self::Home),
+            "end" => Some(Self::End),
+            "pageup" | "pgup" => Some(Self::PageUp),
+            "pagedown" | "pgdn" => Some(Self::PageDown),
+            "up" => Some(Self::Up),
+            "down" => Some(Self::Down),
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            _ => None,
+        }
+    }
+
     /// The `VK_*` code. Also the `wParam` of a posted `WM_KEYDOWN`, so the
     /// posted and injected routes agree on what a key is.
     pub fn vk(self) -> u16 {

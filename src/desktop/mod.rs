@@ -64,6 +64,7 @@ mod input_events;
 mod input_windows;
 
 mod model;
+pub mod policy;
 
 pub use model::{
     Capture, INK_CHANNEL_FLOOR, MAX_WINDOWS, MIN_INK_RATIO, Rect, WindowInfo, WindowList,
