@@ -57,6 +57,11 @@ mod win32;
 #[cfg(not(windows))]
 mod disabled;
 
+/// The app-control decisions, kept away from the syscalls for the same reason
+/// `policy` is: they are the part that decides when a claim is honest, and only
+/// the Linux job runs tests.
+pub mod app;
+
 mod input;
 mod input_events;
 
