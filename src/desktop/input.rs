@@ -251,12 +251,26 @@ impl Input {
     /// getting plausible-looking bytes. Both accessors check the tag first, so
     /// that mistake is a `None` instead of a number nobody questions.
     pub fn as_mouse(&self) -> Option<MouseInput> {
-        (self.kind == INPUT_MOUSE).then(|| unsafe { self.body.mouse })
+        if self.kind == INPUT_MOUSE {
+            // SAFETY: `kind` names the active member, so this reads the field
+            // that was written. Guarded with `if` rather than `bool::then_some`
+            // because `then_some` would evaluate its argument either way, and
+            // reading a member the tag does not name is exactly the mistake this
+            // accessor exists to make impossible.
+            Some(unsafe { self.body.mouse })
+        } else {
+            None
+        }
     }
 
     /// The keyboard member, or `None` when the tag does not name one.
     pub fn as_keyboard(&self) -> Option<KeyboardInput> {
-        (self.kind == INPUT_KEYBOARD).then(|| unsafe { self.body.keyboard })
+        if self.kind == INPUT_KEYBOARD {
+            // SAFETY: as above, with the other tag.
+            Some(unsafe { self.body.keyboard })
+        } else {
+            None
+        }
     }
 }
 
@@ -299,7 +313,7 @@ pub fn normalize_axis(position: i32, origin: i32, span: i32) -> Option<i32> {
 /// coordinates above the origin that are negative, and sign-extending them
 /// instead of masking puts the click 65536 pixels away.
 pub fn mouse_lparam(x: i32, y: i32) -> isize {
-    let low = u32::from(x as u16) as u32;
+    let low = u32::from(x as u16);
     let high = u32::from(y as u16) << 16;
     (low | high) as i32 as isize
 }
