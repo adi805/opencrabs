@@ -53,46 +53,106 @@ struct Shape {
     /// produce a perfectly flat frame, because everything the shell "printed"
     /// went to somebody else's file descriptor.
     null_stdio: bool,
+    /// Whether the console is opened through `start`, and how its title slot is
+    /// written.
+    via_start: ViaStart,
+}
+
+/// `start`'s grammar is `start ["title"] program [args...]`, and it decides by
+/// position. A bare word in the title slot is read as the program to run, so
+/// `Bare` asks Windows to launch a program that does not exist: it answers with
+/// a `#32770` error dialog and never starts the shell at all. `Bare` is in the
+/// list only as the negative control for `Quoted`, which is what the receipts
+/// actually ship.
+#[derive(PartialEq)]
+enum ViaStart {
+    No,
+    Quoted,
+    Bare,
 }
 
 const SHAPES: &[Shape] = &[
+    // The two shapes that answer the question the previous probe never asked: it
+    // spawned `cmd.exe` directly in all five cases, so the `start` route the
+    // receipts ship was never on the table, and the console shape it measured
+    // was the shape of a command nobody runs. Expectation, written down before
+    // the run: `start-bare-title` exits with a dialog window, `start-quoted-
+    // title` sits alive at its prompt with its marker in the listing.
+    Shape {
+        name: "start-quoted-title",
+        script: "title {m} & mode con cols=100 lines=20 & echo {m}",
+        settle: Duration::from_millis(3_000),
+        null_stdio: false,
+        via_start: ViaStart::Quoted,
+    },
+    Shape {
+        name: "start-bare-title",
+        script: "title {m} & mode con cols=100 lines=20 & echo {m}",
+        settle: Duration::from_millis(3_000),
+        null_stdio: false,
+        via_start: ViaStart::Bare,
+    },
     Shape {
         name: "idle-prompt",
         script: "title {m} & mode con cols=100 lines=20 & echo {m}",
         settle: Duration::from_millis(2_000),
         null_stdio: false,
+        via_start: ViaStart::No,
     },
     Shape {
         name: "running-ping",
         script: "title {m} & mode con cols=100 lines=20 & echo {m} & ping -n 300 127.0.0.1 > nul",
         settle: Duration::from_millis(2_000),
         null_stdio: false,
+        via_start: ViaStart::No,
     },
     Shape {
         name: "prompt-then-ping",
         script: "title {m} & mode con cols=100 lines=20 & echo {m} & ping -n 6 127.0.0.1 > nul",
         settle: Duration::from_millis(2_000),
         null_stdio: false,
+        via_start: ViaStart::No,
     },
     Shape {
         name: "idle-null-stdio",
         script: "title {m} & mode con cols=100 lines=20 & echo {m}",
         settle: Duration::from_millis(2_000),
         null_stdio: true,
+        via_start: ViaStart::No,
     },
     Shape {
         name: "no-new-console",
         script: "title {m} & echo {m}",
         settle: Duration::from_millis(2_000),
         null_stdio: false,
+        via_start: ViaStart::No,
     },
 ];
 
 /// The reading for one shape, in the order the questions matter.
 fn describe(shape: &Shape, marker: &str, fresh_console: bool) -> String {
     let script = shape.script.replace("{m}", marker);
+    // Quoted, and that is the whole fix: see `ViaStart`.
+    let title = match shape.via_start {
+        ViaStart::Quoted => format!("\"{marker}\""),
+        _ => marker.to_string(),
+    };
     let mut spawn = Command::new("cmd.exe");
-    spawn.args(["/K", script.as_str()]);
+    match shape.via_start {
+        ViaStart::No => {
+            spawn.args(["/K", script.as_str()]);
+        }
+        ViaStart::Quoted | ViaStart::Bare => {
+            spawn.args([
+                "/C",
+                "start",
+                title.as_str(),
+                "cmd.exe",
+                "/K",
+                script.as_str(),
+            ]);
+        }
+    }
     if shape.null_stdio {
         spawn
             .stdin(std::process::Stdio::null())

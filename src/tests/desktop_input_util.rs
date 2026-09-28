@@ -78,15 +78,20 @@ pub(crate) fn note(line: &str) {
 /// leftover cannot be mistaken for another test's window. `close_window` exists
 /// for the paths that do reach their end.
 pub(crate) fn spawn_marker_window(marker: &str) -> Child {
-    // A title argument is mandatory in `start`'s grammar and would otherwise be
-    // eaten as the window title, so the launcher passes one it does not care
-    // about and the inner shell sets the real title.
+    // `start`'s grammar is `start ["title"] program [args...]`, decided by
+    // position: a bare word in the title slot is read as the program to run, so
+    // this line used to ask Windows for a program named "opencrabs-input-probe",
+    // which does not exist. Windows answered with a #32770 error dialog,
+    // `cmd.exe` was never started, and every receipt failed in wait_for_window
+    // against a window nobody had opened. The title has to be quoted to be a
+    // title; that one character pair is the difference between a console and an
+    // error box.
     let script = format!("title {marker} & mode con cols=100 lines=20 & echo {marker}");
     Command::new("cmd.exe")
         .args([
             "/C",
             "start",
-            "opencrabs-input-probe",
+            "\"opencrabs-input-probe\"",
             "cmd.exe",
             "/K",
             script.as_str(),
