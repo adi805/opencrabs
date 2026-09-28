@@ -155,3 +155,43 @@ jobs:
           path: target/capture-dump
           if-no-files-found: error
           retention-days: 30
+
+      - name: Drive a real window (injected and posted input)
+        shell: bash
+        env:
+          AWS_LC_SYS_CMAKE_BUILDER: '1'
+        run: |
+          set +e
+          # --test-threads=1 is not a style choice. These jobs share two pieces of
+          # machine-global state: which window holds focus, and where the pointer
+          # is. Run concurrently, one job's injected click moves the pointer that
+          # another job is asserting was left alone, and a spawned console steals
+          # focus from the one about to be typed into -- which that test is
+          # written to refuse, so it would fail for a reason that is the runner's
+          # fault and not the code's.
+          cargo test --locked --profile ci --target x86_64-pc-windows-msvc --all-features \
+            --lib input_dump -- --ignored --nocapture --test-threads=1
+          status=$?
+          set -e
+          echo "input-dump test exit=$status"
+          ls -la target/input-dump 2>/dev/null || echo "no target/input-dump directory"
+          # Same outcome gate as the capture step, same reason: the claim here is
+          # "a keystroke visibly changed a captured frame", and that claim needs
+          # the before/after pair on disk to be checkable by anyone. A filter that
+          # matches nothing exits 0 and prints ok.
+          frames=$(find target/input-dump -type f -name '*.png' 2>/dev/null | wc -l)
+          echo "input-dump frames=$frames"
+          if [ "$frames" -lt 2 ]; then
+            echo "::error::the input dump wrote fewer than 2 PNGs (frames=$frames, test exit $status): no before/after pair, so the keystroke claim is unverified"
+            exit 1
+          fi
+          exit $status
+
+      - name: Upload the input evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencrabs-windows-input
+          path: target/input-dump
+          if-no-files-found: error
+          retention-days: 30
