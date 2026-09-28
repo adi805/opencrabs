@@ -26,11 +26,24 @@ impl Rect {
         self.bottom.saturating_sub(self.top)
     }
 
-    /// Signed, saturating area. Negative widths (a rect reported inverted) are
-    /// kept negative rather than absolved, so a nonsense rect cannot pass the
-    /// `area > 0` candidate test by arithmetic accident.
+    /// The signed, saturating product of the spans. This is arithmetic, not a
+    /// validity test: a rect with both edges swapped (right < left *and*
+    /// bottom < top) multiplies out to a positive number, so no caller should
+    /// treat `area() > 0` as "this window is real". Use [`Rect::has_positive_span`].
     pub fn area(&self) -> i64 {
         i64::from(self.width()).saturating_mul(i64::from(self.height()))
+    }
+
+    /// Whether the rect describes a region that could actually be painted.
+    ///
+    /// Both spans must be positive independently. The single test that reads
+    /// most naturally, `area() > 0`, is the one that lies: inverting both edges
+    /// keeps the product positive, and a nonsense rect therefore looks
+    /// indistinguishable from an 800x600 window. Negative *origins* are fine
+    /// and expected (secondary monitors up and to the left), which is why the
+    /// test is on the spans and not on the coordinates.
+    pub fn has_positive_span(&self) -> bool {
+        self.width() > 0 && self.height() > 0
     }
 }
 
@@ -57,8 +70,11 @@ pub struct WindowInfo {
 }
 
 impl WindowInfo {
-    pub fn is_zero_area(&self) -> bool {
-        self.rect.area() <= 0
+    /// A window whose rect cannot describe a painted region. Reported rather
+    /// than silently dropped by the caller, so a backend that forgot the filter
+    /// is visible in a test instead of invisible in a click that lands nowhere.
+    pub fn is_degenerate(&self) -> bool {
+        !self.rect.has_positive_span()
     }
 }
 
@@ -84,14 +100,14 @@ pub fn is_shell_backdrop(class: &str) -> bool {
         .any(|known| known.eq_ignore_ascii_case(class))
 }
 
-/// The candidate rule: visible, real area, not desktop furniture.
+/// The candidate rule: visible, a span that could be painted, not furniture.
 ///
 /// Deliberately *not* `!title.is_empty()`: untitled windows are often exactly
 /// the ones worth driving (a dialog that has not set its caption yet, a game,
 /// a Chrome render surface), and dropping them would hide interactive targets
 /// behind a cosmetic property.
-pub fn keep_candidate(visible: bool, area: i64, class: &str) -> bool {
-    visible && area > 0 && !is_shell_backdrop(class)
+pub fn keep_candidate(visible: bool, rect: &Rect, class: &str) -> bool {
+    visible && rect.has_positive_span() && !is_shell_backdrop(class)
 }
 
 /// A window snapshot plus whether it was cut short.

@@ -104,7 +104,7 @@ unsafe extern "system" fn collect_window(hwnd: isize, param: isize) -> i32 {
     };
     let visible = unsafe { IsWindowVisible(hwnd) } != 0;
     let class = read_wide_text(|buffer, max| unsafe { GetClassNameW(hwnd, buffer, max) });
-    if !keep_candidate(visible, rect.area(), &class) {
+    if !keep_candidate(visible, &rect, &class) {
         return 1;
     }
 
