@@ -172,19 +172,16 @@ fn a_truncated_snapshot_says_so_in_its_rendered_form() {
     );
 }
 
-#[test]
-fn the_cap_is_large_enough_to_be_true_and_small_enough_to_be_bounded() {
-    // Not a tautology about the constant's value: the bound only helps if it is
-    // below what a real desktop can produce, and the filtering only helps if it
-    // is above what an ordinary session shows. Both sides are checked against
-    // the documented expectation, so retuning the number is a decision with a
-    // test that reacts.
-    assert!(
-        MAX_WINDOWS >= 64,
-        "a cap this low would truncate ordinary sessions"
-    );
-    assert!(
-        MAX_WINDOWS <= 1024,
-        "a cap this high defeats the bounded-context reason for the type"
-    );
-}
+// Both bounds are statements about a constant, so they belong where a violation
+// stops being a test result and becomes a build failure: a runtime `assert!` over
+// literals returns the same verdict on every machine forever, so it can never
+// report anything. `const _` makes pushing `MAX_WINDOWS` past either edge fail
+// the compile instead of failing a test on someone else's CI.
+const _: () = assert!(
+    MAX_WINDOWS >= 64,
+    "a cap this low would truncate ordinary sessions"
+);
+const _: () = assert!(
+    MAX_WINDOWS <= 1024,
+    "a cap this high defeats the bounded-context reason for the type"
+);

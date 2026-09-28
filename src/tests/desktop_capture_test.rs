@@ -89,7 +89,10 @@ fn one_glyph_still_clears_the_blank_threshold() {
         "{MIN_INK_RATIO} of a 1024x768 frame is {} pixels, which is not below one 8x16 glyph ({one_glyph})",
         MIN_INK_RATIO * probe_frame_pixels
     );
-    assert!(MIN_INK_RATIO > 0.0, "a zero threshold cannot fail");
+    // A threshold of zero is a build error, not a test failure. Nothing in this
+    // comparison but constants, so a runtime `assert!` would return the same
+    // verdict on every machine forever and could never report anything.
+    const _: () = assert!(MIN_INK_RATIO > 0.0, "a zero threshold cannot fail");
 }
 
 #[test]
@@ -101,7 +104,7 @@ fn a_capture_with_one_character_is_not_blank_and_a_black_one_is() {
     let mut with_text = frame(w, h, 0, 0, 0, 255);
     // Exactly one 8x16 glyph's worth of lit pixels, which is the smallest amount
     // of content this frame can carry and still be called content.
-    for pixel in with_text.chunks_exact_mut(4).take(8 * 16) {
+    for pixel in with_text.as_chunks_mut::<4>().0.iter_mut().take(8 * 16) {
         pixel[0] = 200;
         pixel[1] = 200;
         pixel[2] = 200;

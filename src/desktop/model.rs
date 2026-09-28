@@ -195,17 +195,20 @@ pub const MIN_INK_RATIO: f64 = 0.0001;
 /// 32-bpp surface leaves the fourth byte at zero, so a test that also required
 /// alpha to be set would call every honest capture blank.
 pub fn ink_ratio(rgba: &[u8]) -> f64 {
-    let pixels = rgba.len() / 4;
-    if pixels == 0 {
+    // `as_chunks` over `chunks_exact` because the trailing byte run of a
+    // misaligned buffer is not a pixel: the remainder is named and dropped here
+    // instead of vanishing inside a division that cannot tell the reader it did.
+    let (pixels, _remainder) = rgba.as_chunks::<4>();
+    if pixels.is_empty() {
         return 0.0;
     }
-    let inked = rgba
-        .chunks_exact(4)
+    let inked = pixels
+        .iter()
         .filter(|p| {
             p[0] > INK_CHANNEL_FLOOR || p[1] > INK_CHANNEL_FLOOR || p[2] > INK_CHANNEL_FLOOR
         })
         .count();
-    inked as f64 / pixels as f64
+    inked as f64 / pixels.len() as f64
 }
 
 /// Rewrite a `BGRA` buffer in place as `RGBA` with opaque alpha.
@@ -215,7 +218,8 @@ pub fn ink_ratio(rgba: &[u8]) -> f64 {
 /// and a fully transparent PNG is indistinguishable from a blank one to
 /// anything that composites it.
 pub fn bgra_to_rgba(buffer: &mut [u8]) {
-    for pixel in buffer.chunks_exact_mut(4) {
+    let (pixels, _remainder) = buffer.as_chunks_mut::<4>();
+    for pixel in pixels {
         pixel.swap(0, 2);
         pixel[3] = 255;
     }
