@@ -209,3 +209,35 @@ fn the_linux_stub_reports_the_missing_backend_instead_of_a_blank_frame() {
         .expect_err("no backend on this platform");
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
 }
+
+#[test]
+fn a_moved_pixel_that_keeps_the_ink_count_is_still_a_change() {
+    // Why this method exists: `ink_ratio` cannot see a change that relocates
+    // light instead of adding it. These two frames hold exactly one lit pixel
+    // each, one column apart, so every ratio-based gate calls them identical
+    // while the window plainly moved.
+    let mut before_bytes = frame(4, 4, 0, 0, 0, 255);
+    before_bytes[0] = 200;
+    let before = Capture::from_rgba(4, 4, before_bytes).expect("sized buffer");
+
+    let mut after_bytes = frame(4, 4, 0, 0, 0, 255);
+    after_bytes[4] = 200;
+    let after = Capture::from_rgba(4, 4, after_bytes).expect("sized buffer");
+
+    assert_eq!(before.ink_ratio, after.ink_ratio, "same light, moved");
+    assert_eq!(before.changed_pixels(&after), Some(2));
+}
+
+#[test]
+fn an_identical_frame_changes_nothing() {
+    let one = Capture::from_rgba(4, 4, frame(4, 4, 9, 8, 7, 255)).expect("sized buffer");
+    let two = Capture::from_rgba(4, 4, frame(4, 4, 9, 8, 7, 255)).expect("sized buffer");
+    assert_eq!(one.changed_pixels(&two), Some(0));
+}
+
+#[test]
+fn frames_of_other_geometry_are_not_comparable() {
+    let small = Capture::from_rgba(4, 4, frame(4, 4, 0, 0, 0, 255)).expect("sized buffer");
+    let wide = Capture::from_rgba(8, 4, frame(8, 4, 0, 0, 0, 255)).expect("sized buffer");
+    assert_eq!(small.changed_pixels(&wide), None);
+}

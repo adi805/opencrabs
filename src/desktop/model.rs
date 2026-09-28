@@ -264,6 +264,33 @@ impl Capture {
         self.ink_ratio < MIN_INK_RATIO
     }
 
+    /// Pixels that differ between this frame and another of the same geometry.
+    ///
+    /// [`ink_ratio`] answers "how much of this is lit", which is blind to a
+    /// change that moves content without changing how much of it is lit: a
+    /// selection rectangle, an inverted cell, one row of a full console
+    /// scrolled off the top. A receipt that asks "did this window change" needs
+    /// a per-pixel difference, and that is what this is.
+    ///
+    /// `None` when the two frames are not comparable: different geometry, or
+    /// buffers whose lengths disagree (which [`Capture::from_rgba`] is built to
+    /// make impossible, so a mismatch here is a contradiction worth refusing
+    /// rather than a zip that quietly stops at the shorter one).
+    pub fn changed_pixels(&self, other: &Capture) -> Option<usize> {
+        if self.width != other.width
+            || self.height != other.height
+            || self.rgba.len() != other.rgba.len()
+        {
+            return None;
+        }
+        // `as_chunks` over `chunks_exact` to match [`ink_ratio`]: a trailing
+        // partial pixel is named here, and compared, instead of vanishing.
+        let (before, tail_before) = self.rgba.as_chunks::<4>();
+        let (after, tail_after) = other.rgba.as_chunks::<4>();
+        let differ = before.iter().zip(after).filter(|(a, b)| a != b).count();
+        Some(differ + usize::from(tail_before != tail_after))
+    }
+
     /// Encode as PNG.
     ///
     /// The `png` feature is already enabled for the WhatsApp pairing QR, so this
