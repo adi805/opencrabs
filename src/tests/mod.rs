@@ -278,6 +278,8 @@ pub mod decide_cached_test;
 pub mod decision_cache_test;
 pub mod decisions_report_test;
 pub mod deepseek_reasoning_test;
+pub mod desktop_capture_dump_test;
+pub mod desktop_capture_test;
 pub mod desktop_model_test;
 pub mod desktop_windows_test;
 pub mod directive_discovery_test;
