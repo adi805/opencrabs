@@ -1,0 +1,124 @@
+name: win-desktop-probe
+
+# Spike only. Answers one question with a receipt: can a GitHub hosted
+# Windows runner show a desktop window at all, and can anything capture it?
+# Two capture lanes are tried independently so a black screen is not
+# mistaken for "no window".
+#
+#   1. CopyFromScreen  - grabs the desktop the session composes
+#   2. PrintWindow     - asks the window itself to paint into a bitmap,
+#                        which works even without a visible desktop
+#
+# Delete the branch and this file once the answer is recorded.
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/win-desktop-probe.yml
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Launch a real window and try both capture lanes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          $out = $env:GITHUB_WORKSPACE
+
+          "=== session identity ==="
+          "SessionId   : $([System.Diagnostics.Process]::GetCurrentProcess().SessionId)"
+          "Interactive : $([Environment]::UserInteractive)"
+          $vd = [System.Windows.Forms.SystemInformation]::VirtualDisplay
+          "VirtualDisplay: $($vd.Bounds) primary=$($vd.Primary)"
+          $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          "VirtualScreen : $($vs.Width)x$($vs.Height) at $($vs.X),$($vs.Y)"
+
+          "--- lane 0: start a console window that paints colored text ---"
+          $p = Start-Process cmd.exe -ArgumentList '/K','title PROBEWIN && color 0b && echo PROBE_MARKER_12345 && timeout /t 60' -PassThru
+          Start-Sleep -Seconds 4
+          "started pid=$($p.Id)"
+
+          "--- lane 1: CopyFromScreen of the whole virtual screen ---"
+          try {
+            $bmp = New-Object System.Drawing.Bitmap($vs.Width, $vs.Height)
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($vs.X, $vs.Y, 0, 0, $bmp.Size)
+            $bmp.Save("$out\cap-screen.png", [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+            "screen: saved $((Get-Item "$out\cap-screen.png").Length) bytes"
+          } catch {
+            "screen: FAILED $($_.Exception.Message)"
+          }
+
+          "--- lane 2: enumerate visible top-level windows, PrintWindow each ---"
+          $src = @"
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+          public class W {
+            public delegate bool EnumProc(IntPtr h, IntPtr l);
+            [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+            [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+            [DllImport("user32.dll")] public static extern int  GetWindowTextLength(IntPtr h);
+            [DllImport("user32.dll")] public static extern int  GetWindowText(IntPtr h, StringBuilder s, int n);
+            [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+            [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+            [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+            public static string[] List() {
+              var keep = new System.Collections.Generic.List<string>();
+              EnumWindows((h, l) => {
+                if (!IsWindowVisible(h)) return true;
+                int n = GetWindowTextLength(h);
+                if (n == 0) return true;
+                var sb = new StringBuilder(n + 1);
+                GetWindowText(h, sb, sb.Capacity);
+                RECT r; GetWindowRect(h, out r);
+                keep.Add(h.ToInt64() + "|" + sb.ToString() + "|" + (r.R - r.L) + "x" + (r.B - r.T));
+                return true;
+              }, IntPtr.Zero);
+              return keep.ToArray();
+            }
+          }
+          "@
+          Add-Type -TypeDefinition $src -Language CSharp
+          $wins = [W]::List()
+          "visible titled windows: $($wins.Count)"
+          $i = 0
+          foreach ($w in $wins) {
+            $parts = $w.Split('|')
+            $hwnd = [IntPtr][long]::Parse($parts[0])
+            $title = $parts[1]
+            "window[$i] title='$title' size=$($parts[2])"
+            $dims = $parts[2] -split 'x'
+            $wd = [Math]::Max(1, [int]$dims[0]); $ht = [Math]::Max(1, [int]$dims[1])
+            if ($wd -gt 3000 -or $ht -gt 3000) { "  skipped (absurd size)"; $i++; continue }
+            try {
+              $b2 = New-Object System.Drawing.Bitmap($wd, $ht)
+              $gr = [System.Drawing.Graphics]::FromImage($b2)
+              $hdc = $gr.GetHdc()
+              $okp = [W]::PrintWindow($hwnd, $hdc, 2)   # PW_RENDERFULLCONTENT
+              $gr.ReleaseHdc($hdc)
+              $b2.Save("$out\cap-win$i.png", [System.Drawing.Imaging.ImageFormat]::Png)
+              "  PrintWindow ok=$okp saved $((Get-Item "$out\cap-win$i.png").Length) bytes"
+              $gr.Dispose(); $b2.Dispose()
+            } catch { "  PrintWindow FAILED $($_.Exception.Message)" }
+            $i++
+            if ($i -ge 6) { break }
+          }
+
+          "--- lane 3: can we see our own console output at all? ---"
+          "this text is in the job log, which is not a window: PROBE_MARKER_12345"
+          try { Stop-Process -Id $p.Id -Force -ErrorAction Stop; "probe cmd stopped" } catch { "stop failed: $($_.Exception.Message)" }
+
+      - name: Upload the frames
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-desktop-probe
+          path: |
+            cap-*.png
+          if-no-files-found: warn
