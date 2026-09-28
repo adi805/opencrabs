@@ -106,6 +106,7 @@ fn slug(title: &str) -> String {
 }
 
 #[test]
+#[ignore = "the artifact workflow asks for this by name; it opens a window and needs a real desktop"]
 fn capture_dump() {
     // A hosted runner was measured to be on an interactive session (SessionId 2,
     // UserInteractive True), but the code must not assume it: a service seat

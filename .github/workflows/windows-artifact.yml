@@ -87,6 +87,15 @@ jobs:
           set -e
           echo "ui-dump exit=$status"
           ls -la target/ui-dump || echo "no target/ui-dump produced"
+          # Same gate as the capture step below, and for the same reason: this job
+          # is the evidence that the Windows renderer ran, and a filter that
+          # matches no test exits 0. Count the frames, do not trust the exit code.
+          frames=$(find target/ui-dump -type f -name '*.txt' 2>/dev/null | wc -l)
+          echo "ui-dump frames=$frames"
+          if [ "$frames" -eq 0 ]; then
+            echo "::error::the UI dump produced no frame files (test exit $status); refusing to hand back an empty artifact"
+            exit 1
+          fi
           exit $status
 
       - name: Upload the UI dump
@@ -95,7 +104,7 @@ jobs:
         with:
           name: opencrabs-ui-dump
           path: target/ui-dump
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
 
       # The other half of the same gap, and the one the UI dump cannot close: a
@@ -123,8 +132,19 @@ jobs:
             --lib capture_dump -- --ignored --nocapture
           status=$?
           set -e
-          echo "capture-dump exit=$status"
-          ls -la target/capture-dump || echo "no target/capture-dump produced"
+          echo "capture-dump test exit=$status"
+          ls -la target/capture-dump 2>/dev/null || echo "no target/capture-dump directory"
+          # An outcome gate, deliberately separate from the test's exit code. The
+          # claim this job has to support is "a PNG was photographed", and a green
+          # run that wrote nothing is the failure this module keeps meeting: an
+          # `--ignored` filter that matches no real test exits 0, cargo prints "ok"
+          # for it, and the upload step at most warns. Count the files instead.
+          frames=$(find target/capture-dump -type f -name '*.png' 2>/dev/null | wc -l)
+          echo "capture-dump frames=$frames"
+          if [ "$frames" -eq 0 ]; then
+            echo "::error::the capture dump produced no PNG (test exit $status); refusing to hand back an empty artifact"
+            exit 1
+          fi
           exit $status
 
       - name: Upload the window captures
@@ -133,5 +153,5 @@ jobs:
         with:
           name: opencrabs-windows-captures
           path: target/capture-dump
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
