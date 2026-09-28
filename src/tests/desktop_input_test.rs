@@ -15,9 +15,10 @@ use crate::desktop::{
     KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, KeyboardInput, MOUSEEVENTF_ABSOLUTE,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEEVENTF_WHEEL, MouseButton, MouseInput, Rect, ScreenPoint, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP, click_events, keyboard_input,
-    mouse_input, normalize_axis,
+    MOUSEEVENTF_WHEEL, MouseButton, MouseInput, Rect, ScreenPoint, VKS_ALT, VKS_CONTROL, VKS_SHIFT,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    click_events, decode_vk_scan, key_events_with_modifiers, keyboard_input, mouse_input,
+    normalize_axis,
 };
 
 fn desktop() -> Rect {
@@ -312,6 +313,119 @@ fn the_keyboard_flag_bits_do_not_overlap() {
                 first & second,
                 0,
                 "keyboard flags {first:#x} and {second:#x} share a bit"
+            );
+        }
+    }
+}
+
+// --- the scan-code fallback: reading the layout's answer ---
+
+#[test]
+fn the_layout_answer_splits_into_a_key_and_its_modifiers() {
+    // `VkKeyScanW` returns a `SHORT`: low byte the virtual key, high byte the
+    // modifier mask. A caller that used the whole value as a key code would press
+    // a key that does not exist for every shifted character, so the split is the
+    // claim under test, not the numbers themselves.
+    assert_eq!(decode_vk_scan(0x0033), Some((0x33, 0x00)));
+    assert_eq!(decode_vk_scan(0x0133), Some((0x33, 0x01)));
+    assert_eq!(decode_vk_scan(0x0241), Some((0x41, 0x02)));
+    assert_eq!(decode_vk_scan(0x0441), Some((0x41, 0x04)));
+    assert_eq!(decode_vk_scan(0x0756), Some((0x56, 0x07)));
+}
+
+#[test]
+fn an_untypeable_character_is_reported_as_none_and_not_as_a_key() {
+    assert_eq!(decode_vk_scan(-1), None);
+    // The reason `None` is the honest shape: -1 is 0xFFFF, whose low byte is a
+    // perfectly plausible-looking number. Reading it as a key code does not fail,
+    // it presses something else, and that is the failure this function exists to
+    // make impossible to write.
+    assert_eq!((-1_i16) as u16 & 0x00FF, 0xFF);
+}
+
+#[test]
+fn modifiers_are_held_before_the_key_and_released_after_it() {
+    let (shift, ctrl, alt, key) = (0x2A_u16, 0x1D_u16, 0x38_u16, 0x1E_u16);
+    let table = [(VKS_SHIFT, shift), (VKS_CONTROL, ctrl), (VKS_ALT, alt)];
+
+    let plain = key_events_with_modifiers(key, 0x00, &table);
+    assert_eq!(plain.len(), 2, "a plain character is a press and a release");
+    assert_eq!(plain[0].as_keyboard().expect("keyboard").scan, key);
+    assert_eq!(
+        plain[1].as_keyboard().expect("keyboard").flags,
+        KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP
+    );
+
+    let shifted = key_events_with_modifiers(key, VKS_SHIFT, &table);
+    let scans: Vec<u16> = shifted
+        .iter()
+        .map(|event| event.as_keyboard().expect("keyboard").scan)
+        .collect();
+    assert_eq!(
+        scans,
+        vec![shift, key, key, shift],
+        "shift brackets the key"
+    );
+    let flags: Vec<u32> = shifted
+        .iter()
+        .map(|event| event.as_keyboard().expect("keyboard").flags)
+        .collect();
+    assert_eq!(
+        flags,
+        vec![
+            KEYEVENTF_SCANCODE,
+            KEYEVENTF_SCANCODE,
+            KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP,
+            KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP,
+        ],
+        "the modifier has to outlive the key, or the key stops being shifted"
+    );
+
+    let chord = key_events_with_modifiers(key, VKS_CONTROL | VKS_ALT, &table);
+    let order: Vec<(u16, bool)> = chord
+        .iter()
+        .map(|event| {
+            let keyboard = event.as_keyboard().expect("keyboard");
+            (keyboard.scan, keyboard.flags & KEYEVENTF_KEYUP != 0)
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            (ctrl, false),
+            (alt, false),
+            (key, false),
+            (key, true),
+            (alt, true),
+            (ctrl, true),
+        ],
+        "a chord comes apart in the opposite order it went together"
+    );
+}
+
+#[test]
+fn the_scan_code_route_carries_no_virtual_key_and_no_unicode_claim() {
+    // wVk must be zero for a `KEYEVENTF_SCANCODE` event. A non-zero one is two
+    // claims about which key was pressed, and they only agree on the layout the
+    // code was written against.
+    let table = [(VKS_SHIFT, 0x2A_u16), (VKS_CONTROL, 0x1D), (VKS_ALT, 0x38)];
+    for state in [
+        0x00_u8,
+        VKS_SHIFT,
+        VKS_CONTROL,
+        VKS_ALT,
+        VKS_SHIFT | VKS_CONTROL,
+    ] {
+        let events = key_events_with_modifiers(0x1E, state, &table);
+        assert!(!events.is_empty(), "every state sends the key itself");
+        for event in &events {
+            let keyboard = event.as_keyboard().expect("a keyboard event");
+            assert_eq!(event.kind, INPUT_KEYBOARD, "state {state:#04x}");
+            assert_eq!(keyboard.virtual_key, 0, "state {state:#04x} leaked a vk");
+            assert_eq!(
+                keyboard.flags & KEYEVENTF_UNICODE,
+                0,
+                "the key route must not also claim to be the unicode route"
             );
         }
     }

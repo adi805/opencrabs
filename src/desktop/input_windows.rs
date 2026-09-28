@@ -285,3 +285,78 @@ pub fn inject_key(key: Key) -> io::Result<Delivery> {
     let scan = scan_code(key)?;
     inject(&key.events(scan))
 }
+
+/// The `VKS_*` bits paired with the scan code of the modifier that satisfies
+/// them, on the layout actually installed.
+///
+/// Resolved through `MapVirtualKeyW` rather than hard-coded. The scan codes for
+/// left Shift, left Ctrl and left Alt are conventional on a US layout and not
+/// guaranteed on any other, and a constant that happens to be right on the
+/// machine it was written on fails as a dropped capital letter, not as an error.
+fn modifier_scans() -> io::Result<[(u8, u16); 3]> {
+    let table = [
+        (super::input::VKS_SHIFT, super::input::VK_SHIFT),
+        (super::input::VKS_CONTROL, super::input::VK_CONTROL),
+        (super::input::VKS_ALT, super::input::VK_MENU),
+    ];
+    let mut out = [
+        (table[0].0, 0_u16),
+        (table[1].0, 0_u16),
+        (table[2].0, 0_u16),
+    ];
+    for index in 0..table.len() {
+        let (bit, vk) = table[index];
+        let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) };
+        if scan == 0 || scan > u32::from(u16::MAX) {
+            return Err(io::Error::other(format!(
+                "modifier bit {bit:#04x} (vk {vk:#04x}) has no usable scan code on this layout, \
+                 so characters that need it cannot be sent by key"
+            )));
+        }
+        out[index] = (bit, scan as u16);
+    }
+    Ok(out)
+}
+
+/// Type a string the way a keyboard does, for applications that ignore unicode events.
+///
+/// [`inject_text`] sends `KEYEVENTF_UNICODE`, which arrives as a character. This
+/// sends the *keys*: `VkKeyScanW` says which key makes each character on this
+/// layout, and Shift, Ctrl and Alt are held around it as ordinary events.
+///
+/// It is a fallback, not an upgrade, and the difference is a real one. Because it
+/// goes through the layout, the receiving application's own dead-key and IME
+/// handling decides what the character ends up being, so on a layout where a
+/// character needs a dead key this sends the dead key and the result depends on
+/// the keystroke that follows. That is exactly what an application polling raw
+/// keys asked for, and exactly why this is opt-in instead of automatic.
+///
+/// One untypeable character refuses the whole string. A partial delivery that
+/// reads like a complete one is the failure worth avoiding, and a password or a
+/// command truncated at a glyph the layout does not have is that failure.
+pub fn inject_text_as_keys(text: &str) -> io::Result<Delivery> {
+    let modifiers = modifier_scans()?;
+    let mut events = Vec::new();
+    for unit in super::input::char_units(text) {
+        let raw = unsafe { super::win32::VkKeyScanW(unit) };
+        let Some((vk, state)) = super::input_events::decode_vk_scan(raw) else {
+            return Err(io::Error::other(format!(
+                "UTF-16 unit {unit:#06x} has no key on this keyboard layout (VkKeyScanW \
+                 reported -1), so the whole string is refused rather than half of it"
+            )));
+        };
+        let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) };
+        if scan == 0 || scan > u32::from(u16::MAX) {
+            return Err(io::Error::other(format!(
+                "vk {vk:#04x}, which VkKeyScanW gave for UTF-16 unit {unit:#06x}, has no usable \
+                 scan code on this layout"
+            )));
+        }
+        events.extend(super::input_events::key_events_with_modifiers(
+            scan as u16,
+            state,
+            &modifiers,
+        ));
+    }
+    inject(&events)
+}

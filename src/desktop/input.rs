@@ -312,6 +312,27 @@ pub const KEYEVENTF_KEYUP: u32 = 0x0002;
 pub const KEYEVENTF_UNICODE: u32 = 0x0004;
 pub const KEYEVENTF_SCANCODE: u32 = 0x0008;
 
+/// Modifier mask bits reported by `VkKeyScanW`, not event flags.
+///
+/// They are deliberately separate from `KEYEVENTF_*`: these describe the state
+/// the *keyboard* has to be in for a character, and the only way to satisfy one
+/// is to press that modifier key as an ordinary event. Reading `VKS_SHIFT` as if
+/// it were a flag on the event produces an event that says nothing of the sort
+/// and a lowercase letter anyway.
+pub const VKS_SHIFT: u8 = 0x01;
+pub const VKS_CONTROL: u8 = 0x02;
+pub const VKS_ALT: u8 = 0x04;
+
+/// Virtual-key codes of the modifiers themselves, left hand.
+///
+/// `VkKeyScanW` does not distinguish left from right, and the right Alt (AltGr)
+/// needs `KEYEVENTF_EXTENDEDKEY` on top of its scan code, which is a layout
+/// detail this module leaves to whatever the OS mapping returns rather than
+/// inventing here.
+pub const VK_SHIFT: u16 = 0x10;
+pub const VK_CONTROL: u16 = 0x11;
+pub const VK_MENU: u16 = 0x12;
+
 /// The UTF-16 units a string becomes on the wire, in order.
 ///
 /// Windows takes UTF-16 code units, not characters, and Rust strings are

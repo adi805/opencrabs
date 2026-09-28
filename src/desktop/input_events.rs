@@ -232,3 +232,56 @@ pub fn posted_key_messages(key: Key, scan: u16) -> Vec<PostedMessage> {
         },
     ]
 }
+
+/// Split the `SHORT` from `VkKeyScanW` into a key code and a modifier mask.
+///
+/// This is the entry to the scan-code route. `KEYEVENTF_UNICODE` reaches an
+/// application as a `WM_CHAR` born from a `VK_PACKET` event, and programs that
+/// poll keys instead of reading characters (games, launchers, terminals with
+/// their own key handling, anything on DirectInput) never see a packet, so a
+/// string sent that way is silently swallowed. The fix is not a flag: it is the
+/// key that makes the character on the installed layout, plus the modifiers it
+/// needs, which is what these two numbers describe.
+///
+/// `None` for -1, meaning the character is not producible on this keyboard. That
+/// is a property of the layout, not a transient failure, so it is reported per
+/// character and the caller decides whether to drop it or refuse the string. A
+/// caller that masked the low byte without checking the negative case would read
+/// `0xFF` and press a key that does not exist.
+pub fn decode_vk_scan(raw: i16) -> Option<(u16, u8)> {
+    if raw < 0 {
+        return None;
+    }
+    let bits = raw as u16;
+    Some((bits & 0x00FF, (bits >> 8) as u8))
+}
+
+/// Press and release for one key, with its modifiers held around it.
+///
+/// `modifiers` pairs each `VKS_*` bit with that modifier's scan code, resolved by
+/// the caller from the layout. The ordering rule is the same whatever that
+/// answer is, and the ordering is the part worth testing here.
+///
+/// A modifier released before the key stops being a modifier, so releasing Shift
+/// early turns `A` into `a`. The key's own release comes before the modifiers'
+/// for the same reason, and the modifiers come back up in reverse so a two-key
+/// chord never briefly presents a different chord on the way out.
+pub fn key_events_with_modifiers(scan: u16, state: u8, modifiers: &[(u8, u16)]) -> Vec<Input> {
+    let mut events = Vec::new();
+    let mut held: Vec<u16> = Vec::new();
+    for (bit, modifier_scan) in modifiers {
+        if state & *bit != 0 {
+            events.push(keyboard_input(*modifier_scan, KEYEVENTF_SCANCODE));
+            held.push(*modifier_scan);
+        }
+    }
+    events.push(keyboard_input(scan, KEYEVENTF_SCANCODE));
+    events.push(keyboard_input(scan, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP));
+    for modifier_scan in held.into_iter().rev() {
+        events.push(keyboard_input(
+            modifier_scan,
+            KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP,
+        ));
+    }
+    events
+}

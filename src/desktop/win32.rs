@@ -171,6 +171,12 @@ unsafe extern "system" {
     /// Virtual-key to scan code for the installed layout. Zero means no
     /// mapping, which is different from scan code zero.
     pub fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
+    /// Which key and modifier state produce a given character on the installed
+    /// layout. Returns a `SHORT`: low byte is the virtual-key code, high byte is
+    /// the modifier mask, and -1 means the character cannot be typed here. The
+    /// negative case is not zero, so a caller that reads the low byte without
+    /// checking gets `0xFF` and presses a key that does not exist.
+    pub fn VkKeyScanW(character: u16) -> i16;
     /// Current cursor position, in screen coordinates. Read-only, and the
     /// receipt that a posted click left the human's pointer where it was.
     pub fn GetCursorPos(point: *mut WinPoint) -> i32;

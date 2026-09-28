@@ -113,3 +113,12 @@ pub fn inject_key(_key: super::input_events::Key) -> io::Result<super::input::De
         "desktop input has no backend on this platform yet",
     ))
 }
+
+/// See [`super::input_windows::inject_text_as_keys`]: refused here because there
+/// is no keyboard to press, not because the question was unreasonable.
+pub fn inject_text_as_keys(_text: &str) -> io::Result<super::input::Delivery> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "desktop input has no backend on this platform yet",
+    ))
+}

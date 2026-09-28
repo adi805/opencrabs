@@ -8,7 +8,7 @@
 //! desktop can answer "did the keystroke arrive", and only a real desktop can
 //! answer it with a photograph rather than a claim.
 //!
-//! Three separate jobs, one per claim, so a failure names the claim that broke
+//! Four separate jobs, one per claim, so a failure names the claim that broke
 //! instead of the last one that ran:
 //!
 //! 1. a keystroke changes the photographed frame: the character reached an
@@ -22,6 +22,11 @@
 //! 3. a posted click leaves the pointer exactly where it was: the safety
 //!    property that makes the non-intrusive route the default, measured instead
 //!    of asserted from a comment.
+//! 4. the scan-code route puts the same characters on the same screen as the
+//!    unicode route. It is a different API contract, not a different spelling of
+//!    the same one, and it is the route that applications which poll keys rather
+//!    than read characters can see at all. Without a job for it, the fallback
+//!    would only be claimed to exist.
 //!
 //! Each job drives a console window it opened itself, for the reason the capture
 //! dump gives: a hosted runner's desktop is not ours to depend on, and a window
@@ -41,7 +46,8 @@ use std::time::{Duration, Instant};
 
 use crate::desktop::{
     Delivery, MIN_INK_RATIO, MouseButton, ScreenPoint, WindowInfo, capture_window, click_window,
-    cursor_position, inject_click, inject_text, interactive_session, list_windows,
+    cursor_position, inject_click, inject_text, inject_text_as_keys, interactive_session,
+    list_windows,
 };
 
 /// `CREATE_NEW_CONSOLE`: without it `cmd.exe` inherits this process's console and
@@ -354,5 +360,93 @@ fn input_dump_a_posted_click_leaves_the_cursor_alone() {
     note(&format!(
         "posted click to {} at {},{} left the pointer at {:?} ({messages} messages queued)",
         window.hwnd, aimed.x, aimed.y, before
+    ));
+}
+
+/// 4. The scan-code route puts the same characters on the same screen.
+#[test]
+#[ignore = "needs a real interactive desktop; run by the artifact workflow with --ignored"]
+fn input_dump_the_scan_code_route_also_reaches_the_console() {
+    if !interactive_session() {
+        note("no interactive seat on this host, so there is no keyboard to press");
+        return;
+    }
+    let marker = format!("OCIN-KEYS-{}", std::process::id());
+    let mut child = spawn_marker_window(&marker);
+    let window = match wait_for_window(&marker) {
+        Ok(window) => window,
+        Err(why) => {
+            stop(&mut child);
+            panic!("{why}");
+        }
+    };
+    if !window.foreground {
+        stop(&mut child);
+        panic!(
+            "the marker window lost focus before it could be typed into; injected input would \
+             have gone to another application, so nothing was sent"
+        );
+    }
+    let before = match capture_stable(window.hwnd) {
+        Ok(capture) => capture,
+        Err(why) => {
+            stop(&mut child);
+            panic!("{why} before pressing keys");
+        }
+    };
+    // The fallback path, not the unicode one: every character here is a key on
+    // the installed layout, with Shift held where the layout says it must be.
+    let delivery = match inject_text_as_keys(TYPED) {
+        Ok(delivery) => delivery,
+        Err(why) => {
+            stop(&mut child);
+            panic!("inject_text_as_keys failed: {why}");
+        }
+    };
+    std::thread::sleep(PAINT_SETTLE);
+    let after = match capture_stable(window.hwnd) {
+        Ok(capture) => capture,
+        Err(why) => {
+            stop(&mut child);
+            panic!("{why} after pressing keys");
+        }
+    };
+    let _ = write_png("before-keys.png", &before);
+    let _ = write_png("after-keys.png", &after);
+    stop(&mut child);
+
+    let Delivery::Injected { events } = delivery else {
+        panic!("inject_text_as_keys must report an injected delivery");
+    };
+    // Not an equality: how many events a string costs depends on the keyboard
+    // the runner happens to have, because every shifted character carries two
+    // more. What is layout-independent is the floor of one pair per character,
+    // and that the count is even, since a lone press is a held key.
+    assert!(
+        events >= TYPED.chars().count() * 2,
+        "{} events for {} characters is fewer than a press and a release each",
+        events,
+        TYPED.chars().count()
+    );
+    assert_eq!(
+        events % 2,
+        0,
+        "{events} events means a key was left pressed: presses and releases are unbalanced"
+    );
+    assert!(
+        after.ink_ratio - before.ink_ratio > MIN_INK_RATIO,
+        "pressing keys changed the frame by only {:.6} of ink ratio (before {:.6}, after {:.6}), \
+         which a blinking caret accounts for on its own: the scan-code route delivered events and \
+         the console ignored them, which is the difference between this job and the unicode one.",
+        after.ink_ratio - before.ink_ratio,
+        before.ink_ratio,
+        after.ink_ratio
+    );
+    note(&format!(
+        "scan-code route typed {TYPED:?}: {} events, ink {:.6} -> {:.6}, delta {:.6}",
+        events,
+        before.ink_ratio,
+        after.ink_ratio,
+        after.ink_ratio - before.ink_ratio
     ));
 }
