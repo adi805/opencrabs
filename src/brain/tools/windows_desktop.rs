@@ -325,7 +325,7 @@ fn capture_report(hwnd: isize, out_dir: &Path) -> std::result::Result<String, St
     let path = out_dir.join(format!("desktop-capture-{hwnd}.png"));
     let capture = desktop::capture_window_to_png(hwnd, &path).map_err(|why| why.to_string())?;
     Ok(format!(
-        "photographed window {hwnd} at {}x{}, ink ratio {:.4}, {} ({}); written to {}",
+        "photographed window {hwnd} at {}x{}, ink ratio {:.4}, {}; written to {}",
         capture.width,
         capture.height,
         capture.ink_ratio,
