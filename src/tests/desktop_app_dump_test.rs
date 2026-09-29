@@ -29,7 +29,7 @@ use crate::tests::desktop_input_util::{close_window, lit_pixels, note, out_dir, 
 /// to a later candidate still says so.
 const CANDIDATES: &[&str] = &["notepad.exe", "mspaint.exe", "charmap.exe"];
 
-fn launch_and_find(name: &str) -> Result<desktop::WindowInfo, String> {
+fn launch_and_find(name: &str) -> Result<(u32, desktop::WindowInfo), String> {
     let plan = LaunchPlan::build(name, &[]).map_err(|why| format!("{name}: {why}"))?;
     let (pid, found) = desktop::launch_to_window(&plan, app::LAUNCH_WINDOW_SETTLE)
         .map_err(|why| format!("{name}: {why}"))?;
@@ -39,7 +39,7 @@ fn launch_and_find(name: &str) -> Result<desktop::WindowInfo, String> {
                 "launched {name} as pid {pid}, window {}",
                 window.hwnd
             ));
-            Ok(window)
+            Ok((pid, window))
         }
         None => Err(format!(
             "{name}: started as pid {pid} and showed no window within {:?}",
@@ -50,11 +50,11 @@ fn launch_and_find(name: &str) -> Result<desktop::WindowInfo, String> {
 
 /// Every candidate tried, each failure kept. A receipt that quietly used a
 /// different program than the one that failed would hide the failure.
-fn first_window_around() -> Result<desktop::WindowInfo, String> {
+fn first_window_around() -> Result<(u32, desktop::WindowInfo), String> {
     let mut failures = Vec::new();
     for name in CANDIDATES {
         match launch_and_find(name) {
-            Ok(window) => return Ok(window),
+            Ok((pid, window)) => return Ok((pid, window)),
             Err(why) => {
                 note(&format!("candidate {name} gave no window: {why}"));
                 failures.push(why);
@@ -89,12 +89,27 @@ fn still_listed(hwnd: isize) -> bool {
 
 /// Best effort between receipts: a leaked window makes the next one harder to
 /// read, and a failed cleanup is not a failed receipt.
-fn tidy(hwnd: isize) {
+fn tidy(launched_pid: u32, window: &desktop::WindowInfo) {
+    let hwnd = window.hwnd;
     if still_listed(hwnd) {
         note(&format!(
             "tidy-up: window {hwnd} is still listed, asking it to close"
         ));
         close_window(hwnd);
+    }
+    // A request is not a guarantee. `WM_CLOSE` is something a program can refuse:
+    // `mspaint.exe` answers with a save dialog and the window stays, and a leaked
+    // window occupies the desktop for every later receipt in the same job. The
+    // sweep is scoped to the pid THIS test started, never to `window.pid`: the
+    // owner of a console window is the shared console host, and `taskkill /F /T`
+    // on that would take the job's own terminal down with it. `app::close_target_allowed`
+    // refuses the same classes for the same reason, and a test that panicked
+    // before reaching here is not cleaned, because the runner dies with it.
+    if launched_pid != process::id() && window.pid == launched_pid {
+        note(&format!(
+            "tidy-up: sweeping pid {launched_pid} and its children"
+        ));
+        crate::utils::shell::kill_process_tree(launched_pid);
     }
 }
 
@@ -125,7 +140,7 @@ fn evidence(name: &str, window: &desktop::WindowInfo) -> Result<(), String> {
 #[test]
 #[ignore = "needs a Windows session with a desktop; runs in windows-artifact.yml"]
 fn app_dump_a_launched_program_shows_a_window_we_can_attribute_to_it() {
-    let window = first_window_around().expect("a launched program should show a window");
+    let (pid, window) = first_window_around().expect("a launched program should show a window");
     assert_ne!(
         window.hwnd, 0,
         "handle 0 is the value for \"no window\", not a window to act on"
@@ -135,14 +150,20 @@ fn app_dump_a_launched_program_shows_a_window_we_can_attribute_to_it() {
         "pid 0 is the value for \"owner unreadable\", and the claim here is that the window \
          belongs to the process we started"
     );
+    assert_eq!(
+        window.pid, pid,
+        "the enumeration attributes window {} to pid {}, but we started the program as pid {} \
+         and the whole claim of this receipt is that pair",
+        window.hwnd, window.pid, pid
+    );
     evidence("app-window.png", &window).expect("write app-window.png");
-    tidy(window.hwnd);
+    tidy(pid, &window);
 }
 
 #[test]
 #[ignore = "needs a Windows session with a desktop; runs in windows-artifact.yml"]
 fn app_dump_focus_is_read_back_from_the_desktop_not_from_the_call() {
-    let window = first_window_around().expect("a launched program should show a window");
+    let (pid, window) = first_window_around().expect("a launched program should show a window");
     let verdict = desktop::focus_target(window.hwnd)
         .expect("the foreground window should be readable on a session that has one");
     note(&format!(
@@ -157,18 +178,20 @@ fn app_dump_focus_is_read_back_from_the_desktop_not_from_the_call() {
         window.hwnd
     );
     evidence("app-focus.png", &window).expect("write app-focus.png");
-    tidy(window.hwnd);
+    tidy(pid, &window);
 }
 
 #[test]
 #[ignore = "needs a Windows session with a desktop; runs in windows-artifact.yml"]
 fn app_dump_closing_a_window_is_measured_by_it_stopping_to_exist() {
-    let window = first_window_around().expect("a launched program should show a window");
+    let (pid, window) = first_window_around().expect("a launched program should show a window");
     let hwnd = window.hwnd;
     let before = still_listed(hwnd);
     let verdict = desktop::close_target(&window, process::id(), app::CLOSE_SETTLE)
         .expect("closing a program we started ourselves must not be refused");
-    note(&format!("close verdict: {verdict}"));
+    note(&format!(
+        "close verdict for window {hwnd}, launched as pid {pid}: {verdict}"
+    ));
     let after = still_listed(hwnd);
     assert!(
         matches!(verdict, CloseVerdict::Gone { .. }),
