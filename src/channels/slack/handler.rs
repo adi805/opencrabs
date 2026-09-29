@@ -631,6 +631,72 @@ pub(crate) fn handler_state() -> Option<Arc<HandlerState>> {
 /// block as the tools it sits between (#943). Narration used to take a separate
 /// `chat_post_message` path, which put the agent's thinking in the channel as
 /// an ordinary message.
+/// Re-render throttle for the live flow group (#1807): the `🕒` clock must
+/// roll between tool events like Telegram's 1500 ms edit loop, but Slack
+/// `chat.update` is rate-limited, so the tick is 4 s. One ticker per turn,
+/// spawned where the turn's group-ts slot is created: it idles until the
+/// first step posts the group, re-renders each tick, and stops when the
+/// group settles (settle keeps the last word via the race fixup below),
+/// when retention prunes it, or at the 30 min safety cap.
+const FLOW_TICKER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(4);
+const FLOW_TICKER_CAP: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+fn spawn_flow_ticker(
+    client: Arc<SlackHyperClient>,
+    slack_state: Arc<SlackState>,
+    group_ts: Arc<Mutex<Option<SlackTs>>>,
+) {
+    tokio::spawn(async move {
+        let born = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(FLOW_TICKER_INTERVAL).await;
+            if born.elapsed() > FLOW_TICKER_CAP {
+                break;
+            }
+            let Some(ts) = group_ts.lock().await.clone() else {
+                // Group not born yet: the turn has not reached its first
+                // step. Keep waiting.
+                continue;
+            };
+            let Some(group) = slack_state.tool_group_snapshot(ts.as_ref()).await else {
+                break; // pruned by retention mid-turn
+            };
+            if group.settled.is_some() {
+                break; // settle already posted the final line
+            }
+            let content = super::tool_group::render(&group, &ts);
+            let token = SlackApiToken::new(SlackApiTokenValue::from(
+                slack_state
+                    .bot_token
+                    .lock()
+                    .await
+                    .clone()
+                    .unwrap_or_default(),
+            ));
+            let session = client.open_session(&token);
+            let upd = SlackApiChatUpdateRequest::new(group.channel.clone(), content, ts.clone());
+            if let Err(e) = session.chat_update(&upd).await {
+                tracing::warn!("Slack: flow ticker chat_update failed (ts={ts}): {e}");
+            }
+            // Race guard: settle may have stamped and posted while this
+            // tick's update was in flight. The settled line must be last,
+            // so if the group settled behind us, re-render its content once.
+            match slack_state.tool_group_snapshot(ts.as_ref()).await {
+                Some(re) if re.settled.is_some() => {
+                    let content = super::tool_group::render(&re, &ts);
+                    let upd = SlackApiChatUpdateRequest::new(re.channel, content, ts);
+                    if let Err(e) = session.chat_update(&upd).await {
+                        tracing::warn!("Slack: flow ticker settle fixup failed: {e}");
+                    }
+                    break;
+                }
+                Some(_) => {}  // still live: keep ticking
+                None => break, // pruned mid-tick
+            }
+        }
+    });
+}
+
 async fn sync_step_group<'a>(
     session: &SlackClientSession<'a, slack_morphism::hyper_tokio::SlackClientHyperHttpsConnector>,
     slack_state: &Arc<SlackState>,
@@ -1771,6 +1837,13 @@ async fn handle_message(
     // posted.
     let turn_group_ts: Arc<Mutex<Option<SlackTs>>> = Arc::new(Mutex::new(None));
     let turn_group_ts_final = turn_group_ts.clone();
+    // Roll the flow clock between tool events (#1807): one ticker per turn,
+    // self-stopping on settle so it never outlives the group.
+    spawn_flow_ticker(
+        client.clone(),
+        state.slack_state.clone(),
+        turn_group_ts.clone(),
+    );
 
     // Build progress callback — sends tool call status as Slack messages
     #[allow(clippy::type_complexity)]

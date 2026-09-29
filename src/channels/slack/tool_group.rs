@@ -382,6 +382,16 @@ impl SlackState {
         Some(group.clone())
     }
 
+    /// Snapshot a group by ts for the flow ticker (#1807): live or settled,
+    /// `None` only when missing (never stored or pruned by retention). The
+    /// ticker decides on `settled`; keeping settled groups visible here is
+    /// what makes the stop condition observable in tests.
+    pub(crate) async fn tool_group_snapshot(&self, ts: &str) -> Option<GroupState> {
+        let guard = self.tool_groups.lock().await;
+        let (_, map) = &*guard;
+        map.get(ts).cloned()
+    }
+
     /// Record the channel's most recent background-waiting group (#1797):
     /// (channel id, group message ts, owning session). One per channel: a
     /// channel has at most one live turn, so at most one waiting group.
