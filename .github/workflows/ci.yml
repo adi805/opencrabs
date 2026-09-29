@@ -194,8 +194,12 @@ jobs:
   # hardcode in four child-spawn sites lived for months with CI green,
   # because tests run on Linux (where `sh` exists) and Windows was never
   # built here (#627 — the old job chronically hit the 40m cap with
-  # --all-features and cold caches). Build-only, no tests: the point is to
-  # catch spawn-path and cfg(windows) compile breakage at PR time. The
+  # --all-features and cold caches). It catches spawn-path and cfg(windows) compile breakage at
+  # PR time, and since this commit it also EXECUTES the artifact once: the
+  # --version smoke step below is the first signal in this repo's history
+  # that opencrabs.exe actually starts. Compiling was never evidence of
+  # that (#1759). Still no full test suite here: the ci-gate job comment
+  # carries the #627 cost history behind that decision. The
   # release recipe (CMake + NASM) compiles the llama-cpp-sys-2 C++ wrapper;
   # `--profile ci` (thin LTO, 16 codegen units) plus rust-cache keep the
   # wall-clock inside the cap that killed the original job.
@@ -208,7 +212,11 @@ jobs:
     # cmake C++ + ~15 for the thin-LTO link of a 4-vCPU runner); warm runs
     # from rust-cache land near 10. The original 40 cap killed a build that
     # was minutes from linking. Keep a cap so a true hang can't burn 360.
-    timeout-minutes: 60
+    # 90 (not 60) while the scoped-test step rides along: the cfg(test) lib
+    # compiles on top of the build. The job is NOT in the required gate, so
+    # the extra ceiling is a priced trade for the first-ever Windows
+    # execution receipts, not silent drift.
+    timeout-minutes: 90
     steps:
       # fetch-depth 0: the path filter below diffs against the PR base sha.
       - uses: actions/checkout@v5
@@ -264,7 +272,7 @@ jobs:
           files=$(git diff --name-only "$base" HEAD)
           echo "changed files:"
           echo "$files"
-          pattern='^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|build\.rs|\.github/workflows/ci\.yml|src/utils/(shell|cwd)\.rs|src/brain/tools/(bash|read)\.rs)$'
+          pattern='^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|build\.rs|\.github/workflows/ci\.yml|src/utils/(shell|cwd)\.rs|src/brain/tools/(bash|read)\.rs|src/tui/app/input\.rs|src/config/(winlock|profile)\.rs|src/cli/service_windows\.rs)$'
           if echo "$files" | grep -qE "$pattern"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
@@ -301,6 +309,93 @@ jobs:
         # doesn't pull the esaxx object — the shape that ships releases.
         run: cargo build --locked --profile ci --target x86_64-pc-windows-msvc --all-features
 
+      # compile-green was never starts-green: a binary that dies on DLL
+      # load, console init, or allocator config at startup sails through a
+      # build-only job. This step runs the ci-profile binary THIS job just
+      # built: proof that a Windows-linked opencrabs.exe starts and answers
+      # --version. It is not the release artifact (release.yml links its own
+      # release-profile binary) — the claim is deliberately bounded. #1759
+      # shipped into a pipeline that could not distinguish the two.
+      - name: "Smoke (windows): execute the binary it built"
+        if: steps.relevant.outputs.run == 'true'
+        shell: bash
+        run: |
+          # Actions' bash runs with -e: without the guard, a failing exe
+          # would die AT the substitution and the echo below would never
+          # run — the exact case whose diagnostic we want. stderr rides in
+          # too (DLL-load failures land there).
+          set +e
+          ver=$(./target/x86_64-pc-windows-msvc/ci/opencrabs.exe --version 2>&1)
+          status=$?
+          set -e
+          echo "exit=$status version=$ver"
+          [ "$status" -eq 0 ] || exit 1
+          echo "$ver" | grep -qi opencrabs
+
+      # Scoped execution: only the modules whose tests assert platform
+      # behaviour. Full-suite Windows was rejected twice (#627 cost, and
+      # POSIX-semantics failures that are not bugs). Slice members:
+      #   config::winlock      (from #3) cross-handle contention +
+      #                        fail-closed terminate proof -- cfg(windows):
+      #                        these run NOWHERE ELSE
+      #   cli::service_windows (from #9) PS builders, parser, injection
+      #   tests::utils_shell_test          the shell_pair probe contract
+      #   tests::utils_cwd_test            drive-letter + lookalike dirs
+      #   tests::browser_default_windows_test  browser path detection
+      #   tests::profile_test                  lock-owner stamp parsing and
+      #                        reused-PID resolution: 67 tests that exist on
+      #                        THIS base, so Windows gives real receipts on
+      #                        day 1 instead of a zero-match tripwire. The
+      #                        round-9 finding (a Windows-only test failure)
+      #                        lived in exactly this module, and no CI job
+      #                        could have seen it: Windows ran no tests.
+      # The first two do not exist on this branch's base: the per-filter
+      # tripwire below reports them as ZERO-MATCH until #3/#9 merge,
+      # rather than pretending green. That silence-is-failure property is
+      # the point of looping filters instead of one combined cargo test.
+      # fail-soft by design: the honest day-1 state is "unknown until run".
+      # Flip continue-on-error once the receipts are green, not before.
+      - name: "Scoped tests (windows): platform-behaviour slice"
+        if: steps.relevant.outputs.run == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          # One filter per module, each individually judged. A combined
+          # `cargo test -- a b c` that silently matches nothing looks green;
+          # per-module zero-detection here is a SCREAM (module renamed, not
+          # yet merged, or renamed by a sibling PR), not a pass -- the same
+          # anti-fake-green principle the footgun gate's --self-test enforces.
+          # Actions' bash runs with -e, so an unguarded substitution exits AT
+          # the assignment and `rc=$?` below is never reached: the loop would
+          # abort on the first failing module, print none of the captured
+          # output, and skip every module after it. The smoke step above
+          # carries the same guard for the same reason. One more trap: with
+          # `--lib`, cargo writes "test result: FAILED. N passed" on failure,
+          # so parsing `$out` must not assume the ok-form.
+          status=0
+          for m in config::winlock cli::service_windows tests::utils_shell_test \
+                   tests::utils_cwd_test tests::browser_default_windows_test \
+                   tests::profile_test; do
+            set +e
+            out=$(cargo test --locked --profile ci --target x86_64-pc-windows-msvc \
+                    --lib -- "$m" 2>&1)
+            rc=$?
+            set -e
+            n=$(printf '%s\n' "$out" | sed -n 's/^test result: [a-z]*\. \([0-9]*\) passed.*/\1/p' | head -n1)
+            failed=$(printf '%s\n' "$out" | sed -n 's/.*; \([0-9]*\) failed.*/\1/p' | head -n1)
+            if [ $rc -ne 0 ]; then
+              echo "::warning::Windows slice FAILS (rc=$rc, failed=${failed:-?}): $m"
+              printf '%s\n' "$out" | tail -20
+              status=1
+            elif [ -z "$n" ] || [ "$n" -eq 0 ]; then
+              echo "::warning::Windows slice ZERO-MATCH: $m names no tests here (renamed or not yet merged)"
+              status=1
+            else
+              echo "Windows slice PASS: $m ($n tests)"
+            fi
+          done
+          exit $status
+
   # ── Windows footgun gate (seconds, every PR, no path filter) ──────
   # The windows-build job is deliberately path-filtered to keep #627's
   # bill down, which means a spawn-path or POSIX-API regression in an
@@ -311,7 +406,7 @@ jobs:
   # then the tree.
   windows-footguns:
     name: Windows footguns
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'self-hosted' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork || github.repository_owner == 'adi805') && 'ubuntu-latest' || 'self-hosted' }}
     steps:
       - uses: actions/checkout@v5
       - name: Linter proves its own teeth
@@ -590,7 +685,11 @@ jobs:
     # actually ran in the same window. #627 removed the original job from the
     # gate for exactly that reason. It stays as an advisory signal; Windows
     # remains release-blocking via release.yml's build matrix before any tag.
-    needs: [lint, build, test, audit]
+    # windows-footguns IS required: it is an ubuntu python pass measured in
+    # seconds, and a footgun finding must block the PR, not scroll by as an
+    # advisory (the whole point of the gate is that nothing lints the
+    # cfg(windows) arms on their way in otherwise).
+    needs: [lint, build, test, audit, windows-footguns]
     runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork || github.repository_owner == 'adi805') && 'ubuntu-latest' || 'self-hosted' }}
     steps:
       - name: Check results

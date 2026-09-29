@@ -1,0 +1,99 @@
+name: Windows binary (artifact)
+
+# Why this file exists: ci.yml's `windows-build` job proves a Windows binary
+# COMPILES and STARTS, then throws it away - it never uploads the artifact. So
+# nothing produced by this series could actually be run on a Windows machine by
+# a human. This is the missing hand-off step: same target, same profile, same
+# flags, same toolchain, plus upload-artifact.
+#
+# It is deliberately a NEW file rather than a step added to ci.yml: ci.yml is
+# being edited by the other open PRs in this series, and a new path cannot
+# conflict with them or restart their in-flight runs.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/windows-artifact]
+
+jobs:
+  windows-exe:
+    name: Build Windows exe
+    runs-on: windows-latest
+    # Same ceiling as ci.yml's windows-build: a COLD run needs ~48 min (33
+    # compile incl. llama's cmake C++ plus ~15 for the thin-LTO link), warm
+    # from rust-cache lands near 10.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (pinned by rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # The two tools ci.yml's windows-build also installs: aws-lc-rs needs
+      # NASM on Windows, llama-cpp-sys-2 drives CMake.
+      - uses: lukka/get-cmake@latest
+      - uses: ilammy/setup-nasm@v1
+
+      - name: Build (flags identical to ci.yml windows-build)
+        shell: bash
+        env:
+          AWS_LC_SYS_CMAKE_BUILDER: '1'
+        run: cargo build --locked --profile ci --target x86_64-pc-windows-msvc --all-features
+
+      - name: Smoke (execute it before shipping it)
+        shell: bash
+        run: |
+          # Actions bash runs with -e: guard the substitution so a failing exe
+          # still prints its stderr instead of dying silently (#1759 shape).
+          set +e
+          ver=$(./target/x86_64-pc-windows-msvc/ci/opencrabs.exe --version 2>&1)
+          status=$?
+          set -e
+          echo "exit=$status version=$ver"
+          [ "$status" -eq 0 ] || exit 1
+          echo "$ver" | grep -qi opencrabs
+
+      - name: Upload the exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencrabs-windows-x64
+          path: target/x86_64-pc-windows-msvc/ci/opencrabs.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      # The gap this series was opened to close: nothing in the repo could show
+      # what the TUI actually renders on Windows. These tests drive the real
+      # `render` / `switch_mode` / `open_usage_dashboard` path into ratatui's
+      # TestBackend - no desktop, no screen-scraping, no Wine emulation - and
+      # write one frame per screen to target/ui-dump as a character grid plus
+      # run-length style runs. They are #[ignore]d, so they must be asked for
+      # explicitly, and they run only after the exe has already been proven to
+      # start.
+      - name: Dump the real UI (one frame per screen)
+        shell: bash
+        env:
+          AWS_LC_SYS_CMAKE_BUILDER: '1'
+        run: |
+          set +e
+          cargo test --locked --profile ci --target x86_64-pc-windows-msvc --all-features \
+            --lib ui_snapshot_dump -- --ignored --nocapture
+          status=$?
+          set -e
+          echo "ui-dump exit=$status"
+          ls -la target/ui-dump || echo "no target/ui-dump produced"
+          exit $status
+
+      - name: Upload the UI dump
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencrabs-ui-dump
+          path: target/ui-dump
+          if-no-files-found: warn
+          retention-days: 30
