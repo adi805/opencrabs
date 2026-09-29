@@ -52,8 +52,99 @@ import sys
 import tempfile
 from pathlib import Path
 
-UNIXY = re.compile(r"\bunix\b|\bmacos\b|\blinux\b|not\s*\(\s*windows\s*\)")
-HAS_WIN = re.compile(r"\bwindows\b")
+
+
+def _not3(v):
+    return None if v is None else (not v)
+
+
+def _any3(vs):
+    if any(v is True for v in vs):
+        return True
+    return None if any(v is None for v in vs) else False
+
+
+def _all3(vs):
+    if any(v is False for v in vs):
+        return False
+    return None if any(v is None for v in vs) else True
+
+
+def cfg_live_for_windows(expr: str) -> bool:
+    """Whether a cfg(...) expression can hold for a Windows build.
+
+    Three-valued: True means it can hold for Windows, False means it
+    cannot, None means unknown (feature gates, test, unresolvable names).
+    Unknown must NOT collapse into a boolean, because `not(unknown)` is
+    unknown, not False: encoding unknown as True made
+    cfg(not(feature = "x")) evaluate to False, so the scanner SKIPPED a
+    scope that can compile on Windows and a Unix-only call inside it would
+    pass the gate. Callers treat anything not definitely-False as live.
+    This replaces a name-regex heuristic that
+    misclassified negated gates in both directions:
+    cfg(not(any(target_os = "macos", target_os = "linux"))) runs ON Windows
+    yet looked unix-only (false negative), and not(windows) needed a special
+    case spelling. A recursive-descent walk of the cfg grammar leaves no
+    special cases to get wrong.
+    """
+    s = expr or ""
+    s = re.sub(
+        r'target_os\s*=\s*"([^"]*)"',
+        lambda m: "windows" if m.group(1) == "windows" else "other_os",
+        s,
+    )
+    s = re.sub(r'[A-Za-z_][A-Za-z0-9_]*\s*=\s*"[^"]*"', "neutral", s)
+    s = re.sub(r'"[^"]*"', "neutral", s)
+    toks = re.findall(r"[A-Za-z_][A-Za-z0-9_]*|[(),]", s)
+    if not toks:
+        return True
+    vals = {
+        "windows": True, "other_os": False, "unix": False,
+        "macos": False, "linux": False, "neutral": None,
+    }
+    pos = 0
+
+    def parse_args(closer_optional_comma: bool):
+        nonlocal pos
+        if pos >= len(toks) or toks[pos] != "(":
+            raise ValueError("cfg: expected (")
+        pos += 1
+        args = [parse_term()]
+        while pos < len(toks) and toks[pos] == ",":
+            pos += 1
+            args.append(parse_term())
+        if pos >= len(toks) or toks[pos] != ")":
+            raise ValueError("cfg: unbalanced parens")
+        pos += 1
+        return args
+
+    def parse_term():
+        nonlocal pos
+        t = toks[pos]
+        pos += 1
+        if t in ("cfg", "any", "all", "not"):
+            args = parse_args(True)
+            if t == "not":
+                return _not3(args[0])
+            return _any3(args) if t == "any" else _all3(args)
+        if t == "(":
+            return _all3(parse_args(True))
+        if t in vals:
+            return vals[t]
+        if t[0].isalpha() or t[0] == "_":
+            return None  # unknown predicate: could go either way
+        raise ValueError(f"cfg: unexpected token {t!r}")
+
+    try:
+        top = [parse_term()]
+        while pos < len(toks) and toks[pos] == ",":
+            pos += 1
+            top.append(parse_term())
+        if pos != len(toks):
+            return True
+        return _all3(top) is not False
+    except (ValueError, IndexError):
+        return True
 ATTR = re.compile(r"#\[!?[^\]]*\]")
 MOD_DECL = re.compile(r"(?:pub(?:\([^)\n]*\))?\s+)?mod\s+(\w+)\s*;$")
 
@@ -127,7 +218,7 @@ def scan_file(path, rules, declared_gate=""):
     except (UnicodeDecodeError, FileNotFoundError):
         return findings
     stack = []                  # (entry_depth, unixy_only)
-    if declared_gate and UNIXY.search(declared_gate) and not HAS_WIN.search(declared_gate):
+    if declared_gate and not cfg_live_for_windows(declared_gate):
         stack.append((-1, True))
     depth = 0
     pending = ""                # accumulated cfg of the item being parsed
@@ -147,7 +238,7 @@ def scan_file(path, rules, declared_gate=""):
         pending_suppress = False
 
         if "#![cfg(" in stripped:
-            stack.append((-1, bool(UNIXY.search(stripped)) and not HAS_WIN.search(stripped)))
+            stack.append((-1, not cfg_live_for_windows(stripped)))
             continue
 
         while stack and stack[-1][0] >= depth:
@@ -161,7 +252,7 @@ def scan_file(path, rules, declared_gate=""):
             continue
 
         expr = pending
-        item_unixy = bool(expr) and bool(UNIXY.search(expr)) and not HAS_WIN.search(expr)
+        item_unixy = bool(expr) and not cfg_live_for_windows(expr)
         live_for_windows = not gated_here and not item_unixy
 
         opens, closes = code.count("{"), code.count("}")
@@ -208,9 +299,23 @@ mod m {
     }
     // windows-footgun: ok -- reason present
     fn y() { let _ = "/tmp/marked"; }
-    #[cfg(unix)]
+    #[cfg(not(windows))]
     fn w() { let _ = h.as_raw_handle(); }
 }
+'''
+
+# The two negated-gate shapes the old name-regex got WRONG, pinned from
+# the review finding, both directions: not(any(macos,linux)) IS
+# windows-live (its spawn must be caught), not(feature = "...") is UNKNOWN
+# and must be scanned too (its kill must be caught -- this is the shape
+# that was silently skipped), and not(windows) is dead (no finding).
+SELF_NEGATED = r'''
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn fallback() { let _ = std::process::Command::new("sh"); }
+#[cfg(not(feature = "telegram"))]
+fn maybe_on_windows() { unsafe { libc::kill(1, 2); } }
+#[cfg(not(windows))]
+fn unix_only() { unsafe { libc::kill(1, 2); } }
 '''
 
 
@@ -228,6 +333,13 @@ def self_test():
         got = scan_file(d / "gates.rs", set(RULES))
         if got:
             print(f"self-test FAIL: inline gates leaked {got}", file=sys.stderr)
+            ok = False
+        (d / "negated.rs").write_text(SELF_NEGATED)
+        names = [rule for _, _, rule, _, _ in scan_file(d / "negated.rs", set(RULES))]
+        if names != ["unix-proc", "unix-api"]:
+            print(f"self-test FAIL: negated gates gave {names}, "
+                  f"expected exactly ['unix-proc', 'unix-api']",
+                  file=sys.stderr)
             ok = False
         (d / "decl.rs").write_text("#[cfg(unix)]\nmod gated;\n")
         (d / "gated.rs").write_text('fn z() { unsafe { libc::kill(1, 2); } }')
