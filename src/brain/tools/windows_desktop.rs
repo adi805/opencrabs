@@ -85,7 +85,8 @@ impl Tool for WindowsDesktopTool {
                 "key": {
                     "type": "string",
                     "enum": ["enter", "tab", "escape", "backspace", "delete", "insert",
-                             "home", "end", "pageup", "pagedown", "up", "down", "left", "right"]
+                             "home", "end", "pageup", "pagedown", "up", "down", "left",
+                             "right", "alt"]
                 },
                 "program": { "type": "string", "description": "Program for launch_app, literal path or name" },
                 "args": {
