@@ -290,6 +290,7 @@ pub mod desktop_input_test;
 pub mod desktop_input_util;
 pub mod desktop_model_test;
 pub mod desktop_policy_test;
+pub mod desktop_tool_test;
 pub mod desktop_windows_test;
 pub mod directive_discovery_test;
 pub mod discord_tool_group_test;
