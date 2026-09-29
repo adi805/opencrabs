@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use super::app::{self, CloseVerdict, FocusVerdict, LaunchPlan, window_of_pid};
 use super::model::WindowInfo;
 use super::win32::{GetForegroundWindow, IsWindow, SetForegroundWindow};
+use super::{Key, inject_key};
 
 /// Start a program. Returns its process id.
 ///
@@ -103,6 +104,20 @@ pub fn launch_to_window(
 /// can refuse the question instead of inventing an answer: `FocusVerdict` has no
 /// value that means "no desktop to ask".
 pub fn focus_target(hwnd: isize) -> Result<FocusVerdict, String> {
+    // Windows does not let a background process move the foreground: the call is
+    // accepted and then ignored, which is exactly the failure the read-back below
+    // is built to catch. Run 36504919419 measured it on the real desktop, window
+    // 852368 asked for while 328230 still held the place. One of the documented
+    // exceptions is that the process which received the last input event may set
+    // the foreground, so a lone Alt press-and-release goes in first, through the
+    // same SendInput path the keyboard receipt is already measured on.
+    //
+    // The injection's own result is dropped on purpose. Whether Alt arrived is not
+    // the claim this function makes; whether the window came forward is, and that
+    // is read back from the desktop instead of from either call. A keyboard layout
+    // with no scan code for `VK_MENU` therefore shows up as an unconfirmed focus,
+    // not as a panic or a false success.
+    let _ = inject_key(Key::Alt);
     let _ = set_foreground(hwnd);
     let deadline = Instant::now() + app::FOCUS_SETTLE;
     loop {

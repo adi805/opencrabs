@@ -60,6 +60,14 @@ pub enum Key {
     Down,
     Left,
     Right,
+    /// Left Alt, `VK_MENU`.
+    ///
+    /// This variant exists for one reason beyond typing: Windows lets the process
+    /// that last touched the input stream move the foreground, so a lone Alt
+    /// press-and-release is the standard way to become that process. Nothing
+    /// chords it, which is what makes it inert in the applications this lane has
+    /// been measured against; `focus_target` is its only caller in the crate.
+    Alt,
 }
 
 impl Key {
@@ -86,6 +94,7 @@ impl Key {
             "down" => Some(Self::Down),
             "left" => Some(Self::Left),
             "right" => Some(Self::Right),
+            "alt" | "menu" => Some(Self::Alt),
             _ => None,
         }
     }
@@ -108,6 +117,7 @@ impl Key {
             Self::Down => 0x28,
             Self::Left => 0x25,
             Self::Right => 0x27,
+            Self::Alt => 0x12,
         }
     }
 
@@ -124,7 +134,7 @@ impl Key {
     pub fn extended(self) -> bool {
         !matches!(
             self,
-            Self::Enter | Self::Tab | Self::Escape | Self::Backspace
+            Self::Enter | Self::Tab | Self::Escape | Self::Backspace | Self::Alt
         )
     }
 
