@@ -255,8 +255,8 @@ fn seat_report(interactive: bool) -> String {
     } else {
         "this process has no interactive desktop to look at, so an empty window \
          list here means the seat has no screen, not that nothing is open. \
-         Everything except seat_report and describe_desktop is refused for that \
-         reason."
+         Every action except seat_report is refused for that reason, and that \
+         refusal is the finding, not a failure to retry."
             .to_string()
     }
 }
