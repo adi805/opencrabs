@@ -205,6 +205,10 @@ jobs:
         shell: bash
 
       - name: Count the app evidence
+        # Windows runners default this step to PowerShell; the gate below is
+        # POSIX. Without an explicit shell the count dies with a ParserError
+        # even when the frames are on disk and the receipt is real.
+        shell: bash
         if: always()
         run: |
           status=0
