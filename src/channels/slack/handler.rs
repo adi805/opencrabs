@@ -624,14 +624,6 @@ pub(crate) fn handler_state() -> Option<Arc<HandlerState>> {
     HANDLER_STATE.get().cloned()
 }
 
-/// Append the ctx budget footer to an already-posted completion message via
-/// chat.update (#459): the footer belongs ON the completion, display-only,
-/// exactly like Telegram — never as its own message below it. The message is
-/// rebuilt as Block Kit sections plus the small grey context-block footer
-/// (#455/#457), retroactively enriching the kept intermediate. If the blocks
-/// update is rejected, a plain-text update with the footer appended retries;
-/// if that fails too, the footer is dropped with a warn — a standalone
-/// footer post is never an option.
 /// Render the turn's step group into Slack, creating the message on the first
 /// step and updating it on every one after.
 ///
@@ -687,22 +679,20 @@ async fn sync_step_group<'a>(
     }
 }
 
-/// Post a reply with the context footer attached, as its own message.
+/// Post the salvaged answer as its own message.
 ///
-/// The salvage path for a turn whose final response is empty: there is no
-/// earlier message to edit the footer into, so it goes out with the text.
+/// The salvage path for a turn whose final response is empty: the folded
+/// narration is the only answer there is, promoted out of the step group
+/// (#1805). Clean prose: the ctx budget lives on the settled line only
+/// (#1806).
 async fn post_final_text<'a>(
     session: &SlackClientSession<'a, slack_morphism::hyper_tokio::SlackClientHyperHttpsConnector>,
     channel_id: &str,
     thread_ts: Option<&SlackTs>,
     text: &str,
-    footer: &str,
 ) {
     let mrkdwn = crate::utils::slack_fmt::markdown_to_mrkdwn(text);
-    let mut blocks = super::blocks::blocks_from_mrkdwn(&mrkdwn);
-    if !footer.is_empty() {
-        blocks.push(super::blocks::context_footer(footer));
-    }
+    let blocks = super::blocks::blocks_from_mrkdwn(&mrkdwn);
     let mut req = SlackApiChatPostMessageRequest::new(
         SlackChannelId::new(channel_id.to_string()),
         SlackMessageContent::new()
@@ -718,44 +708,11 @@ async fn post_final_text<'a>(
     }
 }
 
-async fn append_footer_via_update<'a>(
-    session: &SlackClientSession<'a, slack_morphism::hyper_tokio::SlackClientHyperHttpsConnector>,
-    channel_id: &str,
-    ts: &SlackTs,
-    text: &str,
-    footer: &str,
-) {
-    if footer.is_empty() {
-        return;
-    }
-    let plain_text = format!("{text}\n\n{footer}");
-    let mut blocks = super::blocks::blocks_from_mrkdwn(text);
-    blocks.push(super::blocks::context_footer(footer));
-    let upd = SlackApiChatUpdateRequest::new(
-        SlackChannelId::new(channel_id.to_string()),
-        SlackMessageContent::new()
-            .with_text(plain_text.clone())
-            .with_blocks(blocks),
-        ts.clone(),
-    );
-    if let Err(e) = session.chat_update(&upd).await {
-        tracing::warn!("Slack: footer blocks update failed ({e}) — retrying as plain text");
-        let plain = SlackApiChatUpdateRequest::new(
-            SlackChannelId::new(channel_id.to_string()),
-            SlackMessageContent::new().with_text(plain_text),
-            ts.clone(),
-        );
-        if let Err(e) = session.chat_update(&plain).await {
-            tracing::warn!("Slack: ctx footer update failed, footer dropped: {e}");
-        }
-    }
-}
-
 /// Settle the turn's step group (#1797): stamp the delivery outcome (or the
 /// background-wait state) onto the group and re-render its message once the
-/// answer is out. The Slack mirror of Telegram's settled flow header, fed
-/// the SAME `ctx_footer` string the final answer carries so the two budgets
-/// can never disagree. A no-op when the turn never opened a group (plain
+/// answer is out. The Slack mirror of Telegram's settled flow header, and
+/// since #1806 the turn's ONLY ctx-budget carrier: answer messages are clean
+/// prose. A no-op when the turn never opened a group (plain
 /// tool-less replies). A Finished turn that ends with detached background
 /// tasks settles into the waiting state instead; the flip back to Finished
 /// happens at the channel's next inbound event (see `flip_waiting_group`),
@@ -1789,36 +1746,11 @@ async fn handle_message(
         }
     }
 
-    // Track sent intermediate message timestamps so we can delete them before
-    // sending the final response (prevents duplicate content on Slack).
-    // Per-turn record of intermediate posts: (slack_ts, content_hash). Both
-    // are needed at final-response time:
-    //   * `slack_ts` to delete the intermediate from the channel.
-    //   * `content_hash` to detect when the final's body matches an
-    //     intermediate verbatim — in which case the intermediate IS the
-    //     answer and we keep it instead of delete+repost.
-    // Per-TURN scope, not global. Earlier I used `state.seen_responses` (a
-    // 5-minute window keyed by channel + hash on HandlerState) and it
-    // suppressed legitimate final posts whenever the same body recurred
-    // across separate user prompts — observed at 01:18 / 01:32 / 01:39+
-    // today, same hash dropping five different turns. The eviction window
-    // doesn't matter when the hash gets re-inserted on every turn that
-    // happens to produce the same answer; the only correct scope is one
-    // turn.
-    // (ts, content hash, posted mrkdwn text). The text rides along so the
-    // footer paths can rebuild the message for a chat.update (#459).
-    let sent_intermediate_ts: Arc<Mutex<Vec<(SlackTs, u64, String)>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let sent_intermediate_ts_final = sent_intermediate_ts.clone();
-
     // Track every IntermediateText `tokio::spawn` handle so the
-    // final-response branch can await ALL of them before reading the
-    // `sent_intermediate_ts` list. Without this, the spawn-then-push race
-    // produced visible duplicates: stream emits IntermediateText, spawn
-    // fires `chat_post_message` + push (~200-500ms), stream ends, final
-    // handler reads list while it's still empty, classifies the
-    // intermediate as not-yet-posted, and posts the same body a second
-    // time. Sync `std::sync::Mutex` because the progress callback closure
+    // final-response branch can await ALL of them before settling, so the
+    // step group is fully updated before the answer lands. Narration folds
+    // into the group (#943), nothing posts standalone. Sync
+    // `std::sync::Mutex` because the progress callback closure
     // is synchronous and we only ever drain (no contention across
     // .await).
     let intermediate_handles: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
@@ -1863,7 +1795,6 @@ async fn handle_message(
             let tools = tools.clone();
             let tool_group_ts_cb = tool_group_ts_outer.clone();
             let slack_state_grp = slack_state_outer.clone();
-            let _ts_ref = sent_intermediate_ts.clone();
             let token = SlackApiToken::new(SlackApiTokenValue::from(bot_token_cb.clone()));
             let channel = channel_cb.clone();
             let client = client_cb.clone();
@@ -1972,7 +1903,6 @@ async fn handle_message(
                 }
                 ProgressEvent::IntermediateText { text, .. } => {
                     let thread_ts_resp = thread_ts_inner.clone();
-                    let ts_ref = sent_intermediate_ts.clone();
                     // Strip LLM-hallucinated artifacts (<!-- tools-v2: ... -->,
                     // <tool_call> XML blocks, etc.) BEFORE posting. The
                     // final-response handler does this on text_only; this is
@@ -1997,7 +1927,6 @@ async fn handle_message(
                     // doesn't break hash-match against the final.
                     let (text_clean, _vid_paths) = crate::utils::extract_vid_markers(&text_clean);
                     let text_clone = text_clean;
-                    let _ = &ts_ref; // narration no longer becomes a standalone message
                     let group_ts = tool_group_ts_cb.clone();
                     let handle = tokio::spawn(async move {
                         if text_clone.trim().is_empty() {
@@ -2168,13 +2097,9 @@ async fn handle_message(
             let token = SlackApiToken::new(SlackApiTokenValue::from(state.current_bot_token()));
             let session = client.open_session(&token);
 
-            // Await every IntermediateText spawn before reading the
-            // intermediates list. This closes the spawn-then-push race
-            // that produced visible duplicates: stream emits IntermediateText,
-            // spawn fires `chat_post_message` (~hundreds of ms), stream ends
-            // ~immediately, final handler used to read `sent_intermediate_ts`
-            // while it was still empty, classify the in-flight intermediate as
-            // not-yet-posted, and post the same body a second time.
+            // Await every IntermediateText spawn before touching the answer
+            // path, so the step group carries every folded note before the
+            // final response branch reads it (spawn-then-read race).
             let pending = {
                 let mut g = intermediate_handles_final.lock().expect("poisoned");
                 std::mem::take(&mut *g)
@@ -2191,36 +2116,11 @@ async fn handle_message(
                 }
             }
 
-            // Resolve intermediate-vs-final overlap PER TURN.
-            //
-            // Three outcomes possible after this block:
-            //   1. An intermediate already posted the same body as the final →
-            //      keep it as the visible answer, delete only the OTHER
-            //      intermediates, and skip the final post entirely. Avoids
-            //      delete+repost, which previously produced visible duplicates
-            //      when chat_delete silently failed.
-            //   2. No intermediate matched the final → delete all intermediates
-            //      (they were partial chunks), then post the final.
-            //   3. There were no intermediates → just post the final.
-            //
-            // The dedup is strictly intra-turn. The earlier global
-            // `state.seen_responses` map (5-minute window) caused legit final
-            // posts to be suppressed across separate user prompts whenever
-            // the same body recurred — observed at 01:18/01:32/01:39+ today,
-            // five turns dropped on the same hash.
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            text_only.hash(&mut hasher);
-            let final_hash = hasher.finish();
-
-            let intermediates = sent_intermediate_ts_final.lock().await.clone();
-
             // Context budget footer (display-only: never stored in the DB,
-            // never fed to TTS). Computed BEFORE the delivery-shape branches
-            // because every completed turn must show it (#456): the final
-            // post appends it, and the intermediate-as-answer paths, which
-            // skip the final post entirely, post it standalone.
+            // never fed to TTS). Sole carrier since #1806: the settled
+            // step-group line. Answer messages are clean prose; intermediates
+            // never post standalone since #943, so there is nothing to
+            // dedup the final against.
             let ctx_max = state.agent.context_limit_for_session(session_id);
             let footer = crate::utils::format_ctx_footer(
                 response.context_tokens,
@@ -2255,8 +2155,7 @@ async fn handle_message(
                         "Slack: final response is empty — posting the folded narration as the answer ({} chars)",
                         answer.len()
                     );
-                    post_final_text(&session, &channel_id, thread_ts.as_ref(), &answer, &footer)
-                        .await;
+                    post_final_text(&session, &channel_id, thread_ts.as_ref(), &answer).await;
                     // Consume the notes out of the group (#1805): the answer
                     // message now carries them, and a group still displaying
                     // the same text turns every expanded group into a visible
@@ -2324,85 +2223,6 @@ async fn handle_message(
                 return;
             }
 
-            let mut matching_keep: Vec<SlackTs> = Vec::new();
-            let mut to_delete: Vec<SlackTs> = Vec::new();
-            for (ts, hash, _text) in &intermediates {
-                if *hash == final_hash {
-                    matching_keep.push(ts.clone());
-                } else {
-                    to_delete.push(ts.clone());
-                }
-            }
-            if !to_delete.is_empty() {
-                tracing::info!(
-                    "Slack: deleting {} non-matching intermediate(s) before final response",
-                    to_delete.len()
-                );
-                for ts in &to_delete {
-                    let del = SlackApiChatDeleteRequest::new(
-                        SlackChannelId::new(channel_id.clone()),
-                        ts.clone(),
-                    );
-                    if let Err(e) = session.chat_delete(&del).await {
-                        tracing::warn!(
-                            "Slack: chat_delete failed (non-matching intermediate, ts={}): {}",
-                            ts,
-                            e
-                        );
-                    }
-                }
-            }
-            if !matching_keep.is_empty() {
-                tracing::info!(
-                    "Slack: skipping final post — {} intermediate(s) already carry this content (hash={})",
-                    matching_keep.len(),
-                    final_hash,
-                );
-                // The matching intermediate(s) stay visible as the answer.
-                // Channel-messages DB record still gets written below for
-                // future context queries.
-                if !text_only.trim().is_empty() {
-                    let cm = DbChannelMessage::new(
-                        "slack".into(),
-                        channel_id.clone(),
-                        Some(channel_name.clone()),
-                        "bot:opencrabs".to_string(),
-                        "OpenCrabs".to_string(),
-                        text_only.clone(),
-                        "text".into(),
-                        None,
-                    )
-                    .with_thread(thread_ts.as_ref().map(|ts| ts.to_string()), None);
-                    if let Err(e) = state.channel_msg_repo.insert(&cm).await {
-                        tracing::warn!(
-                            "Slack: failed to record bot reply in channel_messages: {}",
-                            e
-                        );
-                    }
-                }
-                // The kept intermediate carries the answer but not the ctx
-                // footer (the final post that normally appends it is being
-                // skipped) — edit the footer into it, display-only (#459).
-                // Its posted body hash-matched the final, so text_only IS
-                // its content.
-                if let Some(ts) = matching_keep.first() {
-                    append_footer_via_update(&session, &channel_id, ts, &text_only, &footer).await;
-                }
-                settle_step_group(
-                    &session,
-                    &state.slack_state,
-                    &state.agent,
-                    session_id,
-                    SlackChannelId::new(channel_id.clone()),
-                    &channel_id,
-                    &turn_group_ts_final,
-                    super::tool_group::TurnOutcome::Finished,
-                    &footer,
-                )
-                .await;
-                return;
-            }
-
             for img_path in img_paths {
                 match tokio::fs::read(&img_path).await {
                     Ok(bytes) => {
@@ -2436,29 +2256,17 @@ async fn handle_message(
                 .into_iter()
                 .map(|s| s.to_string())
                 .collect();
-            for (i, chunk) in chunks.iter().enumerate() {
+            for chunk in chunks.iter() {
                 if chunk.is_empty() {
                     continue;
                 }
-                let is_last = i + 1 == chunks.len();
                 // Rich delivery (#455): the chunk goes out as Block Kit
                 // sections/dividers, with the plain text kept as the
                 // notification fallback. A rejected blocks post retries
                 // text-only so delivery never regresses on a Block Kit
                 // error (invalid block, limit change, ...).
-                let mut blocks = super::blocks::blocks_from_mrkdwn(chunk);
-                // The ctx footer rides the LAST message as a context block:
-                // small grey type that reads as metadata, not conversation
-                // (#457). The plain-text fallback keeps it appended so it is
-                // never lost when blocks are rejected.
-                let fallback_text = if is_last && !footer.is_empty() {
-                    if !blocks.is_empty() {
-                        blocks.push(super::blocks::context_footer(&footer));
-                    }
-                    format!("{chunk}\n\n{footer}")
-                } else {
-                    chunk.clone()
-                };
+                let blocks = super::blocks::blocks_from_mrkdwn(chunk);
+                let fallback_text = chunk.clone();
                 let content = if blocks.is_empty() {
                     SlackMessageContent::new().with_text(fallback_text.clone())
                 } else {
@@ -2488,12 +2296,12 @@ async fn handle_message(
                 }
             }
 
-            // Post-completion sweep: defense-in-depth for any IntermediateText
-            // spawn that pushed AFTER the dedup check above (e.g. a stream
-            // chunk delivered post-stream-end, or any future progress source
-            // that races with the final post). Drain remaining handles, await
-            // them, re-read the list, and delete any late entry that matches
-            // `final_hash` and wasn't already classified.
+            // Post-completion sweep: await any IntermediateText spawn that
+            // fired after the pre-answer drain (e.g. a stream chunk delivered
+            // post-stream-end) so the step group is fully updated before the
+            // reply is recorded and settled. Narration folds into the group
+            // (#943): nothing posts standalone, so there is nothing to
+            // delete here.
             let late_pending = {
                 let mut g = intermediate_handles_final.lock().expect("poisoned");
                 std::mem::take(&mut *g)
@@ -2501,31 +2309,6 @@ async fn handle_message(
             for h in late_pending {
                 if let Err(e) = h.await {
                     tracing::warn!(error = %e, "Slack late intermediate post task panicked");
-                }
-            }
-            let final_intermediates = sent_intermediate_ts_final.lock().await.clone();
-            let already_seen: std::collections::HashSet<String> = matching_keep
-                .iter()
-                .chain(to_delete.iter())
-                .map(|t| t.to_string())
-                .collect();
-            for (ts, hash, _text) in &final_intermediates {
-                if *hash == final_hash && !already_seen.contains(&ts.to_string()) {
-                    tracing::info!(
-                        "Slack: post-completion sweep — deleting late intermediate ts={} (hash matches final)",
-                        ts
-                    );
-                    let del = SlackApiChatDeleteRequest::new(
-                        SlackChannelId::new(channel_id.clone()),
-                        ts.clone(),
-                    );
-                    if let Err(e) = session.chat_delete(&del).await {
-                        tracing::warn!(
-                            "Slack: chat_delete failed (post-completion sweep, ts={}): {}",
-                            ts,
-                            e
-                        );
-                    }
                 }
             }
 
