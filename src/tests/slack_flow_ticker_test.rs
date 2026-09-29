@@ -6,7 +6,7 @@
 
 use crate::channels::slack::SlackState;
 use crate::channels::slack::tool_group::{GroupState, TurnOutcome};
-use slack_morphism::prelude::{SlackChannelId, SlackTs};
+use slack_morphism::prelude::SlackChannelId;
 
 fn live_group() -> GroupState {
     GroupState::new(SlackChannelId::new("C123".into()), vec![])

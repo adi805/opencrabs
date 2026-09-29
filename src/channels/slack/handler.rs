@@ -1795,22 +1795,32 @@ async fn handle_message(
         .store_cancel_token(session_id, cancel_token.clone())
         .await;
 
-    // Post a "thinking" placeholder so the user knows we're processing
-    let thinking_ts: Arc<Mutex<Option<SlackTs>>> = Arc::new(Mutex::new(None));
+    let turn_group_ts: Arc<Mutex<Option<SlackTs>>> = Arc::new(Mutex::new(None));
+    let turn_group_ts_final = turn_group_ts.clone();
+    // Open the flow group at turn start (#1808): the counter and the 🕒
+    // clock must cover the thinking latency too, not start at the first
+    // tool call. The old static placeholder is gone, the
+    // live group with its rolling clock IS the processing feedback.
     {
         let token = SlackApiToken::new(SlackApiTokenValue::from(state.current_bot_token()));
         let session = client.open_session(&token);
-        let mut req = SlackApiChatPostMessageRequest::new(
+        sync_step_group(
+            &session,
+            &state.slack_state,
             SlackChannelId::new(channel_id.clone()),
-            SlackMessageContent::new().with_text("_thinking..._".to_string()),
-        );
-        if let Some(ref ts) = thread_ts {
-            req = req.with_thread_ts(ts.clone());
-        }
-        if let Ok(resp) = session.chat_post_message(&req).await {
-            *thinking_ts.lock().await = Some(resp.ts);
-        }
+            thread_ts.clone(),
+            &turn_group_ts,
+            Vec::new(),
+        )
+        .await;
     }
+    // Roll the flow clock between tool events (#1807): one ticker per turn,
+    // self-stopping on settle so it never outlives the group.
+    spawn_flow_ticker(
+        client.clone(),
+        state.slack_state.clone(),
+        turn_group_ts.clone(),
+    );
 
     // Track every IntermediateText `tokio::spawn` handle so the
     // final-response branch can await ALL of them before settling, so the
@@ -1835,15 +1845,6 @@ async fn handle_message(
     // and the delivery tail: the settle pass (#1797) stamps the group only
     // after the answer is out, and it reaches the same ts the callbacks
     // posted.
-    let turn_group_ts: Arc<Mutex<Option<SlackTs>>> = Arc::new(Mutex::new(None));
-    let turn_group_ts_final = turn_group_ts.clone();
-    // Roll the flow clock between tool events (#1807): one ticker per turn,
-    // self-stopping on settle so it never outlives the group.
-    spawn_flow_ticker(
-        client.clone(),
-        state.slack_state.clone(),
-        turn_group_ts.clone(),
-    );
 
     // Build progress callback — sends tool call status as Slack messages
     #[allow(clippy::type_complexity)]
@@ -1858,7 +1859,6 @@ async fn handle_message(
         let bot_token_cb = state.current_bot_token();
         let channel_cb = SlackChannelId::new(channel_id.clone());
         let client_cb = client.clone();
-        let thinking_ts_cb = thinking_ts.clone();
         let thread_ts_cb = thread_ts.clone();
         let tool_group_ts_outer = tool_group_ts.clone();
 
@@ -1878,22 +1878,10 @@ async fn handle_message(
                     tool_name,
                     tool_input,
                 } => {
-                    let thinking_ts = thinking_ts_cb.clone();
                     let group_ts = tool_group_ts_cb.clone();
                     let ctx = crate::utils::tool_context_hint(&tool_name, &tool_input);
                     tokio::spawn(async move {
                         let session = client.open_session(&token);
-                        // Delete the "thinking..." placeholder on first tool call
-                        if let Some(ts) = thinking_ts.lock().await.take() {
-                            let del = SlackApiChatDeleteRequest::new(channel.clone(), ts.clone());
-                            if let Err(e) = session.chat_delete(&del).await {
-                                tracing::warn!(
-                                    "Slack: chat_delete failed (thinking placeholder on tool start, ts={}): {}",
-                                    ts,
-                                    e
-                                );
-                            }
-                        }
                         // Append to the turn's grouped tool message (#371),
                         // collapsed by default with an Expand toggle (#373).
                         let entries = {
@@ -2103,23 +2091,6 @@ async fn handle_message(
         .await;
 
     state.slack_state.remove_cancel_token(session_id).await;
-
-    // Delete the "thinking..." placeholder if it's still around
-    {
-        let token = SlackApiToken::new(SlackApiTokenValue::from(state.current_bot_token()));
-        let session = client.open_session(&token);
-        if let Some(ts) = thinking_ts.lock().await.take() {
-            let del =
-                SlackApiChatDeleteRequest::new(SlackChannelId::new(channel_id.clone()), ts.clone());
-            if let Err(e) = session.chat_delete(&del).await {
-                tracing::warn!(
-                    "Slack: chat_delete failed (thinking placeholder, ts={}): {}",
-                    ts,
-                    e
-                );
-            }
-        }
-    }
 
     match result {
         Ok(response) => {
