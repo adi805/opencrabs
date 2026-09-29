@@ -109,7 +109,8 @@ fn the_tool_level_flag_is_not_the_gate() {
 fn the_schema_offers_exactly_the_actions_the_policy_knows() {
     // Drift guard: the action list is written out as literal JSON because a
     // schema has to be literal, so this is what keeps the two from disagreeing.
-    let listed: Vec<&str> = tool().input_schema()["properties"]["action"]["enum"]
+    let schema = tool().input_schema();
+    let listed: Vec<&str> = schema["properties"]["action"]["enum"]
         .as_array()
         .expect("the action enum has to be an array")
         .iter()
