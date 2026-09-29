@@ -179,6 +179,21 @@ pub(crate) fn notes_text(entries: &[GroupEntry]) -> Option<String> {
     (!joined.is_empty()).then_some(joined)
 }
 
+/// The group's entries minus the narration notes (#1805).
+///
+/// The empty-final salvage promotes the folded narration to the answer
+/// message; notes left behind in the group then showed the same text twice
+/// the moment the group was expanded. They are consumed, not copied: what
+/// stays is the tool record only. An empty result means the group held
+/// nothing but narration, so its message is a shell the caller can delete.
+pub(crate) fn consume_notes(entries: &[GroupEntry]) -> Vec<GroupEntry> {
+    entries
+        .iter()
+        .filter(|e| matches!(e, GroupEntry::Tool { .. }))
+        .cloned()
+        .collect()
+}
+
 /// One rendered line for a step.
 fn entry_line(entry: &GroupEntry) -> String {
     match entry {

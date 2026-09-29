@@ -162,7 +162,7 @@ fn a_lone_narration_step_renders_without_a_summary_header() {
 // posted nothing at all — the answer stayed sealed in a collapsed group. These
 // pin the salvage path.
 
-use crate::channels::slack::tool_group::notes_text;
+use crate::channels::slack::tool_group::{consume_notes, notes_text};
 
 #[test]
 fn a_group_with_no_narration_has_nothing_to_salvage() {
@@ -205,4 +205,87 @@ fn blank_notes_do_not_produce_an_empty_answer() {
         GroupEntry::Note("\n".to_string()),
     ];
     assert_eq!(notes_text(&entries), None);
+}
+
+// ── Salvage consumes the notes out of the group (#1805) ──────────────────────
+//
+// #951's salvage posts the folded narration as the answer message; leaving the
+// notes in the group as well meant an expanded group displayed the answer
+// TWICE — the visible duplication reported on #1805. The notes must leave the
+// group when they become the answer, Telegram's take_folded_final mirror.
+
+#[test]
+fn consuming_notes_keeps_the_tool_record_and_drops_the_narration() {
+    let entries = vec![
+        GroupEntry::Note("First finding.".to_string()),
+        tool("bash", Some(true)),
+        GroupEntry::Note("Second finding.".to_string()),
+    ];
+    let remaining = consume_notes(&entries);
+    assert_eq!(
+        remaining.len(),
+        1,
+        "only the tool row survives:\n{remaining:?}"
+    );
+    assert!(
+        matches!(&remaining[0], GroupEntry::Tool { name, .. } if name == "bash"),
+        "the surviving entry must be the tool row:\n{remaining:?}"
+    );
+    assert!(
+        !matches!(remaining[0], GroupEntry::Note(_)),
+        "no note may survive the consume"
+    );
+}
+
+#[test]
+fn consuming_a_note_only_group_empties_it_so_the_shell_can_be_deleted() {
+    // When the group held nothing but narration, its message has nothing left
+    // to show after the salvage: the caller deletes it instead of rendering
+    // a "0 tool calls" shell, and the channel keeps exactly one copy.
+    let entries = vec![
+        GroupEntry::Note("Only speech.".to_string()),
+        GroupEntry::Note("More speech.".to_string()),
+    ];
+    assert!(
+        consume_notes(&entries).is_empty(),
+        "a note-only group must consume to empty"
+    );
+}
+
+#[test]
+fn consuming_a_tool_only_group_changes_nothing() {
+    let entries = vec![tool("bash", Some(true)), tool("read_file", None)];
+    let remaining = consume_notes(&entries);
+    assert_eq!(remaining.len(), 2);
+    assert!(
+        remaining
+            .iter()
+            .all(|e| matches!(e, GroupEntry::Tool { .. })),
+        "tool rows pass through untouched"
+    );
+}
+
+#[test]
+fn salvage_then_consume_never_show_the_same_text_twice() {
+    // The end-to-end contract of the #1805 fix: whatever the salvage posts as
+    // the answer is exactly what the group stops displaying.
+    let entries = vec![
+        GroupEntry::Note("Finding one.".to_string()),
+        tool("bash", Some(true)),
+        GroupEntry::Note("Finding two.".to_string()),
+    ];
+    let answer = notes_text(&entries).expect("salvage has the narration");
+    let remaining = consume_notes(&entries);
+    for entry in &remaining {
+        if let GroupEntry::Note(text) = entry {
+            assert!(
+                !answer.contains(text.as_str()),
+                "a consumed note must not survive in the group:\n{answer}"
+            );
+        }
+    }
+    assert!(
+        !remaining.iter().any(|e| matches!(e, GroupEntry::Note(_))),
+        "no notes may remain after consume"
+    );
 }

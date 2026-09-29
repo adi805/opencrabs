@@ -2239,32 +2239,12 @@ async fn handle_message(
             // Observed at 01:53 today: bot's only response was a streaming
             // intermediate, the final was empty, my dedup deleted the
             // intermediate and posted nothing.
+            // Post-#943 the intermediates list below is always empty — narration
+            // folds into the step group and nothing posts standalone — so the
+            // empty-final answer is the salvage path: it promotes the folded
+            // notes to the answer message and consumes them out of the group
+            // (#1805), mirroring Telegram's take_folded_final reclaim.
             if text_only.trim().is_empty() {
-                if !intermediates.is_empty() {
-                    tracing::info!(
-                        "Slack: final response is empty — keeping {} intermediate(s) as the visible answer",
-                        intermediates.len(),
-                    );
-                    // The kept intermediates ARE the completion: the footer
-                    // edits into the LAST one, display-only, exactly like
-                    // Telegram — never a standalone post below (#459).
-                    if let Some((ts, _hash, text)) = intermediates.last() {
-                        append_footer_via_update(&session, &channel_id, ts, text, &footer).await;
-                    }
-                    settle_step_group(
-                        &session,
-                        &state.slack_state,
-                        &state.agent,
-                        session_id,
-                        SlackChannelId::new(channel_id.clone()),
-                        &channel_id,
-                        &turn_group_ts_final,
-                        super::tool_group::TurnOutcome::Finished,
-                        &footer,
-                    )
-                    .await;
-                    return;
-                }
                 // Nothing was posted standalone, because narration now folds
                 // into the step group (#943). When the final is empty that
                 // folded text is the only answer there is, and leaving it
@@ -2277,6 +2257,38 @@ async fn handle_message(
                     );
                     post_final_text(&session, &channel_id, thread_ts.as_ref(), &answer, &footer)
                         .await;
+                    // Consume the notes out of the group (#1805): the answer
+                    // message now carries them, and a group still displaying
+                    // the same text turns every expanded group into a visible
+                    // duplicate — the exact shape reported on #1805.
+                    let remaining = super::tool_group::consume_notes(&steps_final.lock().await);
+                    let group_ts_snapshot = turn_group_ts_final.lock().await.clone();
+                    if let Some(ts) = group_ts_snapshot {
+                        if remaining.is_empty() {
+                            // The group was narration only: its message is an
+                            // empty shell now that the answer stands alone.
+                            let del = SlackApiChatDeleteRequest::new(
+                                SlackChannelId::new(channel_id.clone()),
+                                ts.clone(),
+                            );
+                            if let Err(e) = session.chat_delete(&del).await {
+                                tracing::warn!(
+                                    "Slack: chat_delete failed (consumed note-only group, ts={ts}): {e}"
+                                );
+                            }
+                            *turn_group_ts_final.lock().await = None;
+                        } else {
+                            sync_step_group(
+                                &session,
+                                &state.slack_state,
+                                SlackChannelId::new(channel_id.clone()),
+                                thread_ts.clone(),
+                                &turn_group_ts_final,
+                                remaining,
+                            )
+                            .await;
+                        }
+                    }
                     settle_step_group(
                         &session,
                         &state.slack_state,
