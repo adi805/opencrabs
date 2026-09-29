@@ -318,8 +318,12 @@ pub(crate) fn extract_status_from_text(command: &str) -> Option<String> {
 /// bare number or path). Human-readable text is returned WHOLE: trimmed, inline
 /// markdown markers (`*`/`` ` ``/`_`) stripped so the preview never shows raw
 /// source, newlines preserved, no truncation (amendment: whole intermediary
+///
+/// `pub(crate)` since #1809: the Slack flow line reuses this exact filter for
+/// its live activity segment (channels/slack/tool_group.rs `latest_activity`),
+/// the twin-file pattern reactions.rs already uses for `build_reaction_prompt`.
 /// text as the status source).
-fn human_readable_preview(text: &str) -> Option<String> {
+pub(crate) fn human_readable_preview(text: &str) -> Option<String> {
     let trimmed = text.trim();
     // Raw output: one bare token, no internal whitespace, that reads as a path
     // or number (has a `/` or no letters at all) — e.g. `src/foo.rs` or `12345`.

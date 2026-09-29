@@ -745,6 +745,7 @@ pub mod session_notify_test;
 pub mod session_provider_restore_test;
 pub mod session_working_dir_isolation_test;
 pub mod session_working_dir_test;
+pub mod slack_activity_text_test;
 pub mod slack_blocks_test;
 pub mod slack_final_body_test;
 pub mod slack_flow_ticker_test;

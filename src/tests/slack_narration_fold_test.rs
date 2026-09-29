@@ -32,7 +32,10 @@ const NARRATION: &str = "Let me verify one thing properly before I report it";
 
 #[test]
 fn collapsed_group_hides_narration() {
-    // The whole point: thinking must not be visible until asked for.
+    // The whole point: the narration TRANSCRIPT stays hidden until asked
+    // for. Since #1809 the summary legitimately leads with the latest
+    // activity (the newest note's one-line preview, Telegram live-footer
+    // parity); what must never appear collapsed is the 💭 row list.
     let g = group(
         vec![
             tool("bash", Some(true)),
@@ -43,8 +46,8 @@ fn collapsed_group_hides_narration() {
     );
     let text = text_of(&render(&g, &SlackTs::new("1.0".into())));
     assert!(
-        !text.contains(NARRATION),
-        "collapsed group must not show narration. Got:\n{text}"
+        !text.contains("💭"),
+        "collapsed group must not list narration rows. Got:\n{text}"
     );
 }
 
@@ -62,7 +65,9 @@ fn expanded_group_shows_narration_in_order() {
     let text = text_of(&render(&g, &SlackTs::new("1.0".into())));
     assert!(text.contains(NARRATION), "expanded must show it: {text}");
 
-    let note_at = text.find(NARRATION).expect("narration present");
+    // #1809: the summary leads with the note as activity too, so the ROW
+    // occurrence is the LAST one in the text (rfind), not the summary's.
+    let note_at = text.rfind(NARRATION).expect("narration present");
     let bash_at = text.find("bash").expect("bash present");
     let read_at = text.find("read_file").expect("read_file present");
     assert!(

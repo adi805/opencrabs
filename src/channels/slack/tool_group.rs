@@ -217,6 +217,55 @@ fn entry_line(entry: &GroupEntry) -> String {
 /// settle keeps the live glyph: `⏳ *Waiting for 2 background tasks ·
 /// 3 tool calls* · ctx · 🕒 5:01`, because the clock keeps rolling until
 /// the flip.
+/// Live activity preview for the flow line (#1809): what the agent is doing
+/// right now, the Slack twin of Telegram's `latest_activity_preview`
+/// (telegram/flow.rs). Same priorities: latest human-readable narration note,
+/// then line-start `#` comments from the latest bash command, then the latest
+/// tool label + context. This is the feedback Telegram's live footer leads
+/// with (#1052) and Slack's flow was missing.
+fn latest_activity(group: &GroupState) -> Option<String> {
+    if let Some(text) = group.entries.iter().rev().find_map(|e| match e {
+        GroupEntry::Note(text) => crate::channels::telegram::flow::human_readable_preview(text),
+        _ => None,
+    }) {
+        return Some(text);
+    }
+    if let Some(comments) = group.entries.iter().rev().find_map(|e| match e {
+        GroupEntry::Tool { name, context, .. } if name == "bash" => {
+            crate::channels::telegram::flow::extract_status_from_text(context)
+        }
+        _ => None,
+    }) {
+        return Some(comments);
+    }
+    group.entries.iter().rev().find_map(|e| match e {
+        GroupEntry::Tool { name, context, .. } => {
+            let ctx = context.trim_start();
+            Some(if ctx.is_empty() {
+                name.clone()
+            } else {
+                format!("{name} {ctx}")
+            })
+        }
+        GroupEntry::Note(_) => None,
+    })
+}
+
+/// Longest activity segment in the live flow line (#1809). Display-only cap:
+/// the line stays a glance, not a transcript.
+const ACTIVITY_MAX_CHARS: usize = 100;
+
+fn activity_segment(group: &GroupState) -> Option<String> {
+    let text = latest_activity(group)?;
+    let clipped: String = text.chars().take(ACTIVITY_MAX_CHARS).collect();
+    let out = if text.chars().count() > ACTIVITY_MAX_CHARS {
+        format!("{clipped}…")
+    } else {
+        clipped
+    };
+    (!out.is_empty()).then_some(out)
+}
+
 fn summary_line(group: &GroupState) -> String {
     let tools = group.entries.iter().filter(|e| e.is_tool()).count();
     let counts = format!("{tools} tool call{}", if tools == 1 { "" } else { "s" });
@@ -257,8 +306,15 @@ fn summary_line(group: &GroupState) -> String {
                     if steps == 1 { "" } else { "s" }
                 )
             };
+            // #1809: the activity leads the live line, the Telegram
+            // live-footer order (#1052): what it's doing, then counts,
+            // then the clock. Absent at turn start (empty group) so the
+            // shell keeps the bare counts shape.
+            let lead = activity_segment(group)
+                .map(|a| format!("{a} · "))
+                .unwrap_or_default();
             format!(
-                "{icon} *{counts}*{tail} · 🕒 {}",
+                "{icon} {lead}*{counts}*{tail} · 🕒 {}",
                 clock(group.started_at.elapsed())
             )
         }

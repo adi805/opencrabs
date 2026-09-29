@@ -57,7 +57,13 @@ fn single_tool_turn_still_shows_counter() {
     let content = render(&group(1, false, false), &SlackTs::new("1.0".into()));
     let text = text_of(&content);
     assert!(text.contains("1 tool call"), "text: {text}");
-    assert!(!text.contains("tool0"), "collapsed hides the row: {text}");
+    // #1809: with no narration the latest tool label legitimately leads
+    // the line as the activity fallback; what stays hidden collapsed is
+    // the rows list (never a second row block for it).
+    assert!(
+        text.starts_with("⚙️ tool0 (arg0) · *1 tool call*"),
+        "activity lead + counter: {text}"
+    );
     assert!(
         content.blocks.as_ref().is_some_and(|b| b.len() == 2),
         "expand button present"
