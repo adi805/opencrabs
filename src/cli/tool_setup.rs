@@ -306,6 +306,17 @@ pub(crate) fn register_runtime_tools(tool_registry: &Arc<ToolRegistry>, config: 
             crate::brain::tools::web_scrape::WebScrapeTool::default(),
         ));
     }
+
+    // Desktop control: offered only where there is a desktop to control. The
+    // module itself compiles everywhere so the Linux job can test its gates,
+    // but registering it on a machine with no window station would hand an agent
+    // a tool whose every useful answer is "no seat".
+    #[cfg(target_os = "windows")]
+    {
+        tool_registry.register(Arc::new(
+            crate::brain::tools::windows_desktop::WindowsDesktopTool,
+        ));
+    }
 }
 
 /// Headless-only preamble (#129, owner-ruled design): appended to the system
