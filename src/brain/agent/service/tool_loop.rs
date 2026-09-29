@@ -838,6 +838,14 @@ impl AgentService {
         has_progress_override: bool,
         progress_callback: Option<ProgressCallback>,
     ) -> Result<AgentResponse> {
+        // Restore the directory `/cd` persisted for this session BEFORE anything
+        // else in this function (#1810). Everything below (context build, brain
+        // assembly, tool-context creation) resolves the session's cwd, and a
+        // touch before this restore would create the handle from the launch
+        // directory of the process hosting the channels, leaving the DB row
+        // ignored forever. See `restore_persisted_working_directory`.
+        self.restore_persisted_working_directory(session_id).await;
+
         // #1776 seam 3: a fresh turn invalidates the claude-task turn
         // markers. Notifications arriving this turn for tasks NOT started
         // this turn are post-exit survivors and get delivered synthetically;
@@ -1452,36 +1460,6 @@ impl AgentService {
                 )
                 .await;
             context.add_message(Message::user(cont_text));
-        }
-
-        // Restore the directory `/cd` persisted for this session before the
-        // handle is created, otherwise the lazy seed hands a channel chat the
-        // directory the process was launched in and the DB row is ignored
-        // forever. Only the first turn of a session in this process can hit
-        // this: once the handle exists, a `cd` made since then wins.
-        if self.session_working_dir_unset(session_id) {
-            let persisted = crate::services::SessionService::new(self.context.clone())
-                .get_session(session_id)
-                .await;
-            match persisted {
-                Ok(Some(session)) => {
-                    if let Some(dir) =
-                        super::session_cwd::restorable_cwd(session.working_directory.as_deref())
-                    {
-                        tracing::info!(
-                            "Restored session {} working directory: {}",
-                            session_id,
-                            dir.display()
-                        );
-                        self.set_session_only_working_directory(session_id, dir);
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "failed to load session {session_id} for working-directory restore"
-                ),
-            }
         }
 
         // Create tool execution context. The working directory is per-session

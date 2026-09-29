@@ -1142,13 +1142,43 @@ impl AgentService {
         )
     }
 
+    /// Read a session's working directory WITHOUT creating its handle (#1810).
+    /// Reader-side twin of `working_dir_handle_for_session`: same value for an
+    /// untouched session (falls back to the global), but no insert. Pre-turn
+    /// readers (prompt build, brain assembly, compaction) must resolve through
+    /// a non-seeding read, or the first read would create the handle from the
+    /// launch directory and the persisted `/cd` restore in the tool loop would
+    /// find `session_working_dir_unset` already false and never run.
+    pub fn peek_working_directory_for_session(
+        &self,
+        session_id: Uuid,
+    ) -> Option<std::path::PathBuf> {
+        self.session_working_dirs
+            .read()
+            .expect("session_working_dirs lock poisoned")
+            .get(&session_id)
+            .map(|handle| {
+                handle
+                    .read()
+                    .expect("session working_directory lock poisoned")
+                    .clone()
+            })
+    }
+
     /// Current working directory for a specific session (#703). Falls back to
     /// the global value for a session that has not run a turn yet.
+    ///
+    /// Deliberately NON-seeding (#1810): this is a reader, not a creator. It
+    /// used to delegate to `working_dir_handle_for_session`, whose lazy insert
+    /// fired on the first prompt/brain build of a turn, before the persisted
+    /// `/cd` restore ran, so the restore's `session_working_dir_unset` guard
+    /// read false forever and every channel session executed in the process
+    /// launch directory. Handle creation stays in
+    /// `working_dir_handle_for_session`, called when the tool context is built
+    /// AFTER the restore has had its say.
     pub fn get_working_directory_for_session(&self, session_id: Uuid) -> std::path::PathBuf {
-        self.working_dir_handle_for_session(session_id)
-            .read()
-            .expect("session working_directory lock poisoned")
-            .clone()
+        self.peek_working_directory_for_session(session_id)
+            .unwrap_or_else(|| self.get_working_directory())
     }
 
     /// Set a session's working directory (#703). Called from a session switch,
@@ -1174,6 +1204,44 @@ impl AgentService {
             .read()
             .expect("session_working_dirs lock poisoned")
             .contains_key(&session_id)
+    }
+
+    /// Restore the directory `/cd` persisted for this session (#1810, #703).
+    ///
+    /// MUST run before anything touches the session's cwd handle: the first
+    /// touch used to lazily create the handle from the launch directory of the
+    /// process hosting the channels (TUI or headless), after which
+    /// `session_working_dir_unset` read false forever and this DB row was
+    /// never applied. Called at the very top of `run_tool_loop_inner`, before
+    /// context build, brain assembly, and tool-context creation. Only the
+    /// first turn of a session in this process can restore; a `cd` made since
+    /// then always wins.
+    pub(crate) async fn restore_persisted_working_directory(&self, session_id: Uuid) {
+        if !self.session_working_dir_unset(session_id) {
+            return;
+        }
+        let persisted = crate::services::SessionService::new(self.context.clone())
+            .get_session(session_id)
+            .await;
+        match persisted {
+            Ok(Some(session)) => {
+                if let Some(dir) =
+                    super::session_cwd::restorable_cwd(session.working_directory.as_deref())
+                {
+                    tracing::info!(
+                        "Restored session {} working directory: {}",
+                        session_id,
+                        dir.display()
+                    );
+                    self.set_session_only_working_directory(session_id, dir);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                error = %e,
+                "failed to load session {session_id} for working-directory restore"
+            ),
+        }
     }
 
     /// Set ONLY this session's working directory, leaving the global untouched.
