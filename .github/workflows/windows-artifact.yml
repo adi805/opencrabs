@@ -195,3 +195,38 @@ jobs:
           path: target/input-dump
           if-no-files-found: error
           retention-days: 30
+
+      - name: Drive the app lane (launch, focus, close)
+        # `always()` on purpose: this is the only place the three app actions are
+        # exercised against a real window, and it is most worth running on a
+        # commit whose input step just went red.
+        if: always()
+        run: cargo test --locked --profile ci --target x86_64-pc-windows-msvc --all-features --lib app_dump -- --ignored --nocapture --test-threads=1
+        shell: bash
+
+      - name: Count the app evidence
+        if: always()
+        run: |
+          status=0
+          ls -la target/input-dump 2>/dev/null || echo "no target/input-dump directory"
+          # Same gate as the input and capture steps, same reason: the claim is
+          # "a launched program showed a window, took the foreground, and then
+          # stopped being one", and that claim is only checkable if the frames it
+          # was measured against are on disk. A filter that matches nothing exits
+          # 0 and prints ok, so the count is the test, not the exit code.
+          frames=$(find target/input-dump -type f -name 'app-*.png' 2>/dev/null | wc -l)
+          echo "app-dump frames=$frames"
+          if [ "$frames" -lt 2 ]; then
+            echo "::error::the app dump wrote fewer than 2 app-*.png (frames=$frames): no launched-window and focused-window frame, so the app-control claim is unverified"
+            exit 1
+          fi
+          exit $status
+
+      - name: Upload the app evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencrabs-windows-app
+          path: target/input-dump/app-*.png
+          if-no-files-found: error
+          retention-days: 30
