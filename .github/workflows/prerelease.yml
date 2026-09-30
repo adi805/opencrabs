@@ -31,7 +31,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-macos:
     name: macOS (${{ matrix.asset_suffix }})
-    runs-on: [self-hosted, macOS]
+    runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
