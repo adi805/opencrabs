@@ -28,7 +28,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # ci2- prefix: the ci-* group on refs/heads/main got ghost-locked GitHub-side
+  # (runs from 2026-09-27/28 held the group forever; later main pushes never
+  # created jobs or check runs). A fresh group name unsticks scheduling; rename
+  # again if it ever recurs.
+  group: ci2-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
