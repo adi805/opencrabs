@@ -722,6 +722,7 @@ pub mod tui_render_utils_test;
 pub mod tui_session_switch_state_test;
 pub mod tui_theme_background_test;
 pub mod tui_theme_cache_invalidation_test;
+pub mod ui_snapshot_dump_test;
 pub mod tui_theme_picker_test;
 pub mod tui_theme_presets_test;
 pub mod tui_user_themes_test;
