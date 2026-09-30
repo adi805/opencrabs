@@ -31,19 +31,22 @@ fn main() {
     let n_in = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let n_out = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let n_err = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let t_in = std::thread::spawn(move || {
+    let c_in = std::sync::Arc::clone(&n_in);
+    let c_out = std::sync::Arc::clone(&n_out);
+    let c_err = std::sync::Arc::clone(&n_err);
+    let _t_in = std::thread::spawn(move || {
         if let Some(w) = child_in {
-            pump(std::io::stdin(), w, &n_in, "STDIN");
+            pump(std::io::stdin(), w, &c_in, "STDIN");
         }
     });
     let t_out = std::thread::spawn(move || {
         if let Some(r) = child_out {
-            pump(r, std::io::stdout(), &n_out, "STDOUT");
+            pump(r, std::io::stdout(), &c_out, "STDOUT");
         }
     });
     let t_err = std::thread::spawn(move || {
         if let Some(r) = child_err {
-            pump(r, std::io::stderr(), &n_err, "SSHERR");
+            pump(r, std::io::stderr(), &c_err, "SSHERR");
         }
     });
     let st = child.wait();
@@ -120,6 +123,7 @@ fn pump<R: std::io::Read, W: std::io::Write>(
 }
 
 fn selftest() {
+    use std::io::Read;
     blog("SELFTEST start");
     let mut cmd = std::process::Command::new(ssh_path());
     cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "joyboy", "printf", "bridge-selftest-ok"])
