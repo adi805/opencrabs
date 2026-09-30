@@ -16,6 +16,10 @@ use std::time::{Duration, Instant};
 /// How long a non-error notice ("Copied to clipboard") stays on the border.
 pub(crate) const NOTIFICATION_TTL: Duration = Duration::from_secs(2);
 
+/// How long the image-in-clipboard hint stays visible in the input area (#1816). Longer
+/// than a notification: it carries a call to action the user still has to act on.
+pub(crate) const CLIPBOARD_HINT_TTL: Duration = Duration::from_secs(6);
+
 /// How long a timestamped error toast stays on the border.
 pub(crate) const ERROR_TTL: Duration = Duration::from_millis(2500);
 
@@ -35,14 +39,17 @@ pub(crate) fn notice_expired(shown_at: Option<Instant>, now: Instant, ttl: Durat
     shown_at.is_some_and(|t| now.saturating_duration_since(t) >= ttl)
 }
 
-/// One slot, two candidates: an error outranks an informational notice.
+/// One slot, three candidates: an error outranks a notification, which
+/// outranks the clipboard hint.
 pub(crate) fn pick_notice<'a>(
     error: Option<&'a str>,
     info: Option<&'a str>,
+    hint: Option<&'a str>,
 ) -> Option<(NoticeKind, &'a str)> {
     error
         .map(|e| (NoticeKind::Error, e))
         .or_else(|| info.map(|i| (NoticeKind::Info, i)))
+        .or_else(|| hint.map(|h| (NoticeKind::Info, h)))
 }
 
 /// Squeeze `text` into a single border row of at most `max_chars` cells.

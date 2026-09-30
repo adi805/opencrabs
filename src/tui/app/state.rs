@@ -114,7 +114,7 @@ use crate::brain::{BrainLoader, CommandLoader, SelfUpdater, UserCommand};
 use crate::db::models::{Message, Session};
 use crate::services::{FileService, MessageService, ServiceContext, SessionService};
 use crate::tui::pane::PaneManager;
-use crate::tui::render::notice::{ERROR_TTL, NOTIFICATION_TTL, notice_expired};
+use crate::tui::render::notice::{CLIPBOARD_HINT_TTL, ERROR_TTL, NOTIFICATION_TTL, notice_expired};
 use crate::utils::prompt_analyzer::PromptAnalyzer;
 use anyhow::Result;
 use ratatui::text::Line;
@@ -362,6 +362,11 @@ pub struct ImageAttachment {
 }
 
 /// Image file extensions for auto-detection
+/// Hint text shown while an unpasted screenshot sits in the clipboard (#1816).
+pub(crate) const CLIPBOARD_HINT_TEXT: &str = "📋 Image in clipboard - Ctrl+V to paste";
+/// Minimum spacing between clipboard probes on the tick loop (#1816).
+pub(crate) const CLIPBOARD_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
 pub(crate) const IMAGE_EXTENSIONS: &[&str] = &[
     ".png", ".jpg", ".jpeg", ".jfif", ".gif", ".webp", ".bmp", ".svg", ".heic", ".heif", ".avif",
     ".ico", ".tiff", ".tif",
@@ -634,6 +639,19 @@ pub struct App {
     /// Transient notification (non-error, e.g. "Copied to clipboard")
     pub notification: Option<String>,
     pub notification_shown_at: Option<std::time::Instant>,
+    /// Image-in-clipboard hint shown inline in the input area like the other notices (#1816)
+    pub clipboard_hint: Option<String>,
+    /// When clipboard_hint was set, for TTL expiry on the tick
+    pub clipboard_hint_shown_at: Option<std::time::Instant>,
+    /// Fingerprint of the clipboard content the probe last saw, so a fresh
+    /// screenshot re-arms the hint while the same image stays quiet
+    pub clipboard_hint_fp: Option<u64>,
+    /// Set by an image paste: this clipboard content stops hinting until it changes
+    pub clipboard_hint_suppressed: bool,
+    /// Last clipboard probe instant, gates the probe cooldown
+    pub clipboard_probe_at: Option<std::time::Instant>,
+    /// Terminal focus from FocusGained/FocusLost; probes run only when focused
+    pub window_focused: bool,
     /// Currently selected message index (left-click to select, right-click to copy)
     pub selected_message_idx: Option<usize>,
     /// Set to true when IntermediateText arrives during the current response cycle.
@@ -1048,6 +1066,12 @@ impl App {
             error_message_shown_at: None,
             notification: None,
             notification_shown_at: None,
+            clipboard_hint: None,
+            clipboard_hint_shown_at: None,
+            clipboard_hint_fp: None,
+            clipboard_hint_suppressed: false,
+            clipboard_probe_at: None,
+            window_focused: true,
             selected_message_idx: None,
             intermediate_text_received: false,
             build_lines: Vec::new(),
@@ -2330,6 +2354,14 @@ impl App {
                     self.notification = None;
                     self.notification_shown_at = None;
                 }
+                if notice_expired(self.clipboard_hint_shown_at, now, CLIPBOARD_HINT_TTL) {
+                    self.clipboard_hint = None;
+                    self.clipboard_hint_shown_at = None;
+                }
+
+                // A screenshot may have landed since the last probe; its hint
+                // shares the notice slot inline in the input area (#1816).
+                self.refresh_clipboard_hint(false);
             }
             TuiEvent::ToolApprovalRequested(request) => {
                 self.handle_approval_requested(request);
@@ -3347,8 +3379,14 @@ impl App {
                 self.update_available_version = Some(version);
                 self.switch_mode(AppMode::UpdatePrompt).await?;
             }
-            TuiEvent::FocusGained | TuiEvent::FocusLost => {
-                // Handled by the event loop for tick coalescing
+            TuiEvent::FocusGained => {
+                self.window_focused = true;
+                // Immediate probe, bypassing the cooldown: alt-tabbing back is
+                // the moment a screenshot taken elsewhere becomes visible (#1816).
+                self.refresh_clipboard_hint(true);
+            }
+            TuiEvent::FocusLost => {
+                self.window_focused = false;
             }
             TuiEvent::Resize(w, h) => {
                 // Invalidate render cache on terminal resize (content width changes)
@@ -3981,6 +4019,42 @@ impl App {
         self.error_message_shown_at = Some(std::time::Instant::now());
         // Auto-scroll to show the error
         self.scroll_offset = 0;
+    }
+
+    /// Probe the macOS clipboard and raise the image-in-clipboard hint (#1816).
+    ///
+    /// Runs on the tick behind a cooldown and immediately on FocusGained:
+    /// screenshot hotkeys do not steal focus, so the poll is what covers
+    /// staying inside the TUI, while the focus event covers alt-tabbing back.
+    fn refresh_clipboard_hint(&mut self, force: bool) {
+        if self.mode != AppMode::Chat || !self.window_focused {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if !force
+            && self
+                .clipboard_probe_at
+                .is_some_and(|t| now.saturating_duration_since(t) < CLIPBOARD_PROBE_INTERVAL)
+        {
+            return;
+        }
+        self.clipboard_probe_at = Some(now);
+        let Some(info) = super::clipboard_route::read_clipboard_info() else {
+            return;
+        };
+        let fp = super::clipboard_route::clipboard_info_fingerprint(&info);
+        if self.clipboard_hint_fp != Some(fp) {
+            // The clipboard content changed: a fresh screenshot hints again.
+            self.clipboard_hint_fp = Some(fp);
+            self.clipboard_hint_suppressed = false;
+        }
+        if self.clipboard_hint_suppressed
+            || !super::clipboard_route::clipboard_info_is_image_only(&info)
+        {
+            return;
+        }
+        self.clipboard_hint = Some(CLIPBOARD_HINT_TEXT.to_string());
+        self.clipboard_hint_shown_at = Some(now);
     }
 
     /// Switch to a different mode

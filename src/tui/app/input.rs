@@ -1006,6 +1006,11 @@ impl App {
         self.attachments.push(att);
         self.notification = Some(format!("📎 Attached {what}: {label}"));
         self.notification_shown_at = Some(std::time::Instant::now());
+        // The paste resolves the hint for this clipboard content; the probe
+        // re-arms it only when the content changes (#1816).
+        self.clipboard_hint = None;
+        self.clipboard_hint_shown_at = None;
+        self.clipboard_hint_suppressed = true;
         true
     }
 

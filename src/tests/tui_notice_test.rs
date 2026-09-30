@@ -9,7 +9,8 @@
 use std::time::{Duration, Instant};
 
 use crate::tui::render::notice::{
-    ERROR_TTL, NOTIFICATION_TTL, NoticeKind, notice_expired, notice_label, pick_notice,
+    CLIPBOARD_HINT_TTL, ERROR_TTL, NOTIFICATION_TTL, NoticeKind, notice_expired, notice_label,
+    pick_notice,
 };
 
 const TTL: Duration = Duration::from_secs(2);
@@ -54,13 +55,15 @@ fn error_ttl_is_longer_than_notification_ttl() {
     // The 2.5s error toast and the 2s info toast kept their pre-#1369 timings.
     assert_eq!(NOTIFICATION_TTL, Duration::from_secs(2));
     assert_eq!(ERROR_TTL, Duration::from_millis(2500));
+    assert_eq!(CLIPBOARD_HINT_TTL, Duration::from_secs(6));
     assert!(ERROR_TTL > NOTIFICATION_TTL);
+    assert!(CLIPBOARD_HINT_TTL > ERROR_TTL);
 }
 
 #[test]
 fn error_outranks_info_in_the_single_slot() {
     assert_eq!(
-        pick_notice(Some("boom"), Some("Copied to clipboard")),
+        pick_notice(Some("boom"), Some("Copied to clipboard"), None),
         Some((NoticeKind::Error, "boom"))
     );
 }
@@ -68,14 +71,26 @@ fn error_outranks_info_in_the_single_slot() {
 #[test]
 fn info_alone_is_shown_as_info() {
     assert_eq!(
-        pick_notice(None, Some("Copied to clipboard")),
+        pick_notice(None, Some("Copied to clipboard"), None),
         Some((NoticeKind::Info, "Copied to clipboard"))
     );
 }
 
 #[test]
-fn no_notice_means_no_title() {
-    assert_eq!(pick_notice(None, None), None);
+fn the_clipboard_hint_is_the_lowest_priority_candidate() {
+    assert_eq!(
+        pick_notice(Some("boom"), Some("Copied to clipboard"), Some("hint")),
+        Some((NoticeKind::Error, "boom"))
+    );
+    assert_eq!(
+        pick_notice(None, Some("Copied to clipboard"), Some("hint")),
+        Some((NoticeKind::Info, "Copied to clipboard"))
+    );
+    assert_eq!(
+        pick_notice(None, None, Some("hint")),
+        Some((NoticeKind::Info, "hint"))
+    );
+    assert_eq!(pick_notice(None, None, None), None);
 }
 
 #[test]
