@@ -311,8 +311,8 @@ path = "src/main.rs"
 
 # FORK-ONLY: Windows stdio bridge shim for MonoCode/Zed ACP over SSH.
 [[bin]]
-name = "hermes"
-path = "src/bin/hermes_shim.rs"
+name = "opencrabs-bridge"
+path = "src/bin/opencrabs_bridge.rs"
 
 # Benchmarks
 [[bench]]

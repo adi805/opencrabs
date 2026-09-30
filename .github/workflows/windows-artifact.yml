@@ -58,15 +58,15 @@ jobs:
           echo "exit=$status version=$ver"
           [ "$status" -eq 0 ] || exit 1
           echo "$ver" | grep -qi opencrabs
-          # hermes.exe shim (FORK-ONLY): --version answers locally before any
+          # opencrabs-bridge.exe shim (FORK-ONLY): --version answers locally before any
           # ssh is attempted, so this is safe on a runner with no joyboy alias.
           set +e
-          hver=$(./target/x86_64-pc-windows-msvc/ci/hermes.exe --version 2>&1)
-          hstatus=$?
+          bridgever=$(./target/x86_64-pc-windows-msvc/ci/opencrabs-bridge.exe --version 2>&1)
+          bstatus=$?
           set -e
-          echo "exit=$hstatus version=$hver"
-          [ "$hstatus" -eq 0 ] || exit 1
-          echo "$hver" | grep -qi "^hermes [0-9]"
+          echo "exit=$bstatus version=$bridgever"
+          [ "$bstatus" -eq 0 ] || exit 1
+          echo "$bridgever" | grep -qi "^opencrabs-acp-bridge [0-9]"
 
       - name: Upload the exe
         uses: actions/upload-artifact@v4
@@ -74,7 +74,7 @@ jobs:
           name: opencrabs-windows-x64
           path: |
             target/x86_64-pc-windows-msvc/ci/opencrabs.exe
-            target/x86_64-pc-windows-msvc/ci/hermes.exe
+            target/x86_64-pc-windows-msvc/ci/opencrabs-bridge.exe
           if-no-files-found: error
           retention-days: 30
 
