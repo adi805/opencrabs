@@ -8,8 +8,11 @@
 
 use crate::config::profile::with_home_override_async;
 use crate::db::Database;
+use crate::db::database::MIGRATION_SQL;
+use crate::db::migration_heal::{heals_would_write, thread_id_migration_index};
 use crate::db::migration_snapshot::{
-    LATEST, PREFIX, RETENTION, rotate, snapshot_before_migrations,
+    LATEST, PREFIX, RETENTION, RETENTION_BYTES, collect_dated, prune_dated, rotate,
+    snapshot_before_migrations,
 };
 use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
@@ -106,7 +109,40 @@ async fn non_empty_db_is_snapshotted_before_migrations_run() {
     assert_eq!(
         std::fs::read(&latest).unwrap().len(),
         std::fs::read(&snaps[0]).unwrap().len(),
-        "-latest must be a copy of the newest snapshot"
+        "-latest must name the same bytes as the newest snapshot"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let alias = std::fs::metadata(&latest).unwrap();
+        let dated_meta = std::fs::metadata(&snaps[0]).unwrap();
+        assert_eq!(
+            (alias.dev(), alias.ino()),
+            (dated_meta.dev(), dated_meta.ino()),
+            "-latest must be a hard link to the dated snapshot, not a second copy"
+        );
+    }
+}
+
+#[tokio::test]
+async fn second_startup_does_not_write_another_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join(".opencrabs");
+    std::fs::create_dir_all(&home).unwrap();
+    let db_path = seeded_db(&home);
+
+    with_home_override_async(home.clone(), async {
+        let db = Database::connect(&db_path).await.unwrap();
+        db.run_migrations().await.unwrap();
+        db.run_migrations().await.unwrap();
+    })
+    .await;
+
+    let snaps = dated_snapshots(&home.join("backups"));
+    assert_eq!(
+        snaps.len(),
+        1,
+        "a database already at the latest migration must not VACUUM INTO again: {snaps:?}"
     );
 }
 
@@ -402,4 +438,106 @@ fn integrity_checks_straddle_the_migration_write() {
         "the post-migration check must still run AFTER migrations, found the \
          flag at {flag} and the write at {write}"
     );
+}
+
+#[test]
+fn latest_alias_is_not_a_dated_name() {
+    assert!(LATEST.starts_with(PREFIX));
+    assert!(
+        LATEST
+            .trim_start_matches(PREFIX)
+            .chars()
+            .all(|c| !c.is_ascii_digit()),
+        "alias must carry no digits so it is distinguishable from dated copies"
+    );
+}
+
+#[test]
+fn retention_is_the_directed_window() {
+    assert_eq!(RETENTION, 7, "owner directive 2026-09-28: rolling 7 days");
+}
+
+#[test]
+fn retention_bytes_admit_one_large_image_and_not_two() {
+    let ops_image = 2_440_159_232u64;
+    assert!(
+        RETENTION_BYTES >= ops_image,
+        "one known-good copy of a multi-gigabyte image must fit"
+    );
+    assert!(
+        RETENTION_BYTES < ops_image * 2,
+        "a second full copy must exceed the budget"
+    );
+}
+
+#[test]
+fn byte_budget_keeps_the_newest_by_time_not_by_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    for name in [
+        format!("{PREFIX}55-20260930-010101"),
+        format!("{PREFIX}60-20260930-020202"),
+        format!("{PREFIX}59-20260930-030303"),
+    ] {
+        let file = std::fs::File::create(tmp.path().join(&name)).unwrap();
+        file.set_len(100).unwrap();
+    }
+    std::fs::write(tmp.path().join(LATEST), b"alias").unwrap();
+
+    let dated = collect_dated(tmp.path());
+    assert!(
+        dated
+            .last()
+            .unwrap()
+            .ends_with("opencrabs.db.pre-migration-59-20260930-030303"),
+        "03:03 is newer than the version-60 file from 02:02: {dated:?}"
+    );
+
+    // 100+100 = 200 > 150, so the two older files go. The count window is 7
+    // and would have kept all three.
+    let removed = prune_dated(dated, RETENTION, 150);
+    assert_eq!(removed, 2);
+    let left = collect_dated(tmp.path());
+    assert_eq!(left.len(), 1);
+    assert!(left[0].ends_with("opencrabs.db.pre-migration-59-20260930-030303"));
+    assert!(tmp.path().join(LATEST).exists(), "alias is not a dated copy");
+}
+
+#[test]
+fn thread_id_index_follows_the_migration_list() {
+    let marker = "ALTER TABLE pending_requests ADD COLUMN channel_thread_id TEXT;";
+    let pos = MIGRATION_SQL
+        .iter()
+        .position(|sql| sql.contains(marker))
+        .expect("thread-id migration missing");
+    assert_eq!(thread_id_migration_index(), pos as i64 + 1);
+}
+
+#[test]
+fn satisfied_heals_do_not_ask_for_a_snapshot() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE pending_requests (origin TEXT);
+         CREATE TABLE notify_queue (id INTEGER);",
+    )
+    .unwrap();
+    assert!(!heals_would_write(&conn, 50).unwrap());
+}
+
+#[test]
+fn missing_notify_queue_would_write() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE pending_requests (origin TEXT);")
+        .unwrap();
+    assert!(heals_would_write(&conn, 50).unwrap());
+}
+
+#[test]
+fn missing_origin_column_would_write() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE pending_requests (id INTEGER);
+         CREATE TABLE notify_queue (id INTEGER);",
+    )
+    .unwrap();
+    assert!(heals_would_write(&conn, 50).unwrap());
 }
