@@ -309,6 +309,11 @@ codegen-units = 16
 name = "opencrabs"
 path = "src/main.rs"
 
+# FORK-ONLY: Windows stdio bridge shim for MonoCode/Zed ACP over SSH.
+[[bin]]
+name = "hermes"
+path = "src/bin/hermes_shim.rs"
+
 # Benchmarks
 [[bench]]
 name = "database"
