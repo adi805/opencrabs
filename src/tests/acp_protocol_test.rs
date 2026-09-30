@@ -206,3 +206,12 @@ fn replay_updates_maps_reasoning_blocked_and_text_segments() {
     assert!(texts[1].contains("phantom narration"));
     assert_eq!(texts[2], "the visible answer");
 }
+
+#[test]
+fn initialize_advertises_auth_methods() {
+    let v = initialize_result();
+    assert!(
+        v.get("authMethods").and_then(|a| a.as_array()).is_some(),
+        "authMethods is optional per the ACP v1 schema (required is only protocolVersion); we emit it explicitly so clients and registry validators that expect the field present do not depend on the schema default"
+    );
+}
