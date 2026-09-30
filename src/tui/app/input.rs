@@ -984,6 +984,31 @@ impl App {
         })
     }
 
+    /// Attach the clipboard's raw image bytes, if any, and track the file in
+    /// the session. Shared by the empty bracketed paste and Ctrl+V so both
+    /// routes attach, track and announce identically. `what` names the source
+    /// in the notification. Returns whether an image was attached.
+    pub(crate) fn attach_image_from_clipboard(&mut self, what: &str) -> bool {
+        let Some(att) = Self::attach_clipboard_image() else {
+            return false;
+        };
+        let label = att.name.clone();
+        if let Some(session) = &self.current_session {
+            let file_svc = self.file_service.clone();
+            let sid = session.id;
+            let path = std::path::PathBuf::from(&att.path);
+            tokio::spawn(async move {
+                if let Err(e) = file_svc.get_or_create_file(sid, path, None).await {
+                    tracing::warn!("Failed to track pasted image: {e}");
+                }
+            });
+        }
+        self.attachments.push(att);
+        self.notification = Some(format!("📎 Attached {what}: {label}"));
+        self.notification_shown_at = Some(std::time::Instant::now());
+        true
+    }
+
     /// Read TEXT from the OS clipboard (pbpaste / wl-paste / xclip). `None`
     /// when every backend fails or the clipboard holds nothing usable.
     // Each platform's `return` is the exit of its own cfg block; on the one
@@ -1037,16 +1062,21 @@ impl App {
     /// drag-drop uses, so every file type and every receipt matches. Plain
     /// text (or an unresolvable path) inserts at the cursor, keeping Ctrl+V a
     /// working paste key on terminals that never bracket-paste.
+    ///
+    /// No usable text (a screenshot copied to the clipboard carries image
+    /// classes only, #1811) falls back to the clipboard's raw image bytes.
     pub(crate) fn attach_from_clipboard(&mut self) {
-        let Some(text) = Self::read_clipboard_text() else {
-            tracing::debug!("Ctrl+V: clipboard text unreadable");
-            return;
+        let clip = Self::read_clipboard_text();
+        let text = match super::clipboard_route::route_for_clipboard_text(clip.as_deref()) {
+            super::clipboard_route::ClipboardRoute::Text(t) => t.to_string(),
+            super::clipboard_route::ClipboardRoute::Image => {
+                if !self.attach_image_from_clipboard("clipboard image") {
+                    tracing::debug!("Ctrl+V: clipboard holds neither text nor an image");
+                }
+                return;
+            }
         };
         let trimmed = text.trim().to_string();
-        if trimmed.is_empty() {
-            tracing::debug!("Ctrl+V: clipboard text empty after trim");
-            return;
-        }
 
         if Self::resolve_dropped_path(&trimmed).is_some() {
             // File-shaped: ride the full pipeline so classification,

@@ -2043,25 +2043,7 @@ impl App {
                         // image bytes (copied from a browser, WhatsApp, a
                         // screenshot) that bracketed paste can't carry as text.
                         // Read them straight from the OS clipboard and attach.
-                        if let Some(att) = Self::attach_clipboard_image() {
-                            let label = att.name.clone();
-                            // Track pasted image in file service
-                            if let Some(session) = &self.current_session {
-                                let file_svc = self.file_service.clone();
-                                let sid = session.id;
-                                let path = std::path::PathBuf::from(&att.path);
-                                tokio::spawn(async move {
-                                    if let Err(e) =
-                                        file_svc.get_or_create_file(sid, path, None).await
-                                    {
-                                        tracing::warn!("Failed to track pasted image: {e}");
-                                    }
-                                });
-                            }
-                            self.attachments.push(att);
-                            self.notification = Some(format!("📎 Attached pasted image: {label}"));
-                            self.notification_shown_at = Some(std::time::Instant::now());
-                        } else {
+                        if !self.attach_image_from_clipboard("pasted image") {
                             tracing::debug!(
                                 "Paste event contained only escape sequences ({} bytes) — dropped",
                                 text.len()
