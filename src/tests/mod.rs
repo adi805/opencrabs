@@ -701,6 +701,7 @@ pub mod tui_attachment_router_test;
 pub mod tui_cancel_indicator_test;
 pub mod tui_cd_arg_test;
 pub mod tui_clickable_test;
+pub mod tui_clipboard_paste_keys_test;
 pub mod tui_clipboard_route_test;
 pub mod tui_components_logo_test;
 // Unix-only alongside the editor module it exercises (#1755).

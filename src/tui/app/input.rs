@@ -2044,11 +2044,12 @@ impl App {
             // and its reasoning details. Scoped to that turn so a long
             // transcript does not reflow out from under the user.
             self.toggle_newest_turn(true);
-        } else if event.code == KeyCode::Char('v') && event.modifiers == KeyModifiers::CONTROL {
-            // Ctrl+V (#1740): paste/attach from the OS clipboard. File-shaped
-            // clipboard text attaches through the same pipeline as a drop
-            // (any file type); plain text inserts at the cursor, so terminals
-            // that never bracket-paste still get a working paste key.
+        } else if keys::is_clipboard_paste(&event) {
+            // Ctrl+V (#1740), or Cmd+V passed through as SUPER (#1812): paste
+            // or attach from the OS clipboard. File-shaped clipboard text
+            // attaches through the same pipeline as a drop (any file type);
+            // plain text inserts at the cursor, so terminals that never
+            // bracket-paste still get a working paste key.
             self.attach_from_clipboard();
         } else if keys::is_page_up(&event) {
             let before = self.scroll_offset;
@@ -2260,10 +2261,7 @@ impl App {
                 KeyCode::Char('@') => {
                     self.open_file_picker().await?;
                 }
-                KeyCode::Char(c)
-                    if !event.modifiers.contains(KeyModifiers::CONTROL)
-                        || event.modifiers.contains(KeyModifiers::ALT) =>
-                {
+                KeyCode::Char(c) if keys::types_character(event.modifiers) => {
                     // Reject chars that are fragments of mouse tracking CSI
                     // sequences leaked through tmux pane switches.  Pattern:
                     // ESC [ < Ps ; Ps ; Ps M  — the ESC is eaten by crossterm
