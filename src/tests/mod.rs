@@ -919,6 +919,7 @@ pub mod whatsapp_suggestion_poll_test;
 pub mod brain_tools_whatsapp_send_test;
 pub mod channel_capabilities_preamble_test;
 pub mod channel_commands_test;
+pub mod discord_activity_text_test;
 pub mod discord_flow_ticker_test;
 pub mod discord_footer_placement_test;
 pub mod discord_handler_test;

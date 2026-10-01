@@ -112,26 +112,84 @@ fn clock(elapsed: Duration) -> String {
     }
 }
 
+/// Longest activity segment in the live flow line (#1844). Display-only
+/// cap: the line stays a glance, not a transcript.
+const ACTIVITY_MAX_CHARS: usize = 100;
+
+fn activity_segment(group: &GroupState) -> Option<String> {
+    let text = latest_activity(group)?;
+    let clipped: String = text.chars().take(ACTIVITY_MAX_CHARS).collect();
+    let out = if text.chars().count() > ACTIVITY_MAX_CHARS {
+        format!("{clipped}…")
+    } else {
+        clipped
+    };
+    (!out.is_empty()).then_some(out)
+}
+
+/// Live activity preview for the flow line (#1844): what the agent is doing
+/// right now, the Discord twin of Slack's `latest_activity` (#1809) and
+/// Telegram's `latest_activity_preview` (telegram/flow.rs). Same
+/// priorities: latest human-readable narration note, then line-start `#`
+/// comments from the latest bash command, then the latest tool label +
+/// context. Discord keeps notes in their own `Vec` (`GroupState.notes`),
+/// not as entries.
+fn latest_activity(group: &GroupState) -> Option<String> {
+    if let Some(text) = group
+        .notes
+        .iter()
+        .rev()
+        .find_map(|n| crate::channels::telegram::flow::human_readable_preview(n))
+    {
+        return Some(text);
+    }
+    if let Some(comments) = group.entries.iter().rev().find_map(|e| {
+        if e.name == "bash" {
+            crate::channels::telegram::flow::extract_status_from_text(&e.context)
+        } else {
+            None
+        }
+    }) {
+        return Some(comments);
+    }
+    group
+        .entries
+        .iter()
+        .rev()
+        .map(|e| {
+            let ctx = e.context.trim_start();
+            if ctx.is_empty() {
+                e.name.clone()
+            } else {
+                // Contexts are stored with a leading space (` (arg0)`): trim,
+                // then join with one canonical space (the #1809 double-space fix).
+                format!("{} {ctx}", e.name)
+            }
+        })
+        .next()
+}
+
 fn summary_line(group: &GroupState) -> String {
     let n = group.entries.len();
-    let running = group.entries.iter().filter(|e| e.status.is_none()).count();
     let failed = group
         .entries
         .iter()
         .filter(|e| e.status == Some(false))
         .count();
-    let (icon, tail) = if running > 0 {
-        ("⚙️", format!(" · {running} running"))
-    } else if failed > 0 {
-        ("❌", format!(" · {failed} failed"))
-    } else {
-        ("✅", String::new())
-    };
     let counts = format!("**{n} tool call{}**", if n == 1 { "" } else { "s" });
     match &group.settled {
         Some(s) => {
             // Settled chrome (#1841): frozen clock, ctx budget as the last
             // word before it, mirroring the Telegram settled header order.
+            // A settled turn has no running tools: the icon reads final
+            // states only, ❌ when something failed, ✅ otherwise, never
+            // the live "N running" tail (an entry left statusless at
+            // settle is done, not running).
+            let (icon, tail) = if failed > 0 {
+                ("❌", format!(" · {failed} failed"))
+            } else {
+                ("✅", String::new())
+            };
             let mut line = format!("{icon} {counts}{tail}");
             if let Some(ctx) = &s.ctx {
                 line.push_str(&format!(" · {ctx}"));
@@ -139,10 +197,25 @@ fn summary_line(group: &GroupState) -> String {
             line.push_str(&format!(" · ⏱️ {}", clock(s.elapsed)));
             line
         }
-        None => format!(
-            "{icon} {counts}{tail} · 🕒 {}",
-            clock(group.started_at.elapsed())
-        ),
+        None => {
+            // Live line (#1844): activity text leads when there is any
+            // (latest note > bash # comments > tool label), bare counts
+            // shape otherwise (zero-entry turn-start shell). Settled arm
+            // above stays clean.
+            let running = group.entries.iter().filter(|e| e.status.is_none()).count();
+            let (icon, tail) = if running > 0 {
+                ("⚙️", format!(" · {running} running"))
+            } else if failed > 0 {
+                ("❌", format!(" · {failed} failed"))
+            } else {
+                ("✅", String::new())
+            };
+            let clock = format!("🕒 {}", clock(group.started_at.elapsed()));
+            match activity_segment(group) {
+                Some(activity) => format!("{icon} {activity} · {counts}{tail} · {clock}"),
+                None => format!("{icon} {counts}{tail} · {clock}"),
+            }
+        }
     }
 }
 
