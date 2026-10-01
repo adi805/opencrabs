@@ -62,6 +62,23 @@ fn main() {
     std::process::exit(code);
 }
 
+fn ssh_target() -> String {
+    match std::env::var("OPENCRABS_SSH_TARGET") {
+        Ok(t) if !t.trim().is_empty() => t,
+        _ => {
+            eprintln!("opencrabs-bridge: OPENCRABS_SSH_TARGET is not set. One-time setup: setx OPENCRABS_SSH_TARGET <your-ssh-alias>  (optionally also setx OPENCRABS_REMOTE_BIN <path-to-opencrabs-on-server>)");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn remote_bin() -> String {
+    std::env::var("OPENCRABS_REMOTE_BIN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "opencrabs".to_string())
+}
+
 fn ssh_cmd(args: &[String]) -> std::process::Command {
     // Absolute ssh path first: GUI-spawned processes may get a sanitized PATH.
     let ssh = if std::path::Path::new("C:\\Windows\\System32\\OpenSSH\\ssh.exe").exists() {
@@ -74,8 +91,8 @@ fn ssh_cmd(args: &[String]) -> std::process::Command {
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=10",
         "-o", "ServerAliveInterval=15",
-        "joyboy",
-        "/home/agentadmin/.opencrabs/opencrabs",
+        &ssh_target(),
+        &remote_bin(),
     ]);
     cmd.args(args);
     cmd.stdin(std::process::Stdio::piped())
@@ -126,7 +143,7 @@ fn selftest() {
     use std::io::Read;
     blog("SELFTEST start");
     let mut cmd = std::process::Command::new(ssh_path());
-    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "joyboy", "printf", "bridge-selftest-ok"])
+    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", &ssh_target(), "printf", "bridge-selftest-ok"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
