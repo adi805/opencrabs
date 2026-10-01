@@ -22,10 +22,11 @@ use crate::db::Database;
 use serde_json::json;
 use std::sync::Arc;
 
-async fn build_registry(headless: bool) -> (Arc<ToolRegistry>, ()) {
+async fn build_registry(headless: bool, notify_enabled: bool) -> (Arc<ToolRegistry>, ()) {
     let db = Database::connect_in_memory().await.expect("in-memory db");
     db.run_migrations().await.expect("migrations");
-    let config = Config::default();
+    let mut config = Config::default();
+    config.agent.session_notify_enabled = notify_enabled;
     let registry = Arc::new(ToolRegistry::new());
     let _m = register_core_agent_tools(&registry, &db, &config, headless);
     (registry, ())
@@ -34,7 +35,7 @@ async fn build_registry(headless: bool) -> (Arc<ToolRegistry>, ()) {
 /// (a) Headless registry: both interactive-only tools absent.
 #[tokio::test]
 async fn headless_registry_lacks_session_notify_and_suggest_options() {
-    let (registry, _) = build_registry(true).await;
+    let (registry, _) = build_registry(true, true).await;
     assert!(
         !registry.has_tool("session_notify"),
         "session_notify must NOT be registered headless (#129): a one-shot \
@@ -52,17 +53,41 @@ async fn headless_registry_lacks_session_notify_and_suggest_options() {
     );
 }
 
-/// (b) Interactive registry: both tools present.
+/// (b) Interactive registry: both tools present, but only with the kill
+/// switch opted in (#1840).
 #[tokio::test]
 async fn interactive_registry_keeps_session_notify_and_suggest_options() {
-    let (registry, _) = build_registry(false).await;
+    let (registry, _) = build_registry(false, true).await;
     assert!(
         registry.has_tool("session_notify"),
-        "interactive registry must keep session_notify"
+        "interactive registry must keep session_notify when the flag is opted in"
     );
     assert!(
         registry.has_tool("suggest_options"),
         "interactive registry must keep suggest_options"
+    );
+}
+
+/// (b2) #1840: interactive registry with the kill switch unset (default off):
+/// `session_notify` must not exist in the surface at all. The agent never
+/// sees the schema, never calls it, never gets confused by a refusal.
+/// `suggest_options` is unaffected by the kill switch.
+#[tokio::test]
+async fn interactive_registry_hides_session_notify_when_kill_switch_is_off() {
+    let (registry, _) = build_registry(false, false).await;
+    assert!(
+        !registry.has_tool("session_notify"),
+        "session_notify must NOT be registered when [agent] session_notify_enabled \
+         is unset/false (#1840): a disabled tool must not exist in the surface"
+    );
+    assert!(
+        registry.has_tool("suggest_options"),
+        "suggest_options is not governed by the kill switch and must stay"
+    );
+    // Sanity: the core set is intact with the flag off.
+    assert!(
+        registry.has_tool("bash") && registry.has_tool("read_file"),
+        "core tools must remain registered with the kill switch off"
     );
 }
 

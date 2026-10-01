@@ -514,7 +514,8 @@ async fn cmd_chat_inner(
     // RSI) live in one place so the headless cron daemon shares the exact same
     // set. Browser/channel-send/media/rebuild/evolve are added below.
     // `false` = interactive (#129): TUI + channel users see mid-task output,
-    // so session_notify/suggest_options stay registered.
+    // so session_notify stays registered only when [agent]
+    // session_notify_enabled is on (#1840); suggest_options always stays.
     let subagent_manager =
         crate::cli::tool_setup::register_core_agent_tools(&tool_registry, &db, config, false);
 

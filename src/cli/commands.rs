@@ -1156,7 +1156,8 @@ pub(crate) async fn cmd_agent_interactive(
 
     // Core tools come from the shared tool_setup helper so this REPL path never
     // drifts from the TUI/daemon tool set. `false` = interactive (#129): the
-    // REPL user sees mid-task output, so session_notify/suggest_options stay.
+    // REPL user sees mid-task output, so session_notify stays when [agent]
+    // session_notify_enabled is on (#1840); suggest_options always stays.
     // Runtime tools (dynamic/browser) are added after the system brain is
     // built, below.
     let tool_registry = Arc::new(ToolRegistry::new());
