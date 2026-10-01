@@ -197,6 +197,54 @@ pub(crate) fn handshake_timeout_for(cli_handles_tools: bool, base_url: Option<&s
     }
 }
 
+/// The connect budget for **one HTTP send** — connect + TLS + response headers.
+///
+/// Each HTTP provider applies this at its own `.send()` call
+/// (`custom_openai_compatible.rs`, `anthropic.rs`, `gemini.rs`). It must NOT be
+/// applied by the caller: `stream_complete` wraps `provider.stream(request)`,
+/// the whole subtree, so a wall there is shared by the provider-internal
+/// rate-limit wait, the in-place retry backoff and the fallback chain walk
+/// (#680/#682). A timeout raised by this function means one send failed — the
+/// interval it was sized for — so a log line stops reporting our own backoff as
+/// a connect failure.
+///
+/// `cli_handles_tools` providers spawn a subprocess instead of sending HTTP, so
+/// there is no send to bound: `None`, and such a provider bounds its own
+/// subprocess instead.
+pub(crate) fn send_handshake_timeout_for(
+    cli_handles_tools: bool,
+    base_url: Option<&str>,
+) -> Option<Duration> {
+    if cli_handles_tools {
+        None
+    } else {
+        Some(handshake_timeout_for(cli_handles_tools, base_url))
+    }
+}
+
+/// The **caller-level** handshake wall, for subprocess providers only.
+///
+/// `stream_complete` applies this around `provider.stream(request)`. That
+/// subtree is the wrong place for an HTTP budget (#680/#682): it also holds the
+/// provider-internal rate-limit wait, the retry backoff and the fallback chain
+/// walk, all of which stretch on a loaded host, so the wall fired while no
+/// single hop had failed. An HTTP provider now applies its own budget at each
+/// `.send()` instead, and returns `None` here.
+///
+/// A CLI provider spawns a subprocess, so its budget is a **process-startup**
+/// one and this level is the only one that can carry it — nothing inside those
+/// providers bounds startup on its own.
+pub(crate) fn cli_startup_timeout_for(
+    cli_handles_tools: bool,
+    base_url: Option<&str>,
+) -> Option<Duration> {
+    if cli_handles_tools {
+        Some(handshake_timeout_for(cli_handles_tools, base_url))
+    } else {
+        None
+    }
+}
+
 /// Sleep for `dur`, aborting early when the cancel token fires (#1148).
 ///
 /// Returns `false` only when cancellation won — the caller should stop
@@ -317,17 +365,27 @@ impl AgentService {
         }
         let request_model = request.model.clone();
 
-        // Bound the initial stream handshake (HTTP POST + response headers)
-        // so a wedged server — accepts TCP but never replies — can't eat
-        // the full 300s reqwest timeout before the retry chain fires.
+        // Bound the stream handshake. For HTTP providers the budget is applied
+        // INSIDE each provider at its own `.send()` (#680/#682): wrapping
+        // `provider.stream(request)` here would charge our own rate-limit wait,
+        // retry backoff and fallback walk to a clock sized for connect + TLS +
+        // response headers — the wall then fired while no single hop had failed,
+        // and the failure was reported as a handshake timeout. Only a CLI
+        // provider — a subprocess, not an HTTP send — keeps a wall at this
+        // level, bounding process startup + auth refresh.
         let handshake_timeout =
-            handshake_timeout_for(provider.cli_handles_tools(), provider.base_url());
+            cli_startup_timeout_for(provider.cli_handles_tools(), provider.base_url());
         // /stop must win over the pre-first-token window too (#1148): the
         // call below contains the provider-internal rate-limit retries and
         // the fallback chain walk, none of which observe the token. Racing
         // the whole subtree drops all of it instantly on cancel instead of
         // riding out minutes of backoff.
-        let handshake = tokio::time::timeout(handshake_timeout, provider.stream(request));
+        let handshake = async {
+            match handshake_timeout {
+                Some(wall) => tokio::time::timeout(wall, provider.stream(request)).await,
+                None => Ok(provider.stream(request).await),
+            }
+        };
         let handshake_result = if let Some(token) = cancel_token {
             tokio::select! {
                 res = handshake => res,
@@ -365,7 +423,10 @@ impl AgentService {
                 return Err(e);
             }
             Err(_elapsed) => {
-                let secs = handshake_timeout.as_secs();
+                // Reachable only when a wall exists at this level — the CLI
+                // class. An HTTP provider's send budget is enforced inside the
+                // provider, where the error is already a `Timeout`/`HttpError`.
+                let secs = handshake_timeout.map_or(0, |wall| wall.as_secs());
                 tracing::warn!(
                     "⏱️ stream handshake timeout after {}s ({}); retry chain will fire",
                     secs,
