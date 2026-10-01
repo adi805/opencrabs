@@ -229,6 +229,7 @@ pub fn replay_usage(messages: &[crate::db::models::Message]) -> Option<i64> {
 pub fn initialize_result() -> Value {
     json!({
         "protocolVersion": 1,
+        "authMethods": [],
         "agentCapabilities": {
             // Honest capability: session/load binds an existing session AND
             // replays the stored transcript as session/update notifications
