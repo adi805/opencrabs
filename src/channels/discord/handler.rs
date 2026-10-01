@@ -14,6 +14,7 @@ use crate::utils::sanitize::redact_secrets;
 use crate::utils::truncate_str;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -985,6 +986,8 @@ pub(crate) async fn handle_message(
                                             entries,
                                             notes: Vec::new(),
                                             expanded: false,
+                                            started_at: Instant::now(),
+                                            settled: None,
                                         },
                                     )
                                     .await;
@@ -1003,6 +1006,8 @@ pub(crate) async fn handle_message(
                                     entries,
                                     notes: Vec::new(),
                                     expanded: false,
+                                    started_at: Instant::now(),
+                                    settled: None,
                                 };
                                 let content = super::tool_group::render_content(&group);
                                 match channel.say(&http, &content).await {
@@ -1060,6 +1065,8 @@ pub(crate) async fn handle_message(
                                         entries,
                                         notes: Vec::new(),
                                         expanded: false,
+                                        started_at: Instant::now(),
+                                        settled: None,
                                     },
                                 )
                                 .await;
@@ -1077,10 +1084,8 @@ pub(crate) async fn handle_message(
                 }
                 ProgressEvent::SelfHealingAlert { message } => {
                     tokio::spawn(async move {
-                        let text = format!(
-                            "🔧 {}",
-                            crate::utils::sanitize::normalize_dashes(&message)
-                        );
+                        let text =
+                            format!("🔧 {}", crate::utils::sanitize::normalize_dashes(&message));
                         if let Err(e) = channel.say(&http, &text).await {
                             tracing::warn!(error = %e, "failed to send Discord message");
                         }
@@ -1339,6 +1344,30 @@ pub(crate) async fn handle_message(
                     .components(super::tool_group::render_components(&group, mid.get()));
                 if let Err(e) = target.edit_message(&ctx.http, mid, edit).await {
                     tracing::debug!("Discord: trace mirror-note drop failed: {e}");
+                }
+            }
+
+            // Settled status chrome (#1841): freeze the clock and stamp the
+            // ctx budget into the flow group, the Discord twin of Telegram's
+            // settled flow header. Runs on every delivery outcome so the
+            // chrome ends as the last word regardless of the answer path.
+            if let Some(mid) = *turn_group_mid.lock().await
+                && let Some(group) = discord_state
+                    .settle_tool_group(
+                        mid.get(),
+                        if footer.is_empty() {
+                            None
+                        } else {
+                            Some(footer.clone())
+                        },
+                    )
+                    .await
+            {
+                let edit = serenity::builder::EditMessage::new()
+                    .content(super::tool_group::render_content(&group))
+                    .components(super::tool_group::render_components(&group, mid.get()));
+                if let Err(e) = target.edit_message(&ctx.http, mid, edit).await {
+                    tracing::debug!("Discord: settled status stamp failed: {e}");
                 }
             }
 

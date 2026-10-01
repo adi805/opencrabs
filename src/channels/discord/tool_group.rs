@@ -12,6 +12,7 @@
 
 use serenity::builder::{CreateActionRow, CreateButton};
 use serenity::model::application::ButtonStyle;
+use std::time::{Duration, Instant};
 
 use super::DiscordState;
 
@@ -35,6 +36,25 @@ pub(crate) struct GroupState {
     /// way it preserves `expanded`.
     pub notes: Vec<String>,
     pub expanded: bool,
+    /// Turn-start anchor for the live `🕒` segment and the settled `⏱` one
+    /// (#1841). Stamped at first insert and preserved across updates so the
+    /// clock never restarts mid-turn.
+    pub started_at: Instant,
+    /// Post-delivery status (#1841). `None` while the turn is live; stamped
+    /// once by [`DiscordState::settle_tool_group`] and preserved by every
+    /// later upsert. `elapsed` freezes at settle so toggling Expand later
+    /// never grows the clock.
+    pub settled: Option<SettledStatus>,
+}
+
+/// Frozen post-delivery chrome (#1841): the Discord twin of Slack's
+/// `SettledStatus`. The clock stops at settle and the ctx budget line moves
+/// into the flow group, so the chrome owns it (the answer-message footer
+/// goes away in #1842, leaving the settled line as the single home).
+#[derive(Debug, Clone)]
+pub(crate) struct SettledStatus {
+    pub elapsed: Duration,
+    pub ctx: Option<String>,
 }
 
 /// Keep at most this many narration lines in the bubble (newest win).
@@ -76,10 +96,30 @@ fn entry_icon(status: Option<bool>) -> &'static str {
     }
 }
 
-fn summary_line(entries: &[GroupEntry]) -> String {
-    let n = entries.len();
-    let running = entries.iter().filter(|e| e.status.is_none()).count();
-    let failed = entries.iter().filter(|e| e.status == Some(false)).count();
+/// `M:SS` elapsed clock (`H:MM:SS` past an hour), the Discord twin of
+/// Telegram's flow clock. The glyph lives with the caller so the live and
+/// settled segments can differ (`🕒` rolls, `⏱️` freezes at settle).
+fn clock(elapsed: Duration) -> String {
+    let (h, m, s) = (
+        elapsed.as_secs() / 3600,
+        (elapsed.as_secs() % 3600) / 60,
+        elapsed.as_secs() % 60,
+    );
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+fn summary_line(group: &GroupState) -> String {
+    let n = group.entries.len();
+    let running = group.entries.iter().filter(|e| e.status.is_none()).count();
+    let failed = group
+        .entries
+        .iter()
+        .filter(|e| e.status == Some(false))
+        .count();
     let (icon, tail) = if running > 0 {
         ("⚙️", format!(" · {running} running"))
     } else if failed > 0 {
@@ -87,10 +127,23 @@ fn summary_line(entries: &[GroupEntry]) -> String {
     } else {
         ("✅", String::new())
     };
-    format!(
-        "{icon} **{n} tool call{}**{tail}",
-        if n == 1 { "" } else { "s" }
-    )
+    let counts = format!("**{n} tool call{}**", if n == 1 { "" } else { "s" });
+    match &group.settled {
+        Some(s) => {
+            // Settled chrome (#1841): frozen clock, ctx budget as the last
+            // word before it, mirroring the Telegram settled header order.
+            let mut line = format!("{icon} {counts}{tail}");
+            if let Some(ctx) = &s.ctx {
+                line.push_str(&format!(" · {ctx}"));
+            }
+            line.push_str(&format!(" · ⏱️ {}", clock(s.elapsed)));
+            line
+        }
+        None => format!(
+            "{icon} {counts}{tail} · 🕒 {}",
+            clock(group.started_at.elapsed())
+        ),
+    }
 }
 
 /// Message body for the group in its current display state.
@@ -104,9 +157,9 @@ pub(crate) fn render_content(group: &GroupState) -> String {
             .iter()
             .map(|e| format!("{} **{}**{}", entry_icon(e.status), e.name, e.context))
             .collect();
-        format!("{}\n{}", summary_line(&group.entries), lines.join("\n"))
+        format!("{}\n{}", summary_line(group), lines.join("\n"))
     } else {
-        summary_line(&group.entries)
+        summary_line(group)
     };
     if group.notes.is_empty() {
         tools_part
@@ -153,6 +206,8 @@ impl DiscordState {
             Some(existing) => {
                 group.expanded = existing.expanded;
                 group.notes = existing.notes.clone();
+                group.started_at = existing.started_at;
+                group.settled = existing.settled.clone();
             }
             None => {
                 order.push(message_id);
@@ -186,6 +241,27 @@ impl DiscordState {
         if group.notes.len() > NOTE_CAP {
             group.notes.remove(0);
         }
+        Some(group.clone())
+    }
+
+    /// Stamp the post-delivery status (#1841): freeze the clock at now and
+    /// record the ctx budget line for the settled chrome. A `None` ctx keeps
+    /// whatever a previous settle stamped, so a re-settle never clears the
+    /// budget. Returns the updated state, or None when the message has no
+    /// stored group (aged out of retention).
+    pub(crate) async fn settle_tool_group(
+        &self,
+        message_id: u64,
+        ctx: Option<String>,
+    ) -> Option<GroupState> {
+        let mut guard = self.tool_groups.lock().await;
+        let (_, map) = &mut *guard;
+        let group = map.get_mut(&message_id)?;
+        let prev_ctx = group.settled.as_ref().and_then(|s| s.ctx.clone());
+        group.settled = Some(SettledStatus {
+            elapsed: group.started_at.elapsed(),
+            ctx: ctx.or(prev_ctx),
+        });
         Some(group.clone())
     }
 

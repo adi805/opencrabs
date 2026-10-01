@@ -4,8 +4,9 @@
 
 use crate::channels::discord::DiscordState;
 use crate::channels::discord::tool_group::{
-    GroupEntry, GroupState, render_components, render_content,
+    GroupEntry, GroupState, SettledStatus, render_components, render_content,
 };
+use std::time::{Duration, Instant};
 
 fn entries(n: usize, done: bool) -> Vec<GroupEntry> {
     (0..n)
@@ -22,6 +23,8 @@ fn group(n: usize, done: bool, expanded: bool) -> GroupState {
         entries: entries(n, done),
         expanded,
         notes: Vec::new(),
+        started_at: Instant::now(),
+        settled: None,
     }
 }
 
@@ -66,4 +69,70 @@ async fn retention_prunes_oldest_groups() {
     }
     assert!(state.toggle_tool_group(0).await.is_none());
     assert!(state.toggle_tool_group(24).await.is_some());
+}
+
+#[test]
+fn live_summary_carries_the_rolling_clock_settled_freezes_it() {
+    let live = render_content(&group(3, false, false));
+    assert!(live.contains("🕒"));
+
+    let mut done_group = group(2, true, false);
+    done_group.settled = Some(SettledStatus {
+        elapsed: Duration::from_secs(90),
+        ctx: Some("ctx: 84K/200K 42%".into()),
+    });
+    let settled = render_content(&done_group);
+    assert!(settled.contains("⏱️ 1:30"));
+    assert!(settled.contains("ctx: 84K/200K 42%"));
+    assert!(!settled.contains("🕒"));
+}
+
+#[tokio::test]
+async fn settle_freezes_elapsed_and_stamps_ctx() {
+    let state = DiscordState::new();
+    let mut g = group(2, true, false);
+    g.started_at = Instant::now() - Duration::from_secs(90);
+    state.upsert_tool_group(77, g).await;
+    let stamped = state
+        .settle_tool_group(77, Some("ctx: 1K/2K 50%".into()))
+        .await
+        .expect("group exists");
+    let s = stamped.settled.as_ref().expect("stamped at settle");
+    assert_eq!(s.elapsed.as_secs(), 90);
+    let done = render_content(&stamped);
+    assert!(done.contains("ctx: 1K/2K 50%"));
+    assert!(done.contains("⏱️ 1:30"));
+}
+
+#[tokio::test]
+async fn upsert_preserves_started_at_and_settled() {
+    let state = DiscordState::new();
+    let mut g = group(1, false, false);
+    g.started_at = Instant::now() - Duration::from_secs(30);
+    state.upsert_tool_group(88, g).await;
+    state.settle_tool_group(88, Some("ctx: A".into())).await;
+    // A late progress update must not restart the clock or clear the stamp.
+    let stored = state.upsert_tool_group(88, group(1, true, false)).await;
+    assert!(stored.started_at.elapsed().as_secs() >= 29);
+    assert!(stored.settled.is_some());
+}
+
+#[tokio::test]
+async fn resettle_with_no_ctx_keeps_the_stamped_budget() {
+    let state = DiscordState::new();
+    state.upsert_tool_group(99, group(1, true, false)).await;
+    state.settle_tool_group(99, Some("ctx: B".into())).await;
+    let again = state
+        .settle_tool_group(99, None)
+        .await
+        .expect("group exists");
+    assert_eq!(
+        again
+            .settled
+            .as_ref()
+            .expect("still stamped")
+            .ctx
+            .as_deref(),
+        Some("ctx: B")
+    );
 }
