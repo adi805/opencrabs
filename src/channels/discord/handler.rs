@@ -885,19 +885,15 @@ pub(crate) async fn handle_message(
     );
     let _typing_guard = super::typing::TypingGuard(typing_cancel);
 
-    // Per-turn record of intermediate posts: (clean body, Option<(MessageId,
-    // last-chunk text)>). The body feeds the final-response dedup: tool_loop
-    // emits the last iteration's text BOTH as IntermediateText (so the TUI
-    // persists it) AND as response.content, so without coordination every tool
-    // turn that ends in text was posted twice — once without the ctx footer
-    // (intermediate) and once with it (final). The MessageId + last-chunk text
-    // let the final path append the ctx footer to the kept intermediate via
-    // edit_message, mirroring Slack's chat.update (#459). Per-TURN scope:
-    // a cross-turn window suppressed legitimate repeated answers on Slack.
-    use serenity::model::id::MessageId;
-    /// One intermediate already posted: (normalized body key, handle of the
-    /// last Discord chunk when the text was split).
-    type SentIntermediate = (String, Option<(MessageId, String)>);
+    // Per-turn record of intermediate post bodies. The body feeds the
+    // final-response dedup: tool_loop emits the last iteration's text BOTH
+    // as IntermediateText (so the TUI persists it) AND as response.content,
+    // so without coordination every tool turn that ends in text was posted
+    // twice. Per-TURN scope: a cross-turn window suppressed legitimate
+    // repeated answers on Slack. (#1842: no message ids or chunk text are
+    // recorded anymore — the ctx footer never rides on any message.)
+    /// One intermediate already posted: its post-sanitized body.
+    type SentIntermediate = String;
     let sent_intermediates: Arc<Mutex<Vec<SentIntermediate>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Track every IntermediateText spawn handle so the final-response path can
@@ -912,6 +908,8 @@ pub(crate) async fn handle_message(
     let intermediate_handles_final = intermediate_handles.clone();
     let sent_intermediates_final = sent_intermediates.clone();
 
+    use serenity::model::id::MessageId;
+
     // Turn bubble id, hoisted OUT of the progress-callback block so the
     // final-response path can find the bubble: trace mode drops the trailing
     // narration note that mirrors the answer, and auto-thread anchors the
@@ -922,7 +920,6 @@ pub(crate) async fn handle_message(
     let progress_cb: crate::brain::agent::ProgressCallback = {
         use crate::brain::agent::ProgressEvent;
         use serenity::builder::EditMessage;
-        use serenity::model::id::MessageId;
 
         use super::tool_group::{GroupEntry, GroupState};
 
@@ -1150,28 +1147,14 @@ pub(crate) async fn handle_message(
                         // already posted this turn.
                         {
                             let mut prev = sent.lock().await;
-                            if prev.iter().any(|(b, _)| b == &clean) {
+                            if prev.iter().any(|b| b == &clean) {
                                 return;
                             }
-                            prev.push((clean.clone(), None));
+                            prev.push(clean.clone());
                         }
-                        // Remember the last chunk's message id so the
-                        // final-response path can append the ctx footer to
-                        // the kept intermediate when it matches (Slack's
-                        // keep-intermediate path, #459).
-                        let mut last: Option<(MessageId, String)> = None;
                         for chunk in split_message(&clean, 2000) {
-                            match channel.say(&http, &chunk).await {
-                                Ok(m) => last = Some((m.id, chunk.to_string())),
-                                Err(e) => {
-                                    tracing::debug!("Discord: intermediate text send failed: {}", e)
-                                }
-                            }
-                        }
-                        if let Some(entry) = last {
-                            let mut prev = sent.lock().await;
-                            if let Some(slot) = prev.iter_mut().find(|(b, _)| b == &clean) {
-                                slot.1 = Some(entry);
+                            if let Err(e) = channel.say(&http, &chunk).await {
+                                tracing::debug!("Discord: intermediate text send failed: {}", e)
                             }
                         }
                     });
@@ -1270,9 +1253,11 @@ pub(crate) async fn handle_message(
             // copies of a text (intermediate + final) normalize identically.
             let text_only = super::table_convert::tables_to_discord(&text_only);
 
-            // Context budget footer appended to last display chunk, never stored in DB
+            // Settled-line ctx source (#1842): the context budget lives ONLY
+            // on the flow group's settled chrome, never appended to an
+            // answer message. Built here, consumed by settle_tool_group.
             let ctx_max = agent.context_limit_for_session(session_id);
-            let footer = crate::utils::format_ctx_footer(
+            let ctx_line = crate::utils::format_ctx_footer(
                 response.context_tokens,
                 ctx_max,
                 response.tokens_per_second,
@@ -1297,28 +1282,17 @@ pub(crate) async fn handle_message(
                     tracing::warn!("Discord: intermediate post task panicked: {e}");
                 }
             }
-            let (skip_final_post, footer_edit_target) = {
+            let skip_final_post = {
                 let posted = sent_intermediates_final.lock().await;
                 if text_only.trim().is_empty() {
                     // Empty-final guard (#943/#951 class): the model's real
                     // answer already went out as intermediates and the final
                     // content is just a wrap-up. Keep them, never post a bare
-                    // footer on its own.
-                    (true, posted.last().and_then(|e| e.1.clone()))
+                    // shell.
+                    true
                 } else {
                     let final_key = norm_key(&text_only);
-                    match posted.iter().rev().find(|(b, _)| norm_key(b) == final_key) {
-                        // The intermediate IS the answer: keep it, append the
-                        // footer to its last chunk via edit, skip the final
-                        // post (Slack's keep-intermediate outcome, #459).
-                        Some((_, Some((id, last_chunk)))) => {
-                            (true, Some((*id, last_chunk.clone())))
-                        }
-                        // Matched but the send failed so no id was recorded:
-                        // still skip the duplicate post, nothing to edit.
-                        Some((_, None)) => (true, None),
-                        None => (false, None),
-                    }
+                    posted.iter().any(|b| norm_key(b) == final_key)
                 }
             };
 
@@ -1355,10 +1329,10 @@ pub(crate) async fn handle_message(
                 && let Some(group) = discord_state
                     .settle_tool_group(
                         mid.get(),
-                        if footer.is_empty() {
+                        if ctx_line.is_empty() {
                             None
                         } else {
-                            Some(footer.clone())
+                            Some(ctx_line.clone())
                         },
                     )
                     .await
@@ -1402,29 +1376,11 @@ pub(crate) async fn handle_message(
             }
 
             if skip_final_post {
-                // Answer already visible via the kept intermediate: append the
-                // ctx footer to its last chunk (edit, not a new message) so the
-                // completion marker still shows exactly once.
-                if let Some((id, last_chunk)) = footer_edit_target {
-                    let content = if footer.is_empty() {
-                        last_chunk
-                    } else {
-                        format!("{last_chunk}\n\n{footer}")
-                    };
-                    let edit = serenity::builder::EditMessage::new().content(content);
-                    if let Err(e) = target.edit_message(&ctx.http, id, edit).await {
-                        tracing::warn!("Discord: footer edit on kept intermediate failed: {e}");
-                    }
-                }
+                // Answer already visible via the kept intermediate (#459's
+                // keep-intermediate outcome): skip the duplicate post. The
+                // settled flow group above carries the completion chrome.
             } else {
-                let mut chunks: Vec<String> = split_message(&text_only, 2000);
-                // Append footer to last display chunk so it's inline, not a separate message
-                if let Some(last) = chunks.last_mut() {
-                    last.push_str("\n\n");
-                    last.push_str(&footer);
-                } else if !footer.is_empty() {
-                    chunks.push(footer);
-                }
+                let chunks: Vec<String> = split_message(&text_only, 2000);
                 // Auto-thread (opt-in): long answers post a short teaser in
                 // the channel and the full body in a thread anchored to the
                 // turn's bubble (or the user's message). The channel stays
