@@ -1766,7 +1766,11 @@ fn has_sql_source(args: &[&str], short: &str, long: &str) -> bool {
 fn redis_cli_flag_takes_value(tok: &str) -> bool {
     matches!(
         tok,
-        "-h" | "-p" | "-a" | "-u" | "-s" | "-n"
+        "-h" | "-p"
+            | "-a"
+            | "-u"
+            | "-s"
+            | "-n"
             | "--host"
             | "--port"
             | "--pass"

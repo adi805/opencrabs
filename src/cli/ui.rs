@@ -830,10 +830,7 @@ async fn cmd_chat_inner(
                 ProgressEvent::SelfHealingAlert { message } => {
                     progress_sender.send(TuiEvent::SystemMessage {
                         session_id,
-                        text: format!(
-                            "🔧 {}",
-                            crate::utils::sanitize::normalize_dashes(&message)
-                        ),
+                        text: format!("🔧 {}", crate::utils::sanitize::normalize_dashes(&message)),
                     })
                 }
                 ProgressEvent::StripStreamedContent { bytes, reason } => {

@@ -458,7 +458,10 @@ mod repository {
         let found = repo.find_by_id(&id).await.unwrap().unwrap();
         assert!(found.last_run_at.is_some());
         assert!(found.next_run_at.is_some());
-        assert!(found.enabled, "a non-one-shot job must stay enabled after firing");
+        assert!(
+            found.enabled,
+            "a non-one-shot job must stay enabled after firing"
+        );
     }
 
     /// #544: a one-shot job retires itself in the same statement that advances
@@ -474,7 +477,10 @@ mod repository {
 
         let before = repo.find_by_id(&id).await.unwrap().unwrap();
         assert!(before.enabled, "a freshly created one-shot starts enabled");
-        assert!(before.run_once, "run_once must survive the insert round-trip");
+        assert!(
+            before.run_once,
+            "run_once must survive the insert round-trip"
+        );
         assert!(before.last_run_at.is_none());
 
         // Firing advances the schedule AND retires the job, in one statement.

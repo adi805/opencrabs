@@ -127,8 +127,21 @@ pub(crate) fn ensure_blank_line_before_tables(text: &str) -> String {
 /// are deliberately absent: after a quote they remain inline content, and
 /// splitting them off would change rendering the message never asked for.
 const BLOCK_HTML_OPENERS: &[&str] = &[
-    "details", "summary", "table", "blockquote", "pre", "ul", "ol", "li", "h1", "h2", "h3", "h4",
-    "h5", "h6", "p",
+    "details",
+    "summary",
+    "table",
+    "blockquote",
+    "pre",
+    "ul",
+    "ol",
+    "li",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "p",
 ];
 
 /// The element name a line's leading `<…>` opener carries, or `None` when the
@@ -186,7 +199,9 @@ pub(crate) fn ensure_blank_line_before_block_html(text: &str) -> String {
         }
         if !in_fence
             && is_block_html_opener(line)
-            && out.last().is_some_and(|prev| prev.trim_start().starts_with('>'))
+            && out
+                .last()
+                .is_some_and(|prev| prev.trim_start().starts_with('>'))
         {
             out.push(String::new());
         }

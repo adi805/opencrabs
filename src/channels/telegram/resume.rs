@@ -817,11 +817,10 @@ pub(crate) async fn resume_session_inner(
             }
             ProgressEvent::SelfHealingAlert { message } => {
                 if let Ok(mut s) = st.lock() {
-                    s.display_queue
-                        .push(DisplayItem::System(format!(
-                            "🔧 {}",
-                            crate::utils::sanitize::normalize_dashes(&message)
-                        )));
+                    s.display_queue.push(DisplayItem::System(format!(
+                        "🔧 {}",
+                        crate::utils::sanitize::normalize_dashes(&message)
+                    )));
                 }
             }
             ProgressEvent::RetryAttempt {
