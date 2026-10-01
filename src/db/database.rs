@@ -389,6 +389,21 @@ impl Database {
         // default profile's home no matter which profile is starting.
         let snapshot_dir = crate::db::migration_snapshot::snapshot_dir();
 
+        // The snapshot and the preflight exist to protect a write. A database
+        // already at the latest migration, with every heal's precondition
+        // satisfied, has nothing to protect. `VACUUM INTO` of that image is
+        // what fills the disk. The probe opens the file itself: the pool's
+        // post_create hook sets WAL, a write, and on a torn image that fails
+        // before the preflight can tell the operator how to restore.
+        let migration_count = Self::MIGRATION_COUNT as i64;
+        let needs_snapshot = match self.db_path.as_deref() {
+            Some(path) => crate::db::migration_snapshot::needs_pre_migration_snapshot_at(
+                path,
+                migration_count,
+            )?,
+            None => false,
+        };
+
         // #1779 defect 2: this used to be the check *after* the migrations, so
         // on a corrupt image it never ran and the operator died on the
         // migration error with no restore path. It goes first, ahead of the
@@ -397,18 +412,22 @@ impl Database {
         // image buys nothing and only spends a write attempt.
         //
         // Skipped when there is no file to check (in-memory database), which is
-        // every test that uses `connect_in_memory`.
-        if let Some(path) = self.db_path.as_deref() {
-            crate::db::migration_snapshot::integrity_preflight(path, &snapshot_dir)?;
-        }
+        // every test that uses `connect_in_memory`. Also skipped when nothing
+        // will write: the preflight opens the file read-write and walks every
+        // page.
+        if needs_snapshot {
+            if let Some(path) = self.db_path.as_deref() {
+                crate::db::migration_snapshot::integrity_preflight(path, &snapshot_dir)?;
+            }
 
-        self.pool
-            .get()
-            .await
-            .context("Failed to get connection for pre-migration snapshot")?
-            .interact(move |conn| crate::db::migration_snapshot::guard(conn, &snapshot_dir))
-            .await
-            .map_err(interact_err)??;
+            self.pool
+                .get()
+                .await
+                .context("Failed to get connection for pre-migration snapshot")?
+                .interact(move |conn| crate::db::migration_snapshot::guard(conn, &snapshot_dir))
+                .await
+                .map_err(interact_err)??;
+        }
 
         self.pool
             .get()
