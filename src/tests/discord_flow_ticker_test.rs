@@ -90,13 +90,14 @@ fn ticker_throttle_is_rate_limit_safe() {
     );
 }
 
-/// The ticker must spawn before the turn is dispatched so it is already
-/// waiting when the group message is born at the first tool call.
+/// The ticker must spawn before the turn is dispatched. Since #1845 the
+/// group is born at turn start (before the spawn), so the ticker finds it
+/// immediately; the spawn still precedes the agent turn itself.
 #[test]
 fn ticker_spawns_before_the_turn_dispatch() {
     let handler = include_str!("../channels/discord/handler.rs");
     let spawn = handler
-        .find("already waiting when the group message is born")
+        .find("Spawns after the turn-start")
         .expect("spawn site comment present");
     let dispatch = handler
         .find("send_message_with_tools_and_display")

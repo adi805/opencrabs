@@ -1280,10 +1280,37 @@ pub(crate) async fn handle_message(
         })
     };
 
+    // Turn-start group shell (#1845, the #1808 Slack parity): the bubble
+    // posts NOW, before the turn dispatches, so the clock covers the
+    // thinking window. Starts as `✅ **0 tool calls** · 🕒 0:00` and is
+    // edited in place on the first tool event (the Some(mid) upsert path
+    // preserves this started_at); the settle stamp is the last word. On a
+    // post failure the mid stays None and creation falls back to the first
+    // tool call, the pre-#1845 behavior.
+    let turn_shell = super::tool_group::GroupState {
+        entries: Vec::new(),
+        notes: Vec::new(),
+        expanded: false,
+        started_at: Instant::now(),
+        settled: None,
+    };
+    match target
+        .say(&ctx.http, &super::tool_group::render_content(&turn_shell))
+        .await
+    {
+        Ok(sent) => {
+            discord_state
+                .upsert_tool_group(sent.id.get(), turn_shell)
+                .await;
+            *turn_group_mid.lock().await = Some(sent.id);
+        }
+        Err(e) => tracing::warn!("Discord: turn-start group shell post failed: {e}"),
+    }
+
     // Flow ticker (#1843): re-renders the bubble's clock every 4 s so the
-    // timer does not freeze between tool events. Spawns before the turn so
-    // it is already waiting when the group message is born (first tool
-    // call); stops itself on settle/prune/cap.
+    // timer does not freeze between tool events. Spawns after the turn-start
+    // shell (#1845) so the group already exists; stops itself on
+    // settle/prune/cap.
     spawn_flow_ticker(
         ctx.http.clone(),
         target,
