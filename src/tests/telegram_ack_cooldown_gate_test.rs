@@ -19,6 +19,7 @@ use crate::channels::telegram::rate_limit::{
 #[tokio::test]
 async fn ack_suppressed_while_global_cooldown_active() {
     let _guard = test_support::registry_guard().await;
+    let _cooldown = crate::tests::telegram_cooldown_lock::guard().await;
     test_support::reset(0);
     reset_global_cooldown();
 
@@ -37,6 +38,7 @@ async fn ack_suppressed_while_global_cooldown_active() {
 #[tokio::test]
 async fn ack_permitted_again_after_cooldown_expires() {
     let _guard = test_support::registry_guard().await;
+    let _cooldown = crate::tests::telegram_cooldown_lock::guard().await;
     test_support::reset(0);
     reset_global_cooldown();
 
@@ -58,6 +60,7 @@ async fn ack_permitted_again_after_cooldown_expires() {
 #[tokio::test]
 async fn ack_gate_tracks_reset() {
     let _guard = test_support::registry_guard().await;
+    let _cooldown = crate::tests::telegram_cooldown_lock::guard().await;
     test_support::reset(0);
     reset_global_cooldown();
 
