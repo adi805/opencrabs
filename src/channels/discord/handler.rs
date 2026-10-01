@@ -149,6 +149,75 @@ pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
     chunks
 }
 
+/// Flow-line re-render interval (#1843): one edit per tick, deliberately
+/// slower than Telegram's 1500 ms. Discord's current docs do not publish a
+/// fixed per-route edit budget and explicitly forbid hardcoding one
+/// ("rate limits should not be hard coded into your app... parse response
+/// headers... and respond accordingly"); serenity 0.12 ships a built-in
+/// per-bucket ratelimiter (src/http/ratelimiting.rs) that pre-emptively
+/// queues requests and honors retry_after, so safety comes from the
+/// limiter, not from a magic number. 4 s matches the Slack ticker (#1807)
+/// for cross-channel parity.
+const FLOW_TICKER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(4);
+/// Hard stop for orphaned ticks (crashed turn): no immortal tasks.
+const FLOW_TICKER_CAP: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Re-render the turn's flow group on an interval (#1843): the Discord twin
+/// of Slack's `spawn_flow_ticker` and Telegram's `spawn_edit_loop`. Without
+/// it the clock freezes between tool events. Waits for the group message to
+/// be born (first tool call), exits on settle/prune/cap, and re-snapshots
+/// after each edit so the settled line keeps the last word.
+fn spawn_flow_ticker(
+    http: Arc<serenity::http::Http>,
+    channel: serenity::model::id::ChannelId,
+    group_mid: Arc<Mutex<Option<serenity::model::id::MessageId>>>,
+    dstate: Arc<super::state::DiscordState>,
+) {
+    tokio::spawn(async move {
+        use serenity::builder::EditMessage;
+        let born = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(FLOW_TICKER_INTERVAL).await;
+            if born.elapsed() > FLOW_TICKER_CAP {
+                break;
+            }
+            let Some(mid) = *group_mid.lock().await else {
+                // Group not born yet: the turn has not reached its first
+                // tool call. Keep waiting.
+                continue;
+            };
+            let Some(group) = dstate.tool_group_snapshot(mid.get()).await else {
+                break; // pruned by retention mid-turn
+            };
+            if group.settled.is_some() {
+                break; // settle already posted the final line
+            }
+            let edit = EditMessage::new()
+                .content(super::tool_group::render_content(&group))
+                .components(super::tool_group::render_components(&group, mid.get()));
+            if let Err(e) = channel.edit_message(&http, mid, edit).await {
+                tracing::warn!("Discord: flow ticker edit failed (mid={}): {e}", mid.get());
+            }
+            // Race guard: settle may have stamped and posted while this
+            // tick's edit was in flight. The settled line must be last,
+            // so if the group settled behind us, re-render its content once.
+            match dstate.tool_group_snapshot(mid.get()).await {
+                Some(re) if re.settled.is_some() => {
+                    let edit = EditMessage::new()
+                        .content(super::tool_group::render_content(&re))
+                        .components(super::tool_group::render_components(&re, mid.get()));
+                    if let Err(e) = channel.edit_message(&http, mid, edit).await {
+                        tracing::warn!("Discord: flow ticker settle fixup failed: {e}");
+                    }
+                    break;
+                }
+                Some(_) => {}  // still live: keep ticking
+                None => break, // pruned mid-tick
+            }
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_message(
     ctx: &Context,
@@ -1210,6 +1279,17 @@ pub(crate) async fn handle_message(
             }
         })
     };
+
+    // Flow ticker (#1843): re-renders the bubble's clock every 4 s so the
+    // timer does not freeze between tool events. Spawns before the turn so
+    // it is already waiting when the group message is born (first tool
+    // call); stops itself on settle/prune/cap.
+    spawn_flow_ticker(
+        ctx.http.clone(),
+        target,
+        turn_group_mid.clone(),
+        discord_state.clone(),
+    );
 
     let discord_chat_id = msg.channel_id.get().to_string();
     let result = agent

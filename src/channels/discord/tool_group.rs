@@ -265,6 +265,15 @@ impl DiscordState {
         Some(group.clone())
     }
 
+    /// Clone the live or settled group for out-of-loop renderers (#1843):
+    /// the flow ticker snapshots under the lock, renders outside it, and
+    /// re-snapshots after its edit so the settled line keeps the last word.
+    pub(crate) async fn tool_group_snapshot(&self, message_id: u64) -> Option<GroupState> {
+        let guard = self.tool_groups.lock().await;
+        let (_, map) = &*guard;
+        map.get(&message_id).cloned()
+    }
+
     /// Remove the LAST narration line matching `pred` — the final-response
     /// dedup drops the trailing note that mirrors the answer, so the trace
     /// does not double-post it as a clip. Returns the updated state, or None
