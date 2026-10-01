@@ -89,7 +89,6 @@ fn is_empty_or_transient(conn: &Connection) -> Result<bool> {
     Ok(tables == 0)
 }
 
-
 /// `(YYYYMMDD, HHMMSS, same-second suffix)` from a dated snapshot name.
 ///
 /// The version sits in front of the stamp (`{version}-{date}-{time}`), so a

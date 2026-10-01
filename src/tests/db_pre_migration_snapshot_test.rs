@@ -499,7 +499,10 @@ fn byte_budget_keeps_the_newest_by_time_not_by_version() {
     let left = collect_dated(tmp.path());
     assert_eq!(left.len(), 1);
     assert!(left[0].ends_with("opencrabs.db.pre-migration-59-20260930-030303"));
-    assert!(tmp.path().join(LATEST).exists(), "alias is not a dated copy");
+    assert!(
+        tmp.path().join(LATEST).exists(),
+        "alias is not a dated copy"
+    );
 }
 
 #[test]
