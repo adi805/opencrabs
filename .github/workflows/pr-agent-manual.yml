@@ -1,0 +1,62 @@
+# PR-Agent in CLI mode, for PRs we do NOT own.
+#
+# The GitHub Action above only sees PRs inside this repository. Our upstream work
+# lives in someone else's repo, and the action has no workflow_dispatch handler,
+# so those reviews run the published CLI instead.
+#
+# Needs secret PR_AGENT_PAT: a personal access token with "repo" scope. The
+# built-in GITHUB_TOKEN is scoped to this repository and cannot read or comment
+# on another one.
+name: PR Agent (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_url:
+        description: "Full URL of the pull request to review"
+        required: true
+        type: string
+      command:
+        description: "PR-Agent command to run"
+        required: true
+        default: review
+        type: choice
+        options:
+          - review
+          - describe
+          - improve
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  run:
+    name: ${{ inputs.command }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require PR_AGENT_PAT
+        env:
+          PAT: ${{ secrets.PR_AGENT_PAT }}
+        run: |
+          if [ -z "$PAT" ]; then
+            echo "::error::PR_AGENT_PAT is not set. Reviewing a PR outside this repository needs a personal access token with 'repo' scope; the built-in GITHUB_TOKEN cannot see other repositories. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PR-Agent
+        run: pip install --disable-pip-version-check "pr-agent==0.47.0"
+      - name: Run PR-Agent
+        env:
+          PR_URL: ${{ inputs.pr_url }}
+          PR_CMD: ${{ inputs.command }}
+          OPENAI__KEY: ${{ secrets.PR_AGENT_KEY }}
+          OPENAI__API_BASE: "https://api.inferhub.dev/v1"
+          CONFIG__MODEL: "openai/ali/deepseek-v4.1-flash"
+          CONFIG__FALLBACK_MODELS: '["openai/ali/qwen3.8-flash"]'
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: "128000"
+          GITHUB__USER_TOKEN: ${{ secrets.PR_AGENT_PAT }}
+        run: pr-agent --pr_url "$PR_URL" "$PR_CMD"
