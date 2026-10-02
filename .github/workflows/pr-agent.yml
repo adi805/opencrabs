@@ -16,7 +16,8 @@
 #   - contents is read-only; this job only posts review comments, so it has no
 #     reason to be able to push
 #   - issue_comment is restricted to the repo owner, so a stranger cannot burn
-#     the model key by commenting on a public PR
+#     the model key by commenting on a public PR. The bot check sits inside that
+#     branch only: at job level it also blocked Dependabot/Renovate PRs
 #   - pull_request only fires for branches inside this repo; GitHub does not hand
 #     secrets to fork PRs anyway
 name: PR Agent
@@ -41,10 +42,10 @@ jobs:
   pr_agent:
     name: Review
     if: |
-      github.event.sender.type != 'Bot'
-      && (github.event_name != 'issue_comment'
-          || (github.event.issue.pull_request != null
-              && github.event.comment.user.login == 'adi805'))
+      (github.event_name != 'issue_comment'
+        || (github.event.sender.type != 'Bot'
+            && github.event.issue.pull_request != null
+            && github.event.comment.user.login == 'adi805'))
       && (github.event_name != 'pull_request'
           || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
