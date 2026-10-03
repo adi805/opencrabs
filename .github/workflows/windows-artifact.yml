@@ -153,10 +153,25 @@ jobs:
               Select-Object -First 1
           }
 
+          # SetForegroundWindow is allowed to fail and says so only through its
+          # return value, which the old code threw away with [void]. A keystroke
+          # or a whole-screen copy aimed at the wrong window still looks like
+          # success, so ask, then VERIFY the foreground handle is the target
+          # before anything is typed or shot.
+          function Focus([System.Diagnostics.Process]$t) {
+            for ($try = 1; $try -le 5; $try++) {
+              if ([U]::GetForegroundWindow() -eq $t.MainWindowHandle) { return $true }
+              [void][U]::SetForegroundWindow($t.MainWindowHandle)
+              Start-Sleep -Milliseconds 400
+            }
+            "  focus FAILED: wanted $($t.MainWindowHandle), foreground is $([U]::GetForegroundWindow())"
+            return $false
+          }
+
           function Shoot([string]$tag) {
             $t = FindTarget
             if ($null -eq $t) { "  $tag : no OCAP window found, skipped"; return }
-            [void][U]::SetForegroundWindow($t.MainWindowHandle)
+            if (-not (Focus $t)) { "  $tag : skipped, the target never held the foreground"; return }
             Start-Sleep -Milliseconds 500
             $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
             try {
@@ -173,7 +188,7 @@ jobs:
           function Send([string]$keys) {
             $t = FindTarget
             if ($null -eq $t) { "  no window, key dropped: $keys"; return }
-            [void][U]::SetForegroundWindow($t.MainWindowHandle)
+            if (-not (Focus $t)) { "  no foreground, key dropped: $keys"; return }
             Start-Sleep -Milliseconds 300
             try { [System.Windows.Forms.SendKeys]::SendWait($keys) }
             catch { "  send FAILED $($_.Exception.Message)" }
@@ -181,8 +196,17 @@ jobs:
           }
 
           # mode con sizes the buffer BEFORE the app starts, which is the one
-          # thing Wine could not do and the reason its frames were garbage.
-          $p = Start-Process cmd.exe -ArgumentList '/K', "title OCAP && mode con cols=150 lines=45 && `"$exe`"" -PassThru
+          # thing Wine could not do and the reason its frames were garbage. The
+          # buffer is measured against the screen the runner actually has: a
+          # fixed 150x45 is about 1200px wide at conhost's 8x16 raster font, so
+          # on a 1024px screen the window ran off the right edge and every
+          # whole-screen capture cropped the app. Leave a little room for the
+          # window chrome.
+          $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          $cols = [Math]::Max(80, [Math]::Min(150, [int]($vs.Width / 8) - 2))
+          $lines = [Math]::Max(25, [Math]::Min(50, [int]($vs.Height / 16) - 3))
+          "console buffer: ${cols}x${lines} on a $($vs.Width)x$($vs.Height) screen"
+          $p = Start-Process cmd.exe -ArgumentList '/K', "title OCAP && mode con cols=$cols lines=$lines && `"$exe`"" -PassThru
           Start-Sleep -Seconds 9
           "started pid=$($p.Id)"
           Shoot "00-boot"
