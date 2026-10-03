@@ -48,6 +48,7 @@ fn note_if_rate_limited(channel: ChannelId, result: &serenity::Result<Message>) 
                 retry_after_ms = retry_after.map(|d| d.as_millis() as u64),
                 cooldown_ms =
                     governor::cooldown_remaining(channel.get()).map(|d| d.as_millis() as u64),
+                count_429 = governor::snapshot(channel.get()).map(|s| s.count_429),
                 "Discord write rate limited; backing off"
             );
         }
