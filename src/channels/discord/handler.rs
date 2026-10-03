@@ -198,7 +198,7 @@ pub(super) fn spawn_flow_ticker(
             let edit = EditMessage::new()
                 .content(super::tool_group::render_content(&group))
                 .components(super::tool_group::render_components(&group, mid.get()));
-            if let Err(e) = channel.edit_message(&http, mid, edit).await {
+            if let Err(e) = writes::edit(&http, channel, mid, edit, Class::Edit).await {
                 tracing::warn!("Discord: flow ticker edit failed (mid={}): {e}", mid.get());
             }
             // Race guard: settle may have stamped and posted while this
@@ -209,7 +209,7 @@ pub(super) fn spawn_flow_ticker(
                     let edit = EditMessage::new()
                         .content(super::tool_group::render_content(&re))
                         .components(super::tool_group::render_components(&re, mid.get()));
-                    if let Err(e) = channel.edit_message(&http, mid, edit).await {
+                    if let Err(e) = writes::edit(&http, channel, mid, edit, Class::Edit).await {
                         tracing::warn!("Discord: flow ticker settle fixup failed: {e}");
                     }
                     break;
@@ -1199,7 +1199,9 @@ pub(crate) async fn handle_message(
                                         &group,
                                         mid.get(),
                                     ));
-                                if let Err(e) = channel.edit_message(&http, mid, edit).await {
+                                if let Err(e) =
+                                    writes::edit(&http, channel, mid, edit, Class::Edit).await
+                                {
                                     tracing::warn!("Discord: tool group edit failed (append): {e}");
                                 }
                             }
@@ -1212,20 +1214,21 @@ pub(crate) async fn handle_message(
                                     settled: None,
                                 };
                                 let content = super::tool_group::render_content(&group);
-                                match channel.say(&http, &content).await {
-                                    Ok(sent) => {
+                                match writes::say(&http, channel, &content, Class::Create).await {
+                                    Ok(Some(sent)) => {
                                         let comps = super::tool_group::render_components(
                                             &group,
                                             sent.id.get(),
                                         );
                                         if !comps.is_empty()
-                                            && let Err(e) = channel
-                                                .edit_message(
-                                                    &http,
-                                                    sent.id,
-                                                    EditMessage::new().components(comps),
-                                                )
-                                                .await
+                                            && let Err(e) = writes::edit(
+                                                &http,
+                                                channel,
+                                                sent.id,
+                                                EditMessage::new().components(comps),
+                                                Class::Edit,
+                                            )
+                                            .await
                                         {
                                             tracing::warn!(
                                                 "Discord: tool group component fixup failed: {e}"
@@ -1234,6 +1237,7 @@ pub(crate) async fn handle_message(
                                         dstate.upsert_tool_group(sent.id.get(), group).await;
                                         *mid_guard = Some(sent.id);
                                     }
+                                    Ok(None) => {}
                                     Err(e) => tracing::warn!(
                                         "Discord: failed to post tool group message: {e}"
                                     ),
@@ -1278,7 +1282,9 @@ pub(crate) async fn handle_message(
                                     &group,
                                     mid.get(),
                                 ));
-                            if let Err(e) = channel.edit_message(&http, mid, edit).await {
+                            if let Err(e) =
+                                writes::edit(&http, channel, mid, edit, Class::Edit).await
+                            {
                                 tracing::warn!("Discord: tool group edit failed (status): {e}");
                             }
                         }
@@ -1288,7 +1294,7 @@ pub(crate) async fn handle_message(
                     tokio::spawn(async move {
                         let text =
                             format!("🔧 {}", crate::utils::sanitize::normalize_dashes(&message));
-                        if let Err(e) = channel.say(&http, &text).await {
+                        if let Err(e) = writes::say(&http, channel, &text, Class::Create).await {
                             tracing::warn!(error = %e, "failed to send Discord message");
                         }
                     });
@@ -1334,7 +1340,9 @@ pub(crate) async fn handle_message(
                                     &group,
                                     mid.get(),
                                 ));
-                            if let Err(e) = channel.edit_message(&http, mid, edit).await {
+                            if let Err(e) =
+                                writes::edit(&http, channel, mid, edit, Class::Edit).await
+                            {
                                 tracing::debug!("Discord: trace note edit failed: {e}");
                             }
                         });
@@ -1358,7 +1366,8 @@ pub(crate) async fn handle_message(
                             prev.push(clean.clone());
                         }
                         for chunk in split_message(&clean, 2000) {
-                            if let Err(e) = channel.say(&http, &chunk).await {
+                            if let Err(e) = writes::say(&http, channel, &chunk, Class::Create).await
+                            {
                                 tracing::debug!("Discord: intermediate text send failed: {}", e)
                             }
                         }
@@ -1376,7 +1385,7 @@ pub(crate) async fn handle_message(
                     let channel = channel;
                     tokio::spawn(async move {
                         let text = format!("⏳ Retry {}/{} — {}", attempt, max, reason);
-                        if let Err(e) = channel.say(&http, &text).await {
+                        if let Err(e) = writes::say(&http, channel, &text, Class::Create).await {
                             tracing::warn!(error = %e, "failed to send Discord message");
                         }
                     });
@@ -1388,7 +1397,7 @@ pub(crate) async fn handle_message(
                     let channel = channel;
                     tokio::spawn(async move {
                         let text = format!("🔄 Now using {}/{}", to_name, to_model);
-                        if let Err(e) = channel.say(&http, &text).await {
+                        if let Err(e) = writes::say(&http, channel, &text, Class::Create).await {
                             tracing::warn!(error = %e, "failed to send Discord message");
                         }
                     });
@@ -1430,16 +1439,21 @@ pub(crate) async fn handle_message(
         started_at: Instant::now(),
         settled: None,
     };
-    match target
-        .say(&ctx.http, &super::tool_group::render_content(&turn_shell))
-        .await
+    match writes::say(
+        &ctx.http,
+        target,
+        &super::tool_group::render_content(&turn_shell),
+        Class::Create,
+    )
+    .await
     {
-        Ok(sent) => {
+        Ok(Some(sent)) => {
             discord_state
                 .upsert_tool_group(sent.id.get(), turn_shell)
                 .await;
             *turn_group_mid.lock().await = Some(sent.id);
         }
+        Ok(None) => {}
         Err(e) => tracing::warn!("Discord: turn-start group shell post failed: {e}"),
     }
 
@@ -1784,13 +1798,12 @@ pub(crate) fn plain_attachment_builder(audio: &[u8]) -> CreateMessage {
 /// uploader-supplied waveform is unverified against a live bot, and a TTS reply
 /// that silently vanishes is worse than one that renders as a file.
 pub(crate) async fn send_tts_voice(http: &Http, channel: ChannelId, audio: &[u8]) {
-    if let Err(e) = channel.send_message(http, voice_reply_builder(audio)).await {
+    if let Err(e) = writes::send(http, channel, voice_reply_builder(audio), Class::Final).await {
         tracing::warn!(
             "Discord: voice-flagged TTS send rejected ({e}); retrying as a plain attachment (#1849)"
         );
-        if let Err(e2) = channel
-            .send_message(http, plain_attachment_builder(audio))
-            .await
+        if let Err(e2) =
+            writes::send(http, channel, plain_attachment_builder(audio), Class::Final).await
         {
             tracing::error!("Discord: failed to send TTS voice: {e2}");
         }
@@ -1874,14 +1887,19 @@ pub(crate) fn make_approval_callback(
                 channel_id
             );
 
-            let mut sent_msg = match ChannelId::new(channel_id)
-                .send_message(
-                    &http,
-                    CreateMessage::new().content(&text).components(vec![row]),
-                )
-                .await
+            let mut sent_msg = match writes::send(
+                &http,
+                ChannelId::new(channel_id),
+                CreateMessage::new().content(&text).components(vec![row]),
+                Class::Final,
+            )
+            .await
             {
-                Ok(m) => m,
+                Ok(Some(m)) => m,
+                Ok(None) => {
+                    tracing::error!("Discord approval: governor refused the prompt send");
+                    return Ok((false, false));
+                }
                 Err(e) => {
                     tracing::error!("Discord approval: failed to send message: {}", e);
                     return Ok((false, false));
