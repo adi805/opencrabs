@@ -74,14 +74,14 @@ fn note_drop(channel: ChannelId, class: WriteClass) {
 pub(crate) async fn say(
     http: &Http,
     channel: ChannelId,
-    content: &str,
+    content: impl AsRef<str>,
     class: WriteClass,
 ) -> serenity::Result<Option<Message>> {
     if governor::admit(channel.get(), class).await == Admission::Drop {
         note_drop(channel, class);
         return Ok(None);
     }
-    let res = channel.say(http, content).await;
+    let res = channel.say(http, content.as_ref()).await;
     note_if_rate_limited(channel, &res);
     res.map(Some)
 }
