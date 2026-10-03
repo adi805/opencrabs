@@ -242,7 +242,7 @@ mod tests {
         let batch = vec![
             FileSize::new("a.bin", 20 * MIB),
             FileSize::new("b.bin", 4 * MIB),
-            FileSize::new("c.bin", 1 * MIB + 1),
+            FileSize::new("c.bin", MIB + 1),
         ];
         assert!(batch.iter().all(|f| f.bytes <= ATTACHMENT_MAX_BYTES));
         match check_batch(&batch) {
@@ -288,7 +288,7 @@ mod tests {
         assert_eq!(plan.batches[0], vec![0, 1]);
         assert_eq!(plan.batches[1], vec![2]);
         for batch in &plan.batches {
-            let bytes: u64 = batch.iter().map(|i| 10 * MIB).sum();
+            let bytes: u64 = batch.iter().map(|_| 10 * MIB).sum();
             assert!(
                 bytes <= REQUEST_MAX_BYTES,
                 "batch {batch:?} = {bytes} bytes"

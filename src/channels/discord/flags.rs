@@ -91,7 +91,7 @@ mod tests {
         // here instead of silently shipping a wrong bit on every scheduled post.
         assert_eq!(
             SUPPRESS_NOTIFICATIONS_BITS,
-            u64::from(MessageFlags::SUPPRESS_NOTIFICATIONS.bits())
+            MessageFlags::SUPPRESS_NOTIFICATIONS.bits()
         );
     }
 

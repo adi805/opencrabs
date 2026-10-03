@@ -162,7 +162,6 @@ pub fn build_spec(input: &[EmbedInput]) -> Result<EmbedSpec, EmbedError> {
         if remaining > title_len {
             let mut clipped = entry;
             clipped.description = truncate_chars(&clipped.description, remaining - title_len);
-            used += clipped.budget_chars();
             embeds.push(clipped);
         } else {
             dropped_embeds += 1;
@@ -373,7 +372,7 @@ mod tests {
     #[test]
     fn empty_field_is_omitted_from_the_wire_payload() {
         let spec = build_spec(&one("Only a title", "")).unwrap();
-        let json = serde_json::to_value(&embed_builders(&spec)).unwrap();
+        let json = serde_json::to_value(embed_builders(&spec)).unwrap();
         assert_eq!(json[0]["title"], serde_json::json!("Only a title"));
         assert_eq!(json[0]["color"], serde_json::json!(BLURPLE));
         assert!(
