@@ -73,6 +73,13 @@ jobs:
             sha="${{ github.event.pull_request.base.sha }}"
           elif [ "${{ github.event_name }}" = "push" ] && [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "$zero" ]; then
             sha="${{ github.event.before }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # a manual run carries no event baseline, and a no-baseline scan
+            # reports upstream's entire backlog: it would be red on every
+            # dispatch, which is the "red forever" case this file exists to
+            # avoid. Diff against main instead; if that ref is missing the
+            # guard below falls back to a full tree scan.
+            sha="origin/main"
           fi
           # a sha we cannot resolve would make semgrep fail the scan outright
           if [ -n "$sha" ] && git cat-file -e "${sha}^{commit}" 2>/dev/null; then
