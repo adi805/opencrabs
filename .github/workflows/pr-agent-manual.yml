@@ -4,9 +4,15 @@
 # lives in someone else's repo, and the action has no workflow_dispatch handler,
 # so those reviews run the published CLI instead.
 #
-# Needs secret PR_AGENT_PAT: a personal access token with "repo" scope. The
-# built-in GITHUB_TOKEN is scoped to this repository and cannot read or comment
-# on another one.
+# Needs secret PR_AGENT_PAT: a FINE-GRAINED personal access token, scoped to the
+# single repository under review, with Metadata: read (GitHub requires it on every
+# fine-grained token), Contents: read, Pull requests: write and Issues: write.
+# A classic token with the "repo" scope is refused on purpose: that scope reaches
+# every repository its owner can see, so a compromised package, action, or
+# transitive dependency inside the CLI could rewrite all of them, not just the
+# repo the PR lives in. Fine-grained tokens cap the blast radius at one repo.
+# The check below fails the run unless the token is fine-grained, or the
+# dispatcher explicitly accepts the wider blast radius with allow_broad_pat.
 name: PR Agent (manual)
 
 on:
@@ -25,6 +31,11 @@ on:
           - review
           - describe
           - improve
+      allow_broad_pat:
+        description: "Proceed even if PR_AGENT_PAT is a classic (broad) token"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -35,14 +46,48 @@ jobs:
   run:
     name: ${{ inputs.command }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - name: Require PR_AGENT_PAT
+      - name: Check PR_AGENT_PAT scope
         env:
           PAT: ${{ secrets.PR_AGENT_PAT }}
+          PR_URL: ${{ inputs.pr_url }}
+          ALLOW_BROAD: ${{ inputs.allow_broad_pat }}
         run: |
           if [ -z "$PAT" ]; then
-            echo "::error::PR_AGENT_PAT is not set. Reviewing a PR outside this repository needs a personal access token with 'repo' scope; the built-in GITHUB_TOKEN cannot see other repositories. Add it under Settings > Secrets and variables > Actions."
+            echo "::error::PR_AGENT_PAT is not set. Reviewing a PR outside this repository needs a fine-grained personal access token scoped to the repo under review (Contents: read, Pull requests: write, Issues: write); the built-in GITHUB_TOKEN cannot see other repositories. Add it under Settings > Secrets and variables > Actions."
             exit 1
+          fi
+
+          REPO=$(printf '%s' "$PR_URL" | sed -n 's#^https://github.com/\([^/]*/[^/]*\)/pull/[0-9][0-9]*.*#\1#p')
+          if [ -z "$REPO" ]; then
+            echo "::error::pr_url must look like https://github.com/<owner>/<repo>/pull/<number>, got: $PR_URL"
+            exit 1
+          fi
+
+          HDRS=$(mktemp)
+          CODE=$(curl -sS -o /dev/null -D "$HDRS" -w '%{http_code}' \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO" || true)
+          if [ "$CODE" != "200" ]; then
+            echo "::error::PR_AGENT_PAT cannot read $REPO (HTTP $CODE). A fine-grained token has to name that repository in its scope, with Contents: read."
+            exit 1
+          fi
+
+          # Classic tokens and OAuth apps return X-OAuth-Scopes; fine-grained
+          # tokens and GitHub App tokens do not. A non-empty header therefore
+          # means this token reaches more repos than the one being reviewed.
+          SCOPES=$(tr -d '\r' < "$HDRS" | awk 'tolower($1) == "x-oauth-scopes:" { sub(/^[^:]*:[ ]*/, ""); print }')
+          if [ -n "$SCOPES" ]; then
+            if [ "$ALLOW_BROAD" = "true" ]; then
+              echo "::warning::PR_AGENT_PAT is a classic token (X-OAuth-Scopes: $SCOPES), so it can write to every repository its owner can reach, not just $REPO. Proceeding because allow_broad_pat=true."
+            else
+              echo "::error::PR_AGENT_PAT is a classic token (X-OAuth-Scopes: $SCOPES), which grants read/write to every repository its owner can reach. Replace it with a fine-grained token scoped to $REPO only (Contents: read, Pull requests: write, Issues: write), or re-dispatch with allow_broad_pat=true if you accept the wider blast radius."
+              exit 1
+            fi
+          else
+            echo "PR_AGENT_PAT is a fine-grained token that can read $REPO."
           fi
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
