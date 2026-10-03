@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use serenity::builder::{CreateAttachment, CreateMessage};
 use serenity::http::Http;
-use serenity::model::channel::{Message, MessageFlags};
+use serenity::model::channel::{Message, MessageFlags, MessageSnapshot};
 use serenity::model::id::ChannelId;
 use serenity::prelude::*;
 
@@ -220,6 +220,101 @@ pub(super) fn spawn_flow_ticker(
     });
 }
 
+/// Fold forwarded payloads into display text (#1891).
+///
+/// Discord message forwards never touch `Message::content` or the top-level
+/// attachments; the payload lives in `message_snapshots`, which this handler
+/// used to ignore entirely, so a pure forward was invisible both to the agent
+/// turn and to the channel history. Images keep the vision-first
+/// `<<IMG:url>>` marker format used for regular attachments; other files carry
+/// their name and CDN URL so the agent can fetch them on demand.
+pub(crate) fn forwarded_snapshot_text(snapshots: &[MessageSnapshot]) -> String {
+    let mut out = String::new();
+    for snap in snapshots {
+        let text = snap.content.trim();
+        if !text.is_empty() {
+            out.push_str(&format!("\n\n[forwarded message]: {text}"));
+        }
+        for att in &snap.attachments {
+            let mime = att.content_type.as_deref().unwrap_or("");
+            if mime.starts_with("image/") {
+                out.push_str(&format!(" <<IMG:{}>>", att.url));
+            } else {
+                out.push_str(&format!(
+                    "\n[forwarded attachment]: {} {}",
+                    att.filename, att.url
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Combine a message's own text with its forwarded payloads (#1891 shape),
+/// reused for replied-to messages so a bare mention reading a forwarded
+/// original sees the payload too (#1890).
+pub(crate) fn folded_message_text(content: &str, snapshots: &[MessageSnapshot]) -> String {
+    let fwd = forwarded_snapshot_text(snapshots);
+    if fwd.is_empty() {
+        content.to_string()
+    } else if content.trim().is_empty() {
+        fwd.trim_start().to_string()
+    } else {
+        format!("{content}{fwd}")
+    }
+}
+
+/// What to do with a message that is empty of text and attachments after
+/// stripping. Pure so the branch contract from #1890 is testable without a
+/// live Context.
+pub(crate) enum EmptyContentDecision {
+    /// The message qualified (mention mode) despite coming up empty:
+    /// dispatch with this visible context instead of vanishing.
+    DispatchWith(String),
+    /// Nothing qualified; drop it, but leave a reason the caller can log.
+    Drop(&'static str),
+}
+
+pub(crate) fn decide_empty_content(
+    in_mention_mode: bool,
+    replied_folded: Option<&str>,
+) -> EmptyContentDecision {
+    if in_mention_mode {
+        EmptyContentDecision::DispatchWith(bare_mention_content(replied_folded))
+    } else {
+        EmptyContentDecision::Drop("no content, no attachments, and no qualifying mention")
+    }
+}
+
+/// Content for a bare @mention whose tag was just stripped (#1890). When the
+/// mention rode a reply, the replied-to text is the payload the user meant to
+/// send; without it, the ping itself is still a dispatchable turn.
+pub(crate) fn bare_mention_content(replied_folded: Option<&str>) -> String {
+    match replied_folded.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(text) => format!("The user mentioned you in reply to this message:\n\n{text}"),
+        None => "The user mentioned you with no other content.".to_string(),
+    }
+}
+
+/// Fetch the message a bare mention replied to and fold its forwards in.
+/// `None` when there is no reply reference or the fetch fails — the caller
+/// still dispatches the ping, just without extra context.
+async fn resolve_replied_folded(ctx: &Context, msg: &Message) -> Option<String> {
+    let reference = msg.message_reference.as_ref()?;
+    let referenced = reference.message_id?;
+    let channel = reference.channel_id;
+    match ctx.http.get_message(channel, referenced).await {
+        Ok(replied) => Some(folded_message_text(
+            &replied.content,
+            &replied.message_snapshots,
+        )),
+        Err(e) => {
+            tracing::warn!(error = %e, "Discord: could not resolve reply target of a bare mention (#1890)");
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_message(
     ctx: &Context,
@@ -246,9 +341,14 @@ pub(crate) async fn handle_message(
 
     let user_id = msg.author.id.get() as i64;
 
+    // Forwarded payloads belong in history too, not just in the agent's turn
+    // (#1891) — the raw `msg.content` of a pure forward is empty.
+    let forwarded_history = forwarded_snapshot_text(&msg.message_snapshots);
+
     // Helper: passively capture a channel message for history
     let store_channel_msg = |text: String| {
         let repo = channel_msg_repo.clone();
+        let fwd = forwarded_history.clone();
         let channel_chat_id = msg.channel_id.get().to_string();
         let guild_name = msg
             .guild_id
@@ -258,6 +358,14 @@ pub(crate) async fn handle_message(
         let sender_name = msg.author.name.clone();
         let msg_id = msg.id.get().to_string();
         async move {
+            let mut text = text;
+            if !fwd.is_empty() {
+                if text.is_empty() {
+                    text = fwd.trim_start().to_string();
+                } else {
+                    text.push_str(&fwd);
+                }
+            }
             if text.is_empty() {
                 return;
             }
@@ -441,8 +549,33 @@ pub(crate) async fn handle_message(
         let mention_tag = format!("<@{}>", bot_id);
         content = content.replace(&mention_tag, "").trim().to_string();
     }
+    // Surface forwarded payloads before the emptiness guard (#1891): a
+    // mention + pure forward has empty content and no top-level attachments,
+    // and used to be dropped here as noise before ever reaching the agent.
+    content = folded_message_text(&content, &msg.message_snapshots);
     if content.is_empty() && msg.attachments.is_empty() {
-        return;
+        // The strip above can empty a message that DID qualify at the gate:
+        // a bare @mention, usually a reply to a missed message (#1890).
+        // Resolve what it replied to and dispatch anyway; everything else
+        // keeps dropping, but never silently.
+        let in_mention_mode = !is_dm && respond_to == &RespondTo::Mention;
+        let replied_folded = if in_mention_mode {
+            resolve_replied_folded(ctx, msg).await
+        } else {
+            None
+        };
+        match decide_empty_content(in_mention_mode, replied_folded.as_deref()) {
+            EmptyContentDecision::DispatchWith(text) => {
+                tracing::debug!(
+                    "Discord: bare mention after tag-strip resolved to a dispatch (#1890)"
+                );
+                content = text;
+            }
+            EmptyContentDecision::Drop(reason) => {
+                tracing::debug!("Discord: dropping empty message: {reason}");
+                return;
+            }
+        }
     }
 
     // Handle attachments — vision-first pipeline
