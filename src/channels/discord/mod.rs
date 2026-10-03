@@ -10,7 +10,8 @@
 //! the gateway, `handler` routes inbound messages, `interactions` /
 //! `reactions` / `suggest_options` / `typing` handle their UI surfaces,
 //! `poll` validates the native-poll spec (#1848), `embed` validates the
-//! multi-embed report layout (C2), `flags` maps the silent delivery flag, and
+//! multi-embed report layout (C2), `guard` holds the outbound size/count
+//! ceilings (C3), `flags` maps the silent delivery flag, and
 //! `resume` re-delivers
 //! background results. This file is declarations
 //! only — no function definitions live here (CONTRIBUTING.md).
@@ -22,6 +23,7 @@ pub(crate) mod commands;
 mod connection;
 pub(crate) mod embed;
 pub(crate) mod flags;
+pub(crate) mod guard;
 pub(crate) mod handler;
 pub(crate) mod interactions;
 mod pending_interactions;

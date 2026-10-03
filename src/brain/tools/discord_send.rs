@@ -213,7 +213,7 @@ impl Tool for DiscordSendTool {
                 },
                 "file_path": {
                     "type": "string",
-                    "description": "Local file path to upload (required for send_file)"
+                    "description": "Local file path to upload (required for send_file). Refused locally if over Discord's 20 MiB per-attachment default or 25 MiB request limit."
                 },
                 "caption": {
                     "type": "string",
@@ -870,18 +870,34 @@ impl Tool for DiscordSendTool {
                     .unwrap_or("")
                     .to_string();
                 let channel = ChannelId::new(channel_id);
+                // C3: check the size from metadata BEFORE reading, so an
+                // oversized file is refused instead of pulled into memory.
+                // Discord would answer 400 after the whole upload.
+                let fname = std::path::Path::new(&file_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file.png")
+                    .to_string();
+                match tokio::fs::metadata(&file_path).await {
+                    Ok(meta) => {
+                        if let Err(e) = check_batch(&[FileSize::new(fname.clone(), meta.len())]) {
+                            return Ok(ToolResult::error(e.message()));
+                        }
+                    }
+                    Err(e) => {
+                        return Ok(ToolResult::error(format!(
+                            "Failed to read file '{file_path}': {e}"
+                        )));
+                    }
+                }
                 match tokio::fs::read(&file_path).await {
                     Ok(bytes) => {
-                        let fname = std::path::Path::new(&file_path)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("file.png")
-                            .to_string();
                         let attachment = CreateAttachment::bytes(bytes.as_slice(), fname);
                         let mut msg = CreateMessage::new().add_file(attachment);
                         if !caption.is_empty() {
                             msg = msg.content(caption);
                         }
+                        let msg = crate::channels::discord::flags::apply_silent(msg, silent);
                         match channel.send_message(&http, msg).await {
                             Ok(_) => Ok(ToolResult::success("File sent.".to_string())),
                             Err(e) => Ok(ToolResult::error(format!("Failed to send file: {e}"))),
