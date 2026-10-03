@@ -6,6 +6,13 @@
 # the same way every time. Review catches what is wrong with the change; Semgrep
 # catches what is wrong with the code.
 #
+# Baseline, not a blanket scan. This repo is a fork of a large upstream tree that
+# already carries findings we do not own (ws:// defaults in the browser manager,
+# a raw-SQL cron template, a shell-injection shape in prerelease.yml). A scan with
+# no baseline is red on day one and stays red forever, which only teaches everyone
+# to ignore the gate. --baseline-commit reports the findings the PR introduces and
+# nothing else, so the gate speaks about the change under review.
+#
 # Policy: only ERROR-severity findings fail the job. MEDIUM/WARNING findings are
 # printed in full (log + job summary) so they stay visible without turning every
 # PR red on day one. Tighten by setting STRICT to "true" once the backlog is triaged.
@@ -47,30 +54,65 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # the baseline diff needs the base commit's tree, which a depth-1
+          # checkout does not carry
+          fetch-depth: 0
           persist-credentials: false
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
+      - name: Resolve baseline
+        id: base
+        run: |
+          zero=0000000000000000000000000000000000000000
+          sha=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            sha="${{ github.event.pull_request.base.sha }}"
+          elif [ "${{ github.event_name }}" = "push" ] && [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "$zero" ]; then
+            sha="${{ github.event.before }}"
+          fi
+          # a sha we cannot resolve would make semgrep fail the scan outright
+          if [ -n "$sha" ] && git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+            echo "sha=$sha" >> "$GITHUB_OUTPUT"
+            echo "baseline: $sha"
+          else
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            echo "baseline: none - scanning the full tree"
+          fi
+
       - name: Install Semgrep
         run: pip install --disable-pip-version-check "semgrep==${SEMGREP_VERSION}"
 
       - name: Scan
+        env:
+          BASELINE: ${{ steps.base.outputs.sha }}
         run: |
+          if [ -n "$BASELINE" ]; then
+            set -- --baseline-commit "$BASELINE"
+          fi
           semgrep scan \
             --config p/default \
             --config p/secrets \
             --metrics=off \
             --quiet \
+            "$@" \
             --json --output semgrep.json
 
       - name: Report and gate
+        env:
+          BASELINE: ${{ steps.base.outputs.sha }}
         run: |
           {
             echo "### Semgrep"
             echo
             echo "semgrep ${SEMGREP_VERSION} | policy: STRICT=${STRICT}"
+            if [ -n "$BASELINE" ]; then
+              echo "baseline: \`${BASELINE}\` - findings already in the base branch are not reported"
+            else
+              echo "baseline: none - full tree scan"
+            fi
             echo
             echo "| Severity | Rule | Location |"
             echo "| --- | --- | --- |"
