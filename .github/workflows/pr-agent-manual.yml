@@ -10,7 +10,10 @@
 # A classic token with the "repo" scope is refused on purpose: that scope reaches
 # every repository its owner can see, so a compromised package, action, or
 # transitive dependency inside the CLI could rewrite all of them, not just the
-# repo the PR lives in. Fine-grained tokens cap the blast radius at one repo.
+# repo the PR lives in. A fine-grained token narrows the blast radius only when
+# it actually names one repository: scoped to "All repositories" it is as broad
+# as a classic token, and GitHub's API does not expose the difference, so this
+# step warns and the operator confirms the scope by hand.
 # The check below fails the run unless the token is fine-grained, or the
 # dispatcher explicitly accepts the wider blast radius with allow_broad_pat.
 name: PR Agent (manual)
@@ -70,10 +73,19 @@ jobs:
             -H "Authorization: Bearer $PAT" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$REPO" || true)
+          # A 200 here is NOT proof that the token can comment on the PR: GitHub
+          # answers this endpoint with 200 for every public repository, even to a
+          # token that has no access to it, and the upstream repos this workflow
+          # targets are public. The call only rules out a token that is invalid
+          # or outright rejected. It cannot confirm the permissions PR-Agent
+          # needs (Pull requests: write, Issues: write).
           if [ "$CODE" != "200" ]; then
-            echo "::error::PR_AGENT_PAT cannot read $REPO (HTTP $CODE). A fine-grained token has to name that repository in its scope, with Contents: read."
+            echo "::error::PR_AGENT_PAT was rejected for $REPO (HTTP $CODE). A fine-grained token has to name that repository in its scope, with Contents: read."
             exit 1
           fi
+
+          WHO=$(curl -sS -H "Authorization: Bearer $PAT" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/user" | sed -n 's/.*"login":[ ]*"\([^"]*\)".*/\1/p' | head -1)
 
           # Classic tokens and OAuth apps return X-OAuth-Scopes; fine-grained
           # tokens and GitHub App tokens do not. A non-empty header therefore
@@ -87,8 +99,14 @@ jobs:
               exit 1
             fi
           else
-            echo "PR_AGENT_PAT is a fine-grained token that can read $REPO."
+            # No scope header: fine-grained or App token. GitHub's API does not
+            # expose a fine-grained token's repository selection, so a token
+            # scoped to All repositories is indistinguishable here from one
+            # scoped to $REPO. Warn instead of claiming the blast radius shrank.
+            echo "::warning::PR_AGENT_PAT sends no X-OAuth-Scopes header, so it is a fine-grained or GitHub App token. GitHub does not expose a fine-grained token's repository selection through the API, so this step cannot confirm it is limited to $REPO: a token scoped to All repositories looks identical here. Verify under Settings > Developer settings > Personal access tokens that it names only $REPO."
           fi
+
+          echo "PR_AGENT_PAT authenticated as ${WHO:-an unknown account}, and GitHub accepted it for $REPO (HTTP 200). Read access to a public repository is not what that proves; the token still has to carry Pull requests: write and Issues: write for the review to post."
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
