@@ -2,7 +2,7 @@
 //!
 //! Drives the REAL gate with time scripted: every evaluation reads the
 //! injectable `gate_now` seam, and tests advance the virtual clock by hand
-//! (`ts::advance`) instead of sleeping. `#[tokio::test(start_paused = true)]`
+//! (`vclock::advance`) instead of sleeping. `#[tokio::test(start_paused = true)]`
 //! means even the governor's internal holds cost zero wall time.
 //!
 //! Nothing here touches the live config: `Config::set_current` swaps an
@@ -11,13 +11,13 @@
 use std::time::Duration;
 
 use crate::channels::discord::governor;
-use crate::channels::discord::governor::test_support as ts;
+use crate::channels::discord::governor::test_support as vclock;
 use crate::channels::discord::governor::{Admission, WriteClass};
 use crate::config::Config;
 
 /// Swap the process-wide config mirror for `config.toml.example` plus
 /// per-test `rate_limiter` mutations. Parsed fresh per test so knob changes
-/// cannot leak sideways; [`ts::registry_guard`] serializes the swap.
+/// cannot leak sideways; [`vclock::registry_guard`] serializes the swap.
 macro_rules! rl_config {
     ($($field:ident : $value:expr),* $(,)?) => {{
         let mut cfg: Config = toml::from_str(include_str!("../../config.toml.example"))
@@ -31,8 +31,8 @@ const CH: u64 = 4_242;
 
 #[tokio::test(start_paused = true)]
 async fn bucket_refuses_when_spent_and_recovers_after_virtual_refill() {
-    let _guard = ts::registry_guard().await;
-    ts::reset(0);
+    let _guard = vclock::registry_guard().await;
+    vclock::reset(0);
     rl_config!(enabled: true, create_burst: 1, creates_per_5s: 1, max_hold_secs: 1);
 
     // Burst of one: the first write is admitted straight away.
@@ -50,7 +50,7 @@ async fn bucket_refuses_when_spent_and_recovers_after_virtual_refill() {
 
     // A full refill window elapses on the virtual clock: the bucket is whole
     // again and the write goes through.
-    ts::advance(5_000);
+    vclock::advance(5_000);
     assert_eq!(
         governor::admit(CH, WriteClass::Create).await,
         Admission::Admit
@@ -63,8 +63,8 @@ async fn bucket_refuses_when_spent_and_recovers_after_virtual_refill() {
 
 #[tokio::test(start_paused = true)]
 async fn final_class_waits_instead_of_being_dropped() {
-    let _guard = ts::registry_guard().await;
-    ts::reset(0);
+    let _guard = vclock::registry_guard().await;
+    vclock::reset(0);
     rl_config!(enabled: true, edit_burst: 1, edits_per_5s: 1, max_hold_secs: 1);
 
     assert_eq!(
@@ -90,8 +90,8 @@ async fn final_class_waits_instead_of_being_dropped() {
 
 #[tokio::test(start_paused = true)]
 async fn content_class_is_never_dropped() {
-    let _guard = ts::registry_guard().await;
-    ts::reset(0);
+    let _guard = vclock::registry_guard().await;
+    vclock::reset(0);
     rl_config!(enabled: true, edit_burst: 1, edits_per_5s: 1, max_hold_secs: 1);
 
     assert_eq!(
@@ -107,8 +107,8 @@ async fn content_class_is_never_dropped() {
 
 #[tokio::test(start_paused = true)]
 async fn cooldown_ladder_grows_on_consecutive_429s() {
-    let _guard = ts::registry_guard().await;
-    ts::reset(0);
+    let _guard = vclock::registry_guard().await;
+    vclock::reset(0);
     rl_config!(
         enabled: true,
         cooldown_base_millis: 1_000,
@@ -141,8 +141,8 @@ async fn cooldown_ladder_grows_on_consecutive_429s() {
 
 #[tokio::test(start_paused = true)]
 async fn cooldown_is_capped_and_cleared_by_a_successful_write() {
-    let _guard = ts::registry_guard().await;
-    ts::reset(0);
+    let _guard = vclock::registry_guard().await;
+    vclock::reset(0);
     rl_config!(
         enabled: true,
         create_burst: 5,
@@ -162,7 +162,7 @@ async fn cooldown_is_capped_and_cleared_by_a_successful_write() {
     );
 
     // Wait the window out, then a successful write clears the ladder.
-    ts::advance(4_100);
+    vclock::advance(4_100);
     assert!(!governor::is_cooldown_active(CH), "window elapsed");
     assert_eq!(
         governor::admit(CH, WriteClass::Create).await,
@@ -176,8 +176,8 @@ async fn cooldown_is_capped_and_cleared_by_a_successful_write() {
 
 #[tokio::test(start_paused = true)]
 async fn discord_retry_after_wins_when_longer_than_the_ladder() {
-    let _guard = ts::registry_guard().await;
-    ts::reset(0);
+    let _guard = vclock::registry_guard().await;
+    vclock::reset(0);
     rl_config!(
         enabled: true,
         cooldown_base_millis: 1_000,
@@ -194,8 +194,8 @@ async fn discord_retry_after_wins_when_longer_than_the_ladder() {
 
 #[tokio::test(start_paused = true)]
 async fn disabled_governor_admits_immediately() {
-    let _guard = ts::registry_guard().await;
-    ts::reset(0);
+    let _guard = vclock::registry_guard().await;
+    vclock::reset(0);
     rl_config!(enabled: false, create_burst: 0, creates_per_5s: 0);
 
     for _ in 0..5 {
@@ -212,8 +212,8 @@ async fn disabled_governor_admits_immediately() {
 
 #[tokio::test(start_paused = true)]
 async fn zero_refill_rate_fails_open_instead_of_wedging() {
-    let _guard = ts::registry_guard().await;
-    ts::reset(0);
+    let _guard = vclock::registry_guard().await;
+    vclock::reset(0);
     // A misconfigured zero budget can never mint a token. Failing open is the
     // deliberate choice: a governor that hangs the channel is worse than one
     // that overshoots.
