@@ -130,6 +130,11 @@ pub(crate) async fn route_followup_turn(
     agent: Arc<AgentService>,
     session_svc: SessionService,
     discord_state: Arc<super::DiscordState>,
+    // Interaction token for the deferred ack, when this turn was started by a
+    // slash command. `Some` lets the final answer REPLACE the deferred message
+    // instead of arriving as an orphaned second reply (FR-002, AC-004); `None`
+    // keeps the legacy channel-say delivery.
+    interaction_token: Option<String>,
     is_dm: bool,
     user_id: u64,
     channel_id: u64,
@@ -580,8 +585,42 @@ pub(crate) async fn route_followup_turn(
             }
 
             if !skip_final_post {
-                for chunk in super::handler::split_message(&text_only, 2000) {
-                    if let Err(e) = channel.say(&http, &chunk).await {
+                let chunks = super::handler::split_message(&text_only, 2000);
+                // FR-002 (AC-004): when the turn was started by a slash
+                // command, the deferred ack IS the answer's home — edit it in
+                // place so the invocation and the result are one message
+                // instead of two. The token is good for 15 minutes; past that
+                // the edit fails and we fall back to a plain message tagged as
+                // a continuation (AC-005) rather than dropping the answer.
+                let mut delivered_via_token = false;
+                for (idx, chunk) in chunks.iter().enumerate() {
+                    if idx == 0
+                        && let Some(token) = interaction_token.as_deref()
+                    {
+                        let edit = serenity::builder::EditInteractionResponse::new()
+                            .content(chunk.clone());
+                        match http
+                            .edit_original_interaction_response(token, &edit, Vec::new())
+                            .await
+                        {
+                            Ok(_) => {
+                                delivered_via_token = true;
+                                continue;
+                            }
+                            Err(e) => tracing::warn!(
+                                "Discord: deferred ack edit failed (token expired?), falling back to a plain message: {e}"
+                            ),
+                        }
+                    }
+                    // A continuation marker covers both the overflow chunks of
+                    // a token delivery and the first chunk of a fallback.
+                    let payload =
+                        if idx > 0 || (interaction_token.is_some() && !delivered_via_token) {
+                            format!("\u{2026}{chunk}")
+                        } else {
+                            chunk.clone()
+                        };
+                    if let Err(e) = channel.say(&http, &payload).await {
                         tracing::error!("Discord: follow-up tap reply delivery failed: {e}");
                     }
                 }
