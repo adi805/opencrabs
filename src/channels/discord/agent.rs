@@ -363,12 +363,29 @@ impl EventHandler for Handler {
             } else {
                 format!("{user_name}: {invocation}")
             };
+            // A slash command has no originating message, so `Acknowledge`
+            // (Discord's DEFERRED_UPDATE_MESSAGE, kind 6) is not a valid reply
+            // to it: there is nothing to update, the handshake fails, and the
+            // user gets the red "This interaction didn't respond" banner while
+            // the turn quietly carries on (#27, upstream #1888). Reply with a
+            // real message inside the 3-second window instead, ephemeral so it
+            // confirms to the caller without cluttering the channel; the
+            // answer itself still arrives from the turn below.
             let _ack = command
                 .create_response(
                     &ctx.http,
-                    serenity::builder::CreateInteractionResponse::Acknowledge,
+                    serenity::builder::CreateInteractionResponse::Message(
+                        serenity::builder::CreateInteractionResponseMessage::new()
+                            .content(format!(
+                                "\u{1f9e0} {invocation} diterima, sedang diproses\u{2026}"
+                            ))
+                            .ephemeral(true),
+                    ),
                 )
                 .await;
+            if let Err(e) = _ack {
+                tracing::warn!("Discord: could not acknowledge {invocation}: {e}");
+            }
             let agent = self.agent.clone();
             let session_svc = self.session_svc.clone();
             let discord_state = self.discord_state.clone();
