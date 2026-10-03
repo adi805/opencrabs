@@ -32,8 +32,8 @@ jobs:
           "=== session identity ==="
           "SessionId   : $([System.Diagnostics.Process]::GetCurrentProcess().SessionId)"
           "Interactive : $([Environment]::UserInteractive)"
-          $vd = [System.Windows.Forms.SystemInformation]::VirtualDisplay
-          "VirtualDisplay: $($vd.Bounds) primary=$($vd.Primary)"
+          $scr = [System.Windows.Forms.Screen]::AllScreens
+          "Displays    : $($scr.Count) primary=$([System.Windows.Forms.Screen]::PrimaryScreen.Bounds)"
           $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
           "VirtualScreen : $($vs.Width)x$($vs.Height) at $($vs.X),$($vs.Y)"
 
@@ -91,9 +91,13 @@ jobs:
           foreach ($w in $wins) {
             $parts = $w.Split('|')
             $hwnd = [IntPtr][long]::Parse($parts[0])
-            $title = $parts[1]
-            "window[$i] title='$title' size=$($parts[2])"
-            $dims = $parts[2] -split 'x'
+            # hwnd is field 0 and the size is the LAST field, so a window title
+            # containing '|' cannot shift them: whatever sits between the two
+            # ends is the title, joined back together.
+            $title = ($parts[1..($parts.Count - 2)] -join '|')
+            $size = $parts[-1]
+            "window[$i] title='$title' size=$size"
+            $dims = $size -split 'x'
             $wd = [Math]::Max(1, [int]$dims[0]); $ht = [Math]::Max(1, [int]$dims[1])
             if ($wd -gt 3000 -or $ht -gt 3000) { "  skipped (absurd size)"; $i++; continue }
             try {
