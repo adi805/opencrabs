@@ -511,7 +511,7 @@ fn trunc(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::summary_label;
+    use super::{summary_label, summary_row};
 
     /// Every label the totals card actually uses must end with a separator, so
     /// a value can never start flush against the label text.
@@ -554,5 +554,40 @@ mod tests {
             format!("{}{}", "Tools", " ".repeat(4))
         );
         assert_eq!(summary_label("A longer label"), "A longer label ");
+    }
+
+    /// The reported defect lived in the row, not the label: `summary_row` used
+    /// to pad to 6 with no separator, so `Verify` rendered as `Verify0 ok / 0
+    /// rollbk` and `RSI live` as `RSI liveRSI has never run`. Asserting on
+    /// `summary_label` alone cannot catch that, because the bug is in how the
+    /// spans are combined. This asserts the joined text of every row the totals
+    /// card actually builds: the flush pairing must never appear, and the
+    /// padded label must still be followed by a space before its value.
+    #[test]
+    fn summary_row_keeps_a_gap_between_label_and_value() {
+        for (label, value) in [
+            ("Tools", "0 calls"),
+            ("Fails", "0 ok / 0 rollbk"),
+            ("Recov", "0 recovered"),
+            ("Verify", "0 ok / 0 rollbk"),
+            ("RSI", "0 applied"),
+            ("RSI live", "RSI has never run"),
+            ("Brain", "no usage yet"),
+        ] {
+            let joined: String = summary_row(label, value.to_string())
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            let padded = summary_label(label);
+            assert!(
+                !joined.contains(&format!("{label}{value}")),
+                "{label:?} runs into its value: {joined:?}"
+            );
+            assert!(
+                joined.contains(&format!("{padded}{value}")),
+                "{label:?} lost the separator before its value: {joined:?}"
+            );
+        }
     }
 }
