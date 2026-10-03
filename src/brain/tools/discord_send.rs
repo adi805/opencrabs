@@ -135,11 +135,23 @@ impl Tool for DiscordSendTool {
                 },
                 "embed_description": {
                     "type": "string",
-                    "description": "Body text for send_embed"
+                    "description": "Body text for send_embed (single-embed path; ignored when 'embeds' is given)"
                 },
                 "embed_color": {
                     "type": "integer",
                     "description": "RGB color integer for send_embed (e.g. 0x00FF00 = 65280)"
+                },
+                "embeds": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "description": {"type": "string"},
+                            "color": {"type": "integer"}
+                        }
+                    },
+                    "description": "Multi-embed layout for send_embed (max 10 blocks). When present and non-empty it replaces embed_title/embed_description/embed_color. Each block: title (<=256 chars), description (<=4096), color (RGB int, default Discord blurple). Discord caps the combined title+description text across all blocks at 6000 chars; overflow is trimmed from the tail and reported."
                 },
                 "thread_name": {
                     "type": "string",
@@ -466,34 +478,72 @@ impl Tool for DiscordSendTool {
 
             // ── send_embed ───────────────────────────────────────────────────
             "send_embed" => {
-                use serenity::builder::{CreateEmbed, CreateMessage};
+                use crate::channels::discord::embed::{EmbedInput, build_spec, embed_builders};
+                use serenity::builder::CreateMessage;
                 let channel_id = pget!(channel_or_err(channel_id_opt));
-                let title = input
-                    .get("embed_title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let description = input
-                    .get("embed_description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let color = input
-                    .get("embed_color")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0x5865F2) as u32; // Discord blurple default
-                let embed = CreateEmbed::new()
-                    .title(title.as_str())
-                    .description(description.as_str())
-                    .color(color);
-                let builder = CreateMessage::new().embed(embed);
+
+                // An explicit non-empty `embeds` array wins; otherwise the
+                // single-embed params become a one-element input, so both paths
+                // share one validator (C2). A blank single embed is refused
+                // rather than sent as an empty embed Discord would 400 on.
+                let inputs: Vec<EmbedInput> = match input.get("embeds").and_then(|v| v.as_array()) {
+                    Some(arr) if !arr.is_empty() => arr
+                        .iter()
+                        .map(|e| {
+                            EmbedInput::new(
+                                e.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                                e.get("description").and_then(|v| v.as_str()).unwrap_or(""),
+                                e.get("color").and_then(|v| v.as_u64()).unwrap_or(0x5865F2) as u32,
+                            )
+                        })
+                        .collect(),
+                    _ => vec![EmbedInput::new(
+                        input
+                            .get("embed_title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                        input
+                            .get("embed_description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                        input
+                            .get("embed_color")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0x5865F2) as u32, // Discord blurple default
+                    )],
+                };
+
+                let spec = match build_spec(&inputs) {
+                    Ok(spec) => spec,
+                    Err(e) => return Ok(ToolResult::error(e.message())),
+                };
+                let builder = crate::channels::discord::flags::apply_silent(
+                    CreateMessage::new().embeds(embed_builders(&spec)),
+                    silent,
+                );
                 match ChannelId::new(channel_id)
                     .send_message(&http, builder)
                     .await
                 {
-                    Ok(_) => Ok(ToolResult::success(format!(
-                        "Embed sent to channel {channel_id}."
-                    ))),
+                    Ok(_) => {
+                        let mut note = format!(
+                            "{} embed(s) sent to channel {channel_id}.",
+                            spec.embeds.len()
+                        );
+                        if spec.dropped_embeds > 0 {
+                            note.push_str(&format!(
+                                " {} block(s) dropped (blank, past the 10-embed cap, or past the \
+                                 6000-char budget).",
+                                spec.dropped_embeds
+                            ));
+                        }
+                        if spec.truncated {
+                            note.push_str(
+                                " Text was trimmed to fit Discord's 6000-character embed budget.",
+                            );
+                        }
+                        Ok(ToolResult::success(note))
+                    }
                     Err(e) => Ok(ToolResult::error(format!("Failed to send embed: {e}"))),
                 }
             }

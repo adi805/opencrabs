@@ -9,8 +9,9 @@
 //! `sessions`, and the tool-group methods in `tool_group`); `agent` runs
 //! the gateway, `handler` routes inbound messages, `interactions` /
 //! `reactions` / `suggest_options` / `typing` handle their UI surfaces,
-//! `poll` validates the native-poll spec (#1848), `flags` maps the silent
-//! delivery flag, and `resume` re-delivers
+//! `poll` validates the native-poll spec (#1848), `embed` validates the
+//! multi-embed report layout (C2), `flags` maps the silent delivery flag, and
+//! `resume` re-delivers
 //! background results. This file is declarations
 //! only — no function definitions live here (CONTRIBUTING.md).
 
@@ -19,6 +20,7 @@ mod approval;
 mod cancel;
 pub(crate) mod commands;
 mod connection;
+pub(crate) mod embed;
 pub(crate) mod flags;
 pub(crate) mod handler;
 pub(crate) mod interactions;
