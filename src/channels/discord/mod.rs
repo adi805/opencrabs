@@ -18,6 +18,7 @@ mod approval;
 mod cancel;
 pub(crate) mod commands;
 mod connection;
+pub(crate) mod governor;
 pub(crate) mod handler;
 pub(crate) mod interactions;
 mod pending_interactions;
@@ -30,6 +31,7 @@ pub(crate) mod suggest_options;
 pub(crate) mod table_convert;
 pub(crate) mod tool_group;
 pub(crate) mod typing;
+pub(crate) mod writes;
 
 pub use agent::DiscordAgent;
 pub use state::DiscordState;

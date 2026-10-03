@@ -6,6 +6,7 @@
 //! completed turn's final text (like the crash-recovery path in `cli/ui.rs`).
 
 use super::DiscordState;
+use super::writes::{self, Class};
 use crate::brain::agent::service::MessageEnqueueCallback;
 use crate::channels::bg_resume::{self, AgentHolder};
 use std::sync::Arc;
@@ -45,7 +46,7 @@ pub(crate) fn build_enqueue_callback(
                     .await
             {
                 let ch = serenity::model::id::ChannelId::new(channel_id);
-                if let Err(e) = ch.say(&http, &content).await {
+                if let Err(e) = writes::say(&http, ch, &content, Class::Final).await {
                     tracing::warn!("[bg-resume] discord: say failed: {e}");
                 }
             }

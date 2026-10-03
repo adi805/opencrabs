@@ -4,6 +4,7 @@
 //! session routing (owner shares TUI session, others get per-user sessions).
 
 use super::DiscordState;
+use super::writes::{self, Class};
 use crate::brain::agent::AgentService;
 use crate::channels::group_history;
 use crate::config::{Config, RespondTo};
@@ -1558,7 +1559,7 @@ pub(crate) async fn handle_message(
                 let edit = serenity::builder::EditMessage::new()
                     .content(super::tool_group::render_content(&group))
                     .components(super::tool_group::render_components(&group, mid.get()));
-                if let Err(e) = target.edit_message(&ctx.http, mid, edit).await {
+                if let Err(e) = writes::edit(&ctx.http, target, mid, edit, Class::Edit).await {
                     tracing::debug!("Discord: trace mirror-note drop failed: {e}");
                 }
             }
@@ -1582,7 +1583,7 @@ pub(crate) async fn handle_message(
                 let edit = serenity::builder::EditMessage::new()
                     .content(super::tool_group::render_content(&group))
                     .components(super::tool_group::render_components(&group, mid.get()));
-                if let Err(e) = target.edit_message(&ctx.http, mid, edit).await {
+                if let Err(e) = writes::edit(&ctx.http, target, mid, edit, Class::Final).await {
                     tracing::debug!("Discord: settled status stamp failed: {e}");
                 }
             }
@@ -1612,7 +1613,7 @@ pub(crate) async fn handle_message(
                 for file in batch {
                     message = message.add_file(file.clone());
                 }
-                if let Err(e) = target.send_message(&ctx.http, message).await {
+                if let Err(e) = writes::send(&ctx.http, target, message, Class::Final).await {
                     tracing::error!("Discord: failed to send media gallery batch: {}", e);
                 }
             }
@@ -1646,11 +1647,15 @@ pub(crate) async fn handle_message(
                                 if truncated { "…" } else { "" },
                                 thread.id
                             );
-                            if let Err(e) = target.say(&ctx.http, &teaser).await {
+                            if let Err(e) =
+                                writes::say(&ctx.http, target, &teaser, Class::Create).await
+                            {
                                 tracing::error!("Discord: auto-thread teaser failed: {e}");
                             }
                             for chunk in &chunks {
-                                if let Err(e) = thread.id.say(&ctx.http, chunk).await {
+                                if let Err(e) =
+                                    writes::say(&ctx.http, thread.id, chunk, Class::Final).await
+                                {
                                     tracing::error!("Discord: auto-thread body failed: {e}");
                                 }
                             }
@@ -1658,7 +1663,9 @@ pub(crate) async fn handle_message(
                         Err(e) => {
                             tracing::warn!("Discord: auto-thread failed, posting inline: {e}");
                             for chunk in &chunks {
-                                if let Err(e) = target.say(&ctx.http, chunk).await {
+                                if let Err(e) =
+                                    writes::say(&ctx.http, target, chunk, Class::Final).await
+                                {
                                     tracing::error!("Discord: failed to send reply: {}", e);
                                 }
                             }
@@ -1666,7 +1673,7 @@ pub(crate) async fn handle_message(
                     }
                 } else {
                     for chunk in &chunks {
-                        if let Err(e) = target.say(&ctx.http, chunk).await {
+                        if let Err(e) = writes::say(&ctx.http, target, chunk, Class::Final).await {
                             tracing::error!("Discord: failed to send reply: {}", e);
                         }
                     }
@@ -1725,7 +1732,7 @@ pub(crate) async fn handle_message(
             // too large, stream broken, repetition loop). Same wording
             // as the TUI + Telegram + Slack + WhatsApp paths.
             let error_msg = format!("❌ Error\n\n{}", crate::brain::agent::format_user_error(&e));
-            if let Err(e) = target.say(&ctx.http, error_msg).await {
+            if let Err(e) = writes::say(&ctx.http, target, &error_msg, Class::Final).await {
                 tracing::warn!(error = %e, "failed to send Discord message");
             }
         }

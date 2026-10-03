@@ -4,6 +4,7 @@
 
 use super::DiscordState;
 use super::handler;
+use super::writes::{self, Class};
 use crate::brain::agent::AgentService;
 use crate::config::Config;
 use crate::db::ChannelMessageRepository;
@@ -790,7 +791,10 @@ impl EventHandler for Handler {
                         tokio::spawn(async move {
                             match agent_clone.send_message(sid, prompt, None).await {
                                 Ok(r) => {
-                                    if let Err(e) = channel_id.say(&http, &r.content).await {
+                                    if let Err(e) =
+                                        writes::say(&http, channel_id, &r.content, Class::Final)
+                                            .await
+                                    {
                                         tracing::warn!(error = %e, "failed to send Discord agent message");
                                     }
                                 }
