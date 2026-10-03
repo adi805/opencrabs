@@ -144,8 +144,9 @@ pub fn build_spec(input: &[EmbedInput]) -> Result<EmbedSpec, EmbedError> {
     let mut dropped_embeds = input.len() - normalized.len();
     let mut used = 0usize;
     let mut embeds: Vec<EmbedInput> = Vec::new();
+    let normalized_len = normalized.len();
 
-    for entry in normalized {
+    for (i, entry) in normalized.into_iter().enumerate() {
         if embeds.len() >= MAX_EMBEDS {
             dropped_embeds += 1;
             continue;
@@ -166,8 +167,10 @@ pub fn build_spec(input: &[EmbedInput]) -> Result<EmbedSpec, EmbedError> {
         } else {
             dropped_embeds += 1;
         }
-        // Everything after this point is past the budget.
+        // Everything from here on is past the budget and never ships, so the
+        // whole tail is counted as dropped instead of being silently lost.
         truncated = true;
+        dropped_embeds += normalized_len - i - 1;
         break;
     }
 
@@ -296,7 +299,9 @@ mod tests {
         assert_eq!(spec.embeds[0].title, "A");
         // C never made it in.
         assert!(spec.embeds.iter().all(|e| e.title != "C"));
-        assert!(spec.dropped_embeds >= 1);
+        // B was clipped into the tail of the budget (it still ships); C never
+        // made it, so exactly one entry must be reported as dropped.
+        assert_eq!(spec.dropped_embeds, 1);
     }
 
     #[test]
