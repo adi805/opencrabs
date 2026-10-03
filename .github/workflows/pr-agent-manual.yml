@@ -118,8 +118,9 @@ jobs:
           PR_CMD: ${{ inputs.command }}
           OPENAI__KEY: ${{ secrets.PR_AGENT_KEY }}
           OPENAI__API_BASE: "https://api.inferhub.dev/v1"
-          CONFIG__MODEL: "openai/ali/deepseek-v4.1-flash"
-          CONFIG__FALLBACK_MODELS: '["openai/ali/qwen3.8-flash"]'
+          CONFIG__MODEL: "openai/ag/gemini-3.8-flash-high"
+          CONFIG__FALLBACK_MODELS: '["openai/ag/gemini-3.7-flash-high"]'
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "128000"
+          CONFIG__AI_TIMEOUT: "300"
           GITHUB__USER_TOKEN: ${{ secrets.PR_AGENT_PAT }}
         run: pr-agent --pr_url "$PR_URL" "$PR_CMD"
