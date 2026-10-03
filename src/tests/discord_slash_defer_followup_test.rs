@@ -62,9 +62,24 @@ fn only_the_slash_arm_supplies_an_interaction_token() {
         .find("// Select menu pick (#382)")
         .expect("select-menu branch terminates the tap branch");
     let tap = &tap_rest[..tap_end];
+
+    // Inspect the call's ARGUMENT LIST, not the whole branch: the branch
+    // legitimately contains `Some(` (e.g. `if let Some(..)`) and the word
+    // "token" in the comment above the call. Scanning the branch for those
+    // substrings is what made this guard panic while the wiring was correct.
+    let call_start = tap
+        .find("route_followup_turn(")
+        .expect("tap arm calls the follow-up helper");
+    let call = &tap[call_start..];
+    let call_end = call.find(".await").expect("the tap call is awaited");
+    let args = &call[..call_end];
     assert!(
-        !tap.contains("Some(") || !tap.contains("token"),
-        "FR-002 is slash-only: the tap arm must pass None, not a token"
+        args.contains("None,"),
+        "FR-002 is slash-only: the tap arm must pass None as the interaction token"
+    );
+    assert!(
+        !args.contains("token"),
+        "FR-002 is slash-only: the tap arm must not hand the turn an interaction token"
     );
 }
 
