@@ -18,9 +18,10 @@
 //! thing in an `Option`) means every existing call site keeps its
 //! `if let Err(e) = ...` shape: only the receiver and arguments move.
 //!
-//! One-shot command replies are deliberately NOT routed here, mirroring the
-//! Telegram governor, where direct user-command replies stay outside the send
-//! pacer by design: at most one message per human action cannot flood.
+//! One-shot command replies (`/help`, `/usage`, `/stop`, ...) ARE routed here
+//! as [`WriteClass::Final`], so a 429 on one of them teaches the governor and
+//! widens that channel's cooldown. `Final` is never dropped, so a reply cannot
+//! vanish: worst case it waits out the cooldown and then fails open.
 
 use serenity::builder::{CreateMessage, EditMessage};
 use serenity::http::Http;
