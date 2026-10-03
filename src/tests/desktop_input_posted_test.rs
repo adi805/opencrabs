@@ -216,7 +216,11 @@ fn posted_key_pair_distinguishes_press_from_release() {
     assert_eq!(messages[0].wparam, 0x0D, "wParam is the virtual key code");
     assert_eq!(messages[1].wparam, 0x0D);
     assert_eq!(messages[0].lparam as u32, 0x001C_0001);
-    assert_eq!(messages[1].lparam as u32, 0x601C_0001);
+    // A release reports the key as previously down (bit 30) and transitioning
+    // up (bit 31). Bit 29 stays clear: it is the context code (ALT held), not
+    // part of the release state, and setting it would describe a chord that
+    // was never pressed.
+    assert_eq!(messages[1].lparam as u32, 0xC01C_0001);
     assert_ne!(messages[0].lparam, messages[1].lparam);
 }
 
