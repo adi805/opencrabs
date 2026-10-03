@@ -28,7 +28,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # ci2- prefix: the ci-* group on refs/heads/main got ghost-locked GitHub-side
+  # (runs from 2026-09-27/28 held the group forever; later main pushes never
+  # created jobs or check runs). A fresh group name unsticks scheduling; rename
+  # again if it ever recurs.
+  group: ci2-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -46,7 +50,7 @@ jobs:
   # cross-platform build/test matrix for a PR that won't lint anyway.
   lint:
     name: Lint
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'self-hosted' }}
+    runs-on: ubuntu-latest
     # 25: hosted Lint ran 13:43 of its 15 cap on a fork PR (run
     # 36069934718); one noisy neighbor on the hosted fleet is a false red.
     timeout-minutes: 25
@@ -137,7 +141,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: self-hosted
+          - os: macos-latest
             target: aarch64-apple-darwin
             features: --all-features
     steps:
@@ -433,7 +437,7 @@ jobs:
   # then the tree.
   windows-footguns:
     name: Windows footguns
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'self-hosted' }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - name: Linter proves its own teeth
@@ -458,7 +462,7 @@ jobs:
   test:
     name: Test
     needs: [lint, audit]
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'self-hosted' }}
+    runs-on: ubuntu-latest
     # 60: fork PRs run this on hosted runners at roughly 3x self-hosted
     # speed, and the 30 cap killed cold-cache fork runs twice (runs
     # 36078125556 and 36069934718, both cancelled at ~30 while green code
@@ -526,7 +530,7 @@ jobs:
 
   audit:
     name: Cargo Audit
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'self-hosted' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
@@ -634,7 +638,7 @@ jobs:
     # On the Mac, where tarpaulin finishes the whole suite in ~15 min. A
     # hosted runner needed well over 30 for the same work and cost minutes
     # for it, which is not a trade worth making for a metric job.
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'self-hosted' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
@@ -717,7 +721,7 @@ jobs:
     # advisory (the whole point of the gate is that nothing lints the
     # cfg(windows) arms on their way in otherwise).
     needs: [lint, build, test, audit, windows-footguns]
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'self-hosted' }}
+    runs-on: ubuntu-latest
     steps:
       - name: Check results
         run: |
