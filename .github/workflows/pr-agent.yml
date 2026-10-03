@@ -15,6 +15,8 @@
 #     "Failed to review PR". `ag/gemini-3.8-flash-high` answers an 8.7k-token
 #     diff in 4s with finish_reason=stop and no reasoning tokens at all, so
 #     CONFIG__AI_TIMEOUT is only a backstop here, not the mechanism keeping it alive.
+#   - the job is capped at 15 minutes. A stalled provider burned ~25 minutes
+#     across its retries before giving up, and the default cap is six hours.
 #
 # Security:
 #   - the action is pinned to a commit SHA, not a tag: a tag is a movable ref, so
@@ -55,6 +57,7 @@ jobs:
       && (github.event_name != 'pull_request'
           || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: PR Agent
         uses: the-pr-agent/pr-agent@8e5a9295973b24af4b70cafd0b660a230811ef9e # v0.47.0
