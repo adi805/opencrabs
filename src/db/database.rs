@@ -27,6 +27,17 @@ pub fn db_integrity_failed() -> bool {
     DB_INTEGRITY_FAILED.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Non-consuming read of the same flag (#1779 defect 4).
+///
+/// `db_integrity_failed()` SWAPS, so the first reader wins and every later
+/// reader sees `false`. The startup path in `cmd_chat_inner` runs before the TUI
+/// is built, so a consuming read there would silence the banner for the one user
+/// actually looking at a screen. Logging surfaces (daemon startup, `doctor`)
+/// peek; the TUI banner keeps the consuming read.
+pub fn db_integrity_failed_now() -> bool {
+    DB_INTEGRITY_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Type alias for database pool
 pub type Pool = DeadPool;
 
@@ -126,6 +137,11 @@ pub(crate) const MIGRATION_SQL: &[&str] = &[
     // [features] audit_recording = true, and nothing reads them except the
     // /audit viewer. Appended last per the list invariant.
     include_str!("../migrations/20260926000001_add_audit_turn_retrievals.sql"),
+    // FORK (#544): the one-shot retirement flag. A cron job with
+    // `run_once = 1` is disabled by the same dispatch-time schedule advance
+    // that moves every job's `next_run_at`, so a spent one-shot reads
+    // `enabled = 0` instead of parking armed until the same date next year.
+    include_str!("../migrations/20260927000001_add_cron_run_once.sql"),
 ];
 
 pub(crate) fn build_migrations() -> Migrations<'static> {
@@ -207,6 +223,13 @@ pub(crate) fn heal_analytics_migration_33(conn: &rusqlite::Connection) -> rusqli
 /// Database connection manager
 pub struct Database {
     pub(crate) pool: Pool,
+    /// The file the pool is backed by, or `None` for an in-memory database.
+    ///
+    /// Kept next to the pool rather than read off a connection because the
+    /// pre-migration integrity check must reach the image *without* borrowing a
+    /// pooled connection (#1779 defect 2): on a torn image `post_create` fails
+    /// and the pool never yields one.
+    pub(crate) db_path: Option<String>,
 }
 
 /// Apply PRAGMA settings to a rusqlite connection.
@@ -286,7 +309,10 @@ impl Database {
         // provider streaming persistence) can still write to the DB. Safe to
         // ignore the error — only the first connect wins.
         let _ = GLOBAL_POOL.set(pool.clone());
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            db_path: Some(path_str),
+        })
     }
 
     /// Connect to an in-memory database (for testing)
@@ -322,7 +348,10 @@ impl Database {
             .context("Failed to create in-memory pool")?;
 
         tracing::debug!("Connected to in-memory database");
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            db_path: None,
+        })
     }
 
     /// Get a reference to the connection pool
@@ -342,6 +371,63 @@ impl Database {
     /// Run database migrations
     pub async fn run_migrations(&self) -> Result<()> {
         let migrations = build_migrations();
+
+        // #1779: snapshot the image BEFORE any migration can write to it.
+        //
+        // Deliberately a separate `interact` with its own anyhow error, not a
+        // step inside the migration closure below: that closure's error type is
+        // `rusqlite_migration::Error`, so a snapshot refusal returned from there
+        // would be wrapped in "Failed to run database migrations", the exact
+        // misleading receipt that made the rpi5 corruption unreadable for two
+        // days. Here the message the operator reads is the one that explains the
+        // restore path.
+        //
+        // `snapshot_dir()` is resolved on THIS task and moved into the closure:
+        // `interact` runs its closure on a `spawn_blocking` thread (deadpool-sync
+        // 0.2.0 `Scope::interact`), where the task-local profile-home override is
+        // not set, so resolving it inside would silently write snapshots into the
+        // default profile's home no matter which profile is starting.
+        let snapshot_dir = crate::db::migration_snapshot::snapshot_dir();
+
+        // The snapshot and the preflight exist to protect a write. A database
+        // already at the latest migration, with every heal's precondition
+        // satisfied, has nothing to protect. `VACUUM INTO` of that image is
+        // what fills the disk. The probe opens the file itself: the pool's
+        // post_create hook sets WAL, a write, and on a torn image that fails
+        // before the preflight can tell the operator how to restore.
+        let migration_count = Self::MIGRATION_COUNT as i64;
+        let needs_snapshot = match self.db_path.as_deref() {
+            Some(path) => crate::db::migration_snapshot::needs_pre_migration_snapshot_at(
+                path,
+                migration_count,
+            )?,
+            None => false,
+        };
+
+        // #1779 defect 2: this used to be the check *after* the migrations, so
+        // on a corrupt image it never ran and the operator died on the
+        // migration error with no restore path. It goes first, ahead of the
+        // snapshot guard, because on the rpi5 shape `VACUUM INTO` fails too
+        // (verified: SQLITE_CORRUPT while stepping), so snapshotting a torn
+        // image buys nothing and only spends a write attempt.
+        //
+        // Skipped when there is no file to check (in-memory database), which is
+        // every test that uses `connect_in_memory`. Also skipped when nothing
+        // will write: the preflight opens the file read-write and walks every
+        // page.
+        if needs_snapshot {
+            if let Some(path) = self.db_path.as_deref() {
+                crate::db::migration_snapshot::integrity_preflight(path, &snapshot_dir)?;
+            }
+
+            self.pool
+                .get()
+                .await
+                .context("Failed to get connection for pre-migration snapshot")?
+                .interact(move |conn| crate::db::migration_snapshot::guard(conn, &snapshot_dir))
+                .await
+                .map_err(interact_err)??;
+        }
 
         self.pool
             .get()

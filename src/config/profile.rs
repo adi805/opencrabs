@@ -1340,14 +1340,9 @@ pub fn preempt_other_profile_instances() -> Vec<PreemptedInstance> {
 /// with a literal header line and `-` in the PID column for services that
 /// are loaded but not currently running. We only care about labels under
 /// our prefix, since bootouting anything else would be hostile.
-///
-/// Compiled only where it has a caller: the `#[cfg(target_os = "macos")]`
-/// launchctl probe in `preempt_instances_in`, and its tests. A bare
-/// `--lib` build on Linux (which the fork's Linux `Lint` job runs) has
-/// neither, so an ungated `pub(crate)` here is dead code under
-/// `-D warnings`. Gating to `any(test, macos)` keeps the tests compiling
-/// on Linux while removing the orphaned non-test definition.
-#[cfg(any(test, target_os = "macos"))]
+// Only the macOS-gated launchd path calls this outside tests, so on other
+// unix targets the lib build sees it as dead code. Tests exercise it everywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn parse_launchctl_labels(output: &str) -> Vec<String> {
     const PREFIX: &str = "com.opencrabs.";
     let mut labels = Vec::new();

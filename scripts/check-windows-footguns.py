@@ -37,10 +37,14 @@ Rules
                 is the windows test slice's job, not shipped-code rules.
 
 Suppression
-  // windows-footgun: ok -- <reason>   on the offending line or the line
-  above it. The reason is mandatory; a marker without one is itself a
-  finding (bad-suppression), because an unexplained marker is how a
-  guardrail quietly dies.
+  // windows-footgun: ok -- <reason>   trailing on the offending line, or
+  as a WHOLE comment line directly above it. A marker appended to a line
+  of real code suppresses that line and nothing below it. The reason is
+  mandatory either way: a whole-line marker without one is itself a
+  finding (bad-suppression), and a trailing marker without one is not
+  recognised as a marker at all, so the offense still fires. An
+  unexplained marker cannot quiet the gate, which is the point: that is
+  how a guardrail quietly dies.
 
 Exit codes: 0 clean, 1 findings, 2 bad usage. --self-test runs the
 built-in negative fixtures: a linter that has silently learned to find
@@ -318,6 +322,22 @@ fn maybe_on_windows() { unsafe { libc::kill(1, 2); } }
 fn unix_only() { unsafe { libc::kill(1, 2); } }
 '''
 
+# Suppression span, pinned in both directions. The docstring used to say
+# "on the offending line or the line above it", which is only true for a
+# WHOLE-LINE marker: a trailing marker on a line of real code suppresses
+# that line and nothing below it. Both halves are asserted so neither a
+# widened hatch (an unexplained marker quietly silencing the gate) nor a
+# narrowed one (a valid marker stopping work) can ship untested.
+SELF_SUPPRESS_VALID = r'''
+// windows-footgun: ok -- cmd.exe shim verified present
+fn above() { std::process::Command::new("sh"); }
+fn trailing() { std::process::Command::new("sh"); } // windows-footgun: ok -- shim present
+'''
+SELF_SUPPRESS_NO_SPAN = r'''
+fn line() { let _ = 1; } // windows-footgun: ok -- must not reach the next line
+fn below() { std::process::Command::new("sh"); }
+'''
+
 
 def self_test():
     ok = True
@@ -346,6 +366,17 @@ def self_test():
         gates = collect_declared_file_gates(d)
         if scan_file(d / "gated.rs", set(RULES), gates.get(d / "gated.rs", "")):
             print("self-test FAIL: declared-mod gate not honored", file=sys.stderr)
+            ok = False
+        (d / "sup_ok.rs").write_text(SELF_SUPPRESS_VALID)
+        if scan_file(d / "sup_ok.rs", set(RULES)):
+            print("self-test FAIL: a valid suppression did not suppress",
+                  file=sys.stderr)
+            ok = False
+        (d / "sup_span.rs").write_text(SELF_SUPPRESS_NO_SPAN)
+        spanned = [rule for _, _, rule, _, _ in scan_file(d / "sup_span.rs", set(RULES))]
+        if spanned != ["unix-proc"]:
+            print(f"self-test FAIL: trailing marker leaked downward, gave {spanned}, "
+                  f"expected exactly ['unix-proc']", file=sys.stderr)
             ok = False
     print("self-test " + ("PASS" if ok else "FAIL"), file=sys.stderr)
     return 0 if ok else 1

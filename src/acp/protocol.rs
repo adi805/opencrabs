@@ -19,17 +19,42 @@ pub const INTERNAL_ERROR: i64 = -32603;
 pub const INITIALIZE: &str = "initialize";
 pub const SESSION_NEW: &str = "session/new";
 pub const SESSION_LOAD: &str = "session/load";
+/// Session lifecycle methods from the official v1 schema (#1815 F5). These are
+/// unprefixed on purpose: they are spec names, not extensions, and v1 reserves
+/// every unprefixed name for the protocol itself. `session/set_config_option`
+/// is the official write half of the config-option picker F4 only displayed.
+pub const SESSION_LIST: &str = "session/list";
+pub const SESSION_RESUME: &str = "session/resume";
+pub const SESSION_SET_CONFIG_OPTION: &str = "session/set_config_option";
+pub const SESSION_CLOSE: &str = "session/close";
+pub const SESSION_DELETE: &str = "session/delete";
 pub const SESSION_PROMPT: &str = "session/prompt";
-pub const SESSION_SET_MODEL: &str = "session/set_model";
+/// Custom model selection. Not a v1 or v2 method, and v1 reserves every
+/// unprefixed name for future protocol versions, so the custom request carries
+/// the `_opencrabs/` prefix (#1815 F3).
+pub const SESSION_SET_MODEL: &str = "_opencrabs/set_model";
+/// Pre-prefix spelling, accepted as an alias for one release.
+pub const SESSION_SET_MODEL_LEGACY: &str = "session/set_model";
 /// Runtime mode selection: `plan` denies mutations, `auto-accept-edits`
 /// pre-approves edit-kind tools, `auto`/`full-access` pre-approve everything,
 /// and `supervised` routes approvals to the client.
 pub const SESSION_SET_MODE: &str = "session/set_mode";
 pub const SESSION_CANCEL: &str = "session/cancel";
-pub const SESSION_COMPACT: &str = "session/compact";
+/// Custom manual-compaction request, prefixed for the same reason as
+/// `SESSION_SET_MODEL` (#1815 F3).
+pub const SESSION_COMPACT: &str = "_opencrabs/compact";
+/// Pre-prefix spelling, accepted as an alias for one release.
+pub const SESSION_COMPACT_LEGACY: &str = "session/compact";
 pub const SESSION_STEER: &str = "_session/steer";
 /// Pre-ext-prefix spelling, accepted as an alias for older adapters.
 pub const SESSION_STEER_LEGACY: &str = "session/steer";
+
+/// The custom methods this agent accepts, in canonical form. Advertised in the
+/// `initialize` result under `_meta`, which is the one place the spec lets an
+/// implementation say so without claiming a reserved name (#1815 F3). The
+/// legacy spellings still dispatch but are deliberately not advertised: a new
+/// client should not be pointed at a name we intend to retire.
+pub const EXTENSION_METHODS: &[&str] = &[SESSION_SET_MODEL, SESSION_COMPACT, SESSION_STEER];
 
 // Outbound frames (agent -> client).
 pub const SESSION_UPDATE: &str = "session/update";
@@ -162,11 +187,110 @@ pub fn session_update(session_id: &str, update: Value) -> Value {
     )
 }
 
+/// The result for `session/new` and `session/load`.
+///
+/// `echo_session_id` is what separates them: `NewSessionResponse` requires
+/// `sessionId`, while `LoadSessionResponse` defines only `modes`,
+/// `configOptions` and `_meta`, and an implementation MUST NOT add a root field
+/// to a type the spec owns. Answering a load with the id the client just sent
+/// us is exactly that (#1815 F4).
+///
+/// `models` is passed through untouched and remains a non-schema field. It is
+/// kept on purpose: MonoCode builds its picker from it, so the field is a
+/// documented wart rather than something to drop without warning (#1815 F4).
+pub fn session_response(
+    session_id: &str,
+    models: Value,
+    modes: Value,
+    config_options: Value,
+    echo_session_id: bool,
+) -> Value {
+    let mut response = json!({
+        "models": models,
+        "modes": modes,
+        "configOptions": config_options,
+    });
+    if echo_session_id {
+        response["sessionId"] = Value::from(session_id);
+    }
+    response
+}
+
+/// `plan` session update (`Plan`): the client replaces the ENTIRE plan with
+/// every update, so this is always a complete snapshot and never a delta
+/// (#1815 F6).
+///
+/// `entries` is the only required field; an empty array is legal and means "no
+/// plan", which is how a discarded plan clears the client's card instead of
+/// leaving a stale one on screen.
+pub fn plan_update(entries: Vec<Value>) -> Value {
+    json!({
+        "sessionUpdate": "plan",
+        "entries": entries,
+    })
+}
+
+/// `session/list` result: a `ListSessionsResponse`. `sessions` is the only
+/// required field; `nextCursor` is present exactly when more pages exist
+/// (#1815 F5).
+pub fn list_sessions_payload(sessions: Vec<Value>, next_cursor: Option<String>) -> Value {
+    let mut response = json!({ "sessions": sessions });
+    if let Some(cursor) = next_cursor {
+        response["nextCursor"] = Value::from(cursor);
+    }
+    response
+}
+
+/// One `SessionInfo` entry: `sessionId` and `cwd` are required by v1, `title`
+/// and `updatedAt` are optional and omitted rather than sent as null.
+pub fn session_info(
+    session_id: &str,
+    cwd: &str,
+    title: Option<&str>,
+    updated_at: Option<&str>,
+) -> Value {
+    let mut info = json!({ "sessionId": session_id, "cwd": cwd });
+    if let Some(title) = title {
+        info["title"] = Value::from(title);
+    }
+    if let Some(updated_at) = updated_at {
+        info["updatedAt"] = Value::from(updated_at);
+    }
+    info
+}
+
+/// `session/set_config_option` result: `SetSessionConfigOptionResponse`, whose
+/// only required field is the full `configOptions` set with current values.
+pub fn config_options_response(config_options: Value) -> Value {
+    json!({ "configOptions": config_options })
+}
+
 /// A text `agent_message_chunk` / `agent_thought_chunk` update body.
 pub fn text_chunk(kind: &str, text: &str) -> Value {
     json!({
         "sessionUpdate": kind,
         "content": { "type": "text", "text": text },
+    })
+}
+
+/// `usage_update` body: the context meter.
+///
+/// The shape is pinned to the official v1 schema (`SessionUpdate.oneOf` in
+/// `schema/v1/schema.json`, fetched 2026-10-02, 247168 bytes): the tag is
+/// `usage_update`, and `UsageUpdate` is folded in with `allOf`, so `used` and
+/// `size` are FLAT siblings of `sessionUpdate`, both required, both `uint64`
+/// with `minimum: 0`. The frame this replaced,
+/// `{"sessionUpdate":"usage","usage":{...}}`, exists in no schema version: a
+/// client generated from the schema sees an unknown tagged variant and drops
+/// the notification, which means the meter never moves (#1815 F1).
+///
+/// `cost` is optional upstream and this path has no per-session money total,
+/// so it stays absent rather than being guessed at.
+pub fn usage_update(used: u64, size: u64) -> Value {
+    json!({
+        "sessionUpdate": "usage_update",
+        "used": used,
+        "size": size,
     })
 }
 
@@ -229,17 +353,41 @@ pub fn replay_usage(messages: &[crate::db::models::Message]) -> Option<i64> {
 pub fn initialize_result() -> Value {
     json!({
         "protocolVersion": 1,
+        "authMethods": [],
         "agentCapabilities": {
             // Honest capability: session/load binds an existing session AND
             // replays the stored transcript as session/update notifications
             // before answering, so clients without their own transcript
             // store (Zed et al.) render history on resume.
             "loadSession": true,
+            // #1815 F5: the four lifecycle capabilities v1 gates behind
+            // `sessionCapabilities`. Each is an empty object meaning "supported"
+            // (`{}` is the whole advertisement; there are no fields to set).
+            // `additionalDirectories` is deliberately absent: this server accepts
+            // and ignores the field on new/load/resume, so advertising it would
+            // promise a workspace behavior we do not implement.
+            //
+            // `session/set_config_option` has no capability bit at all -- it is
+            // implied by sending `configOptions` in the session/new response,
+            // which F4 already does.
+            "sessionCapabilities": {
+                "list": {},
+                "resume": {},
+                "close": {},
+                "delete": {},
+            },
             "promptCapabilities": { "text": true, "image": false, "embeddedContext": false },
         },
         "agentInfo": {
             "name": "opencrabs",
             "version": env!("CARGO_PKG_VERSION"),
+        },
+        // Custom methods live in `_meta`, never in reserved root names: the
+        // extensibility rule is that a custom request must start with an
+        // underscore, and implementations MUST NOT add custom fields at the
+        // root of a spec type (#1815 F3).
+        "_meta": {
+            "extensions": EXTENSION_METHODS,
         },
     })
 }

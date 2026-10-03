@@ -554,6 +554,21 @@ pub fn key_matches(event: &KeyEvent, code: KeyCode, modifiers: KeyModifiers) -> 
 pub mod keys {
     use super::*;
 
+    /// Ctrl+V or Cmd+V: paste from the OS clipboard. Kitty-protocol
+    /// terminals that pass Cmd+V through report it as SUPER (#1812).
+    pub fn is_clipboard_paste(event: &KeyEvent) -> bool {
+        matches!(event.code, KeyCode::Char('v') | KeyCode::Char('V'))
+            && (event.modifiers == KeyModifiers::CONTROL || event.modifiers == KeyModifiers::SUPER)
+    }
+
+    /// Whether a character key held with `modifiers` types its character.
+    /// Ctrl chords are commands except AltGr (reported as Ctrl+Alt), which
+    /// composes characters. Cmd (SUPER) chords never type text (#1812).
+    pub fn types_character(modifiers: KeyModifiers) -> bool {
+        !modifiers.contains(KeyModifiers::SUPER)
+            && (!modifiers.contains(KeyModifiers::CONTROL) || modifiers.contains(KeyModifiers::ALT))
+    }
+
     /// Ctrl+C - Quit
     pub fn is_quit(event: &KeyEvent) -> bool {
         key_matches(event, KeyCode::Char('c'), KeyModifiers::CONTROL)

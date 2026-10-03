@@ -814,7 +814,7 @@ impl TelegramConfig {
 }
 
 /// Discord channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscordConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -850,8 +850,10 @@ pub struct DiscordConfig {
     /// Fold intermediate narration (the text a model writes between tool
     /// calls) into the turn's tool-group bubble as dim subtext lines instead
     /// of posting each as a separate message — one editable "work log" per
-    /// turn (agent-disco-style live trace). Default: false.
-    #[serde(default)]
+    /// turn (agent-disco-style live trace). Default: true (#1871); set
+    /// `trace_narration = false` to post each intermediate as its own
+    /// message.
+    #[serde(default = "default_true")]
     pub trace_narration: bool,
     /// Post answers longer than this many characters as a short teaser in
     /// the channel plus an anchored thread carrying the full body. 0
@@ -865,6 +867,25 @@ pub struct DiscordConfig {
     /// Default: false.
     #[serde(default)]
     pub bang_new_thread: bool,
+}
+
+impl Default for DiscordConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token: None,
+            allowed_users: Vec::new(),
+            allowed_channels: Vec::new(),
+            allowed_roles: Vec::new(),
+            component_ttl_hours: default_component_ttl_hours(),
+            respond_to: RespondTo::default(),
+            session_idle_hours: None,
+            bot_owner: Vec::new(),
+            trace_narration: default_true(),
+            auto_thread_min_chars: 0,
+            bang_new_thread: false,
+        }
+    }
 }
 
 impl DiscordConfig {
@@ -1636,6 +1657,18 @@ pub struct AgentConfig {
     /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_max_turns: Option<u32>,
+
+    /// Kill switch for the session_notify family (issue #1802, owner order).
+    /// Default OFF: an unprompted channel into another session's context
+    /// breaks session isolation, so cross-session notification must be an
+    /// explicit operator opt-in. When false, the session_notify tool refuses
+    /// every action, the A2A `session/notify` method refuses, and
+    /// `opencrabs session notify` exits 4. Cross-session "notify" belongs to
+    /// the channel send tools (telegram_send / slack_send) under explicit
+    /// user request; opt in only for deliberate machine tooling fan-out.
+    /// Post-mortem: issue #1203 / PR #1207.
+    #[serde(default)]
+    pub session_notify_enabled: bool,
 }
 
 impl AgentConfig {
@@ -1751,6 +1784,7 @@ impl Default for AgentConfig {
             plan_worker_allow_write: false,
             auto_update: default_auto_update(),
             evolve_allow_root: default_evolve_allow_root(),
+            session_notify_enabled: false,
             subagent_session_ttl_days: default_subagent_session_ttl_days(),
             self_improvement_provider: None,
             rsi_enabled: None,
@@ -1920,8 +1954,11 @@ pub struct EmbeddingConfig {
 /// Controls whether vector embeddings are enabled for semantic memory search.
 /// When disabled, only FTS5 (keyword) search is used.
 ///
-/// Automatically set to `vector_enabled = false` when running on a VPS or
-/// system with < 2GB RAM.
+/// OFF by default (#1798): the native GGUF/llama.cpp engine hard-aborts on
+/// VPS and Windows hosts mid-index (exit 0xC0000409), taking the daemon down
+/// with it. Local embeddings still run well on Apple Silicon and most Linux
+/// desktops, so they are a deliberate opt-in here; startup VPS detection also
+/// writes an explicit `vector_enabled = false` on cloud hosts as a safety net.
 ///
 /// When `vector_enabled = true`, embeddings can be generated either:
 /// - **Locally**: via embeddinggemma-300M GGUF model (default, no config needed)
@@ -1938,7 +1975,8 @@ pub struct EmbeddingConfig {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
-    /// Whether vector embeddings are enabled (default: true on desktop, false on VPS)
+    /// Whether vector embeddings are enabled (default: false; opt in with
+    /// `vector_enabled = true`, see #1798)
     #[serde(default = "default_vector_enabled")]
     pub vector_enabled: bool,
 
@@ -2043,8 +2081,15 @@ fn default_external_excludes() -> Vec<String> {
     ]
 }
 
+/// #1798: vector embeddings are OFF by default on every platform.
+///
+/// The native GGUF/llama.cpp engine aborts (0xC0000409) mid-index on
+/// VPS and Windows hosts and used to take the daemon down with it; that
+/// crash is deliberate won't-fix territory, so local embeddings are now an
+/// explicit opt-in (`vector_enabled = true`), which still runs well on
+/// Apple Silicon and capable Linux desktops.
 const fn default_vector_enabled() -> bool {
-    true
+    false
 }
 
 const fn default_backfill_interval_secs() -> u64 {

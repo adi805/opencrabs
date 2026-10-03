@@ -27,6 +27,22 @@ const STICKY_FALLBACK_THRESHOLD: u32 = 4;
 /// Default interval in seconds between mid-turn intra-loop time markers (#153).
 pub const DEFAULT_TIME_MARKER_INTERVAL_SECS: u64 = 900;
 
+/// Self-healing alert texts that reach channel posts verbatim (#1745
+/// follow-up): user-facing, so they carry no em dashes. The renderer arms
+/// normalize dashes anyway; `em_dash_guard_test` pins these constants.
+pub(crate) const PHANTOM_RETRY_ENFORCEMENT_ALERT: &str =
+    "Phantom tool calls detected: retrying with enforcement";
+pub(crate) const SELF_HEAL_BUDGET_ROLLED_ALERT: &str =
+    "Self-heal retry budget rolled: forcing another retry";
+pub(crate) const SELF_HEAL_EXHAUSTED_ALERT: &str =
+    "Self-heal exhausted: the model kept narrating without calling tools; ending the turn.";
+pub(crate) const ACCOUNT_ROTATION_ALERT: &str =
+    "Account rotation mid-task: retrying with continuation context";
+pub(crate) const CONTINUATION_EMPTY_ALERT: &str =
+    "Continuation added nothing: retrying with an anchored prompt";
+pub(crate) const EMPTY_ANSWER_ANALYSIS_ALERT: &str =
+    "Empty answer after data fetch: nudging the model to write the analysis";
+
 /// Check whether the intra-turn elapsed time warrants injecting a new time notice (#153).
 /// Returns `Some((notice_string, now))` if the interval has passed, or `None`.
 pub(crate) fn check_intra_turn_time_marker(
@@ -822,6 +838,24 @@ impl AgentService {
         has_progress_override: bool,
         progress_callback: Option<ProgressCallback>,
     ) -> Result<AgentResponse> {
+        // Restore the directory `/cd` persisted for this session BEFORE anything
+        // else in this function (#1810). Everything below (context build, brain
+        // assembly, tool-context creation) resolves the session's cwd, and a
+        // touch before this restore would create the handle from the launch
+        // directory of the process hosting the channels, leaving the DB row
+        // ignored forever. See `restore_persisted_working_directory`.
+        self.restore_persisted_working_directory(session_id).await;
+
+        // #1776 seam 3: a fresh turn invalidates the claude-task turn
+        // markers. Notifications arriving this turn for tasks NOT started
+        // this turn are post-exit survivors and get delivered synthetically;
+        // tasks started this turn stay silent (claude sees those natively).
+        // retain, not remove: other sessions' in-flight turns keep theirs.
+        self.claude_turn_tasks
+            .lock()
+            .expect("claude turn-task lock")
+            .retain(|(sid, _)| *sid != session_id);
+
         // Snapshot the manual-switch epoch at turn start. If the user
         // switches provider/model while this turn is in flight, an automatic
         // fallback the turn takes could otherwise stick over their pick. We
@@ -1428,36 +1462,6 @@ impl AgentService {
             context.add_message(Message::user(cont_text));
         }
 
-        // Restore the directory `/cd` persisted for this session before the
-        // handle is created, otherwise the lazy seed hands a channel chat the
-        // directory the process was launched in and the DB row is ignored
-        // forever. Only the first turn of a session in this process can hit
-        // this: once the handle exists, a `cd` made since then wins.
-        if self.session_working_dir_unset(session_id) {
-            let persisted = crate::services::SessionService::new(self.context.clone())
-                .get_session(session_id)
-                .await;
-            match persisted {
-                Ok(Some(session)) => {
-                    if let Some(dir) =
-                        super::session_cwd::restorable_cwd(session.working_directory.as_deref())
-                    {
-                        tracing::info!(
-                            "Restored session {} working directory: {}",
-                            session_id,
-                            dir.display()
-                        );
-                        self.set_session_only_working_directory(session_id, dir);
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "failed to load session {session_id} for working-directory restore"
-                ),
-            }
-        }
-
         // Create tool execution context. The working directory is per-session
         // (#703): resolve THIS session's own handle so a `cd` here mutates only
         // this session's cwd, and a concurrent session's `cd` can never move it.
@@ -1488,6 +1492,11 @@ impl AgentService {
         // Vision resolves the CURRENT provider first (#1318); a tool cannot
         // ask AgentService for it, and this loop has both.
         tool_context.session_provider = Some(self.provider_name_for_session(session_id));
+        // #1802: the session_notify kill switch rides the same single
+        // stamping site; the mirror reads [agent] session_notify_enabled.
+        tool_context.session_notify_enabled = crate::config::Config::current()
+            .agent
+            .session_notify_enabled;
         // Ambient conversation origin (#148): derived HERE — the single
         // stamping site, mirroring `session_provider` directly above — from
         // the session ownership maps via the channel manager. `None` on
@@ -4868,36 +4877,38 @@ impl AgentService {
                 };
                 if let Some(queued_msg) = queued_msg {
                     tracing::info!("Injecting queued user message (from_buf={})", from_buf);
-                    // Emit assistant's intermediate text FIRST so it appears
-                    // before the queued user message in the TUI
+                    // #1784: the draft this round finished is NOT relayed. On a
+                    // text-only round `iteration_text` is the complete answer to
+                    // the PREVIOUS request, and a deliverable `IntermediateText`
+                    // lands in the channel as a regular message, so the user got
+                    // the superseded draft and then the folded final: two replies
+                    // for one burst. The text still goes into the model's context
+                    // below, so nothing is lost, and the next round produces the
+                    // single final reply.
+                    //
+                    // The Kimi-coding reroute (#616) stays. On that endpoint this
+                    // text is reasoning, and an event with an empty `text` is not
+                    // deliverable by any channel: it renders in the reasoning pane
+                    // and the draft stays visible where it does no harm.
                     if !iteration_text.is_empty()
                         && let Some(ref cb) = progress_callback
+                        && crate::brain::provider::kimi_reasoning::streams_reasoning_inline(
+                            self.provider_for_session(session_id).base_url(),
+                        )
                     {
-                        // Same Kimi-coding inline-reasoning reroute as the
-                        // pre-tool site (#616): this mid-turn text is reasoning,
-                        // not a chat message, on that endpoint.
-                        let reasoning_inline =
-                            crate::brain::provider::kimi_reasoning::streams_reasoning_inline(
-                                self.provider_for_session(session_id).base_url(),
-                            );
-                        let event = if reasoning_inline {
-                            let combined = match reasoning_text.as_deref() {
-                                Some(r) if !r.trim().is_empty() => {
-                                    format!("{r}\n{iteration_text}")
-                                }
-                                _ => iteration_text.clone(),
-                            };
+                        let combined = match reasoning_text.as_deref() {
+                            Some(r) if !r.trim().is_empty() => {
+                                format!("{r}\n{iteration_text}")
+                            }
+                            _ => iteration_text.clone(),
+                        };
+                        cb(
+                            session_id,
                             ProgressEvent::IntermediateText {
                                 text: String::new(),
                                 reasoning: Some(combined),
-                            }
-                        } else {
-                            ProgressEvent::IntermediateText {
-                                text: iteration_text,
-                                reasoning: reasoning_text,
-                            }
-                        };
-                        cb(session_id, event);
+                            },
+                        );
                     }
                     // Emit QueuedUserMessage — always here, never in stream_complete
                     if let Some(ref cb) = progress_callback {
@@ -4918,8 +4929,15 @@ impl AgentService {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
+                    let had_draft = !assistant_text.trim().is_empty();
                     context.add_message(Message::assistant(assistant_text));
-                    let injected = Message::user(queued_msg.context_text.clone());
+                    // #1784: say out loud that the draft above was never sent, so
+                    // the model writes one complete final reply instead of a delta
+                    // pointing at an answer nobody received.
+                    let injected = Message::user(super::queued_fold::injected_context(
+                        had_draft,
+                        &queued_msg.context_text,
+                    ));
                     context.add_message(injected);
                     if let Err(e) = message_service
                         .create_message(session_id, "user".to_string(), queued_msg.display_text)
@@ -5322,8 +5340,7 @@ impl AgentService {
                         cb(
                             session_id,
                             ProgressEvent::SelfHealingAlert {
-                                message: "Phantom tool calls detected — retrying with enforcement"
-                                    .into(),
+                                message: PHANTOM_RETRY_ENFORCEMENT_ALERT.into(),
                             },
                         );
                     }
@@ -5396,9 +5413,7 @@ impl AgentService {
                             cb(
                                 session_id,
                                 ProgressEvent::SelfHealingAlert {
-                                    message:
-                                        "Self-heal retry budget rolled — forcing another retry"
-                                            .to_string(),
+                                    message: SELF_HEAL_BUDGET_ROLLED_ALERT.to_string(),
                                 },
                             );
                         }
@@ -5428,9 +5443,7 @@ impl AgentService {
                         cb(
                             session_id,
                             ProgressEvent::SelfHealingAlert {
-                                message: "Self-heal exhausted — the model kept narrating without \
-                                          calling tools; ending the turn."
-                                    .to_string(),
+                                message: SELF_HEAL_EXHAUSTED_ALERT.to_string(),
                             },
                         );
                     }
@@ -5496,9 +5509,7 @@ impl AgentService {
                         cb(
                             session_id,
                             ProgressEvent::SelfHealingAlert {
-                                message:
-                                    "Account rotation mid-task — retrying with continuation context"
-                                        .into(),
+                                message: ACCOUNT_ROTATION_ALERT.into(),
                             },
                         );
                     }
@@ -5991,9 +6002,7 @@ impl AgentService {
                         cb(
                             session_id,
                             ProgressEvent::SelfHealingAlert {
-                                message: "Continuation added nothing — retrying with an \
-                                          anchored prompt"
-                                    .into(),
+                                message: CONTINUATION_EMPTY_ALERT.into(),
                             },
                         );
                     }
@@ -6148,8 +6157,7 @@ impl AgentService {
                             cb(
                                 session_id,
                                 ProgressEvent::SelfHealingAlert {
-                                    message: "Empty answer after data fetch — nudging the model to write the analysis"
-                                        .to_string(),
+                                    message: EMPTY_ANSWER_ANALYSIS_ALERT.to_string(),
                                 },
                             );
                         }
@@ -8161,6 +8169,24 @@ impl AgentService {
                 && let Err(e) = crate::utils::plan_files::archive_plan(session_id).await
             {
                 tracing::warn!("Failed to archive completed plan at turn settle: {e}");
+            }
+        }
+
+        // Channel-safe suggest_options recovery (#1774): a model that fails
+        // to emit the structured call sometimes writes it as TEXT —
+        // <<suggest_options>> markers around a JSON options array (see
+        // utils::directives). Recover at the settle point: strip the block
+        // from the delivered text and fire the real SuggestedOptions event
+        // so every surface renders native buttons. An unparseable block
+        // still loses its markers: raw markers and raw JSON never ship.
+        if let Some(cb) = self.progress_callback.as_ref() {
+            let (cleaned, recovered) =
+                crate::utils::directives::extract_leaked_suggestions(&final_text);
+            if cleaned != final_text {
+                final_text = cleaned;
+            }
+            if let Some(items) = recovered {
+                cb(session_id, ProgressEvent::SuggestedOptions(items));
             }
         }
 

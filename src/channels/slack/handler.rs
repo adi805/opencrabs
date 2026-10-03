@@ -74,12 +74,16 @@ pub async fn on_interaction(
                         && let Some(text) = state.slack_state.take_pending_followup(sid, idx).await
                         && let Some(ref channel) = block_actions.channel
                     {
-                        let agent_clone = state.agent.clone();
-                        let bot_token = state.current_bot_token();
+                        // #1838: route the tapped suggestion through the same
+                        // tool-loop display path `handle_message` runs, so the
+                        // turn is visible from the second the tap works.
+                        let handler_clone = state.clone();
                         let channel_id_clone = channel.id.clone();
                         let client_clone = client.clone();
                         tokio::spawn(async move {
-                            let token = SlackApiToken::new(SlackApiTokenValue::from(bot_token));
+                            let token = SlackApiToken::new(SlackApiTokenValue::from(
+                                handler_clone.current_bot_token(),
+                            ));
                             let session = client_clone.open_session(&token);
                             // Echo the pick.
                             let echo = SlackApiChatPostMessageRequest::new(
@@ -90,22 +94,14 @@ pub async fn on_interaction(
                             if let Err(e) = session.chat_post_message(&echo).await {
                                 tracing::warn!(error = %e, "failed to post Slack message");
                             }
-                            match agent_clone.send_message(sid, text, None).await {
-                                Ok(r) => {
-                                    let clean =
-                                        crate::utils::sanitize::strip_llm_artifacts(&r.content);
-                                    let request = SlackApiChatPostMessageRequest::new(
-                                        channel_id_clone,
-                                        SlackMessageContent::new().with_text(clean),
-                                    );
-                                    if let Err(e) = session.chat_post_message(&request).await {
-                                        tracing::warn!(error = %e, "failed to post Slack message");
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!("Slack follow-up tap turn failed: {e}")
-                                }
-                            }
+                            run_followup_turn(
+                                handler_clone,
+                                client_clone,
+                                sid,
+                                channel_id_clone.to_string(),
+                                text,
+                            )
+                            .await;
                         });
                     }
                     continue;
@@ -624,14 +620,6 @@ pub(crate) fn handler_state() -> Option<Arc<HandlerState>> {
     HANDLER_STATE.get().cloned()
 }
 
-/// Append the ctx budget footer to an already-posted completion message via
-/// chat.update (#459): the footer belongs ON the completion, display-only,
-/// exactly like Telegram — never as its own message below it. The message is
-/// rebuilt as Block Kit sections plus the small grey context-block footer
-/// (#455/#457), retroactively enriching the kept intermediate. If the blocks
-/// update is rejected, a plain-text update with the footer appended retries;
-/// if that fails too, the footer is dropped with a warn — a standalone
-/// footer post is never an option.
 /// Render the turn's step group into Slack, creating the message on the first
 /// step and updating it on every one after.
 ///
@@ -639,6 +627,72 @@ pub(crate) fn handler_state() -> Option<Arc<HandlerState>> {
 /// block as the tools it sits between (#943). Narration used to take a separate
 /// `chat_post_message` path, which put the agent's thinking in the channel as
 /// an ordinary message.
+/// Re-render throttle for the live flow group (#1807): the `🕒` clock must
+/// roll between tool events like Telegram's 1500 ms edit loop, but Slack
+/// `chat.update` is rate-limited, so the tick is 4 s. One ticker per turn,
+/// spawned where the turn's group-ts slot is created: it idles until the
+/// first step posts the group, re-renders each tick, and stops when the
+/// group settles (settle keeps the last word via the race fixup below),
+/// when retention prunes it, or at the 30 min safety cap.
+const FLOW_TICKER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(4);
+const FLOW_TICKER_CAP: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+fn spawn_flow_ticker(
+    client: Arc<SlackHyperClient>,
+    slack_state: Arc<SlackState>,
+    group_ts: Arc<Mutex<Option<SlackTs>>>,
+) {
+    tokio::spawn(async move {
+        let born = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(FLOW_TICKER_INTERVAL).await;
+            if born.elapsed() > FLOW_TICKER_CAP {
+                break;
+            }
+            let Some(ts) = group_ts.lock().await.clone() else {
+                // Group not born yet: the turn has not reached its first
+                // step. Keep waiting.
+                continue;
+            };
+            let Some(group) = slack_state.tool_group_snapshot(ts.as_ref()).await else {
+                break; // pruned by retention mid-turn
+            };
+            if group.settled.is_some() {
+                break; // settle already posted the final line
+            }
+            let content = super::tool_group::render(&group, &ts);
+            let token = SlackApiToken::new(SlackApiTokenValue::from(
+                slack_state
+                    .bot_token
+                    .lock()
+                    .await
+                    .clone()
+                    .unwrap_or_default(),
+            ));
+            let session = client.open_session(&token);
+            let upd = SlackApiChatUpdateRequest::new(group.channel.clone(), content, ts.clone());
+            if let Err(e) = session.chat_update(&upd).await {
+                tracing::warn!("Slack: flow ticker chat_update failed (ts={ts}): {e}");
+            }
+            // Race guard: settle may have stamped and posted while this
+            // tick's update was in flight. The settled line must be last,
+            // so if the group settled behind us, re-render its content once.
+            match slack_state.tool_group_snapshot(ts.as_ref()).await {
+                Some(re) if re.settled.is_some() => {
+                    let content = super::tool_group::render(&re, &ts);
+                    let upd = SlackApiChatUpdateRequest::new(re.channel, content, ts);
+                    if let Err(e) = session.chat_update(&upd).await {
+                        tracing::warn!("Slack: flow ticker settle fixup failed: {e}");
+                    }
+                    break;
+                }
+                Some(_) => {}  // still live: keep ticking
+                None => break, // pruned mid-tick
+            }
+        }
+    });
+}
+
 async fn sync_step_group<'a>(
     session: &SlackClientSession<'a, slack_morphism::hyper_tokio::SlackClientHyperHttpsConnector>,
     slack_state: &Arc<SlackState>,
@@ -652,14 +706,7 @@ async fn sync_step_group<'a>(
     match gts.as_ref() {
         Some(ts) => {
             let group = slack_state
-                .upsert_tool_group(
-                    ts.to_string(),
-                    GroupState {
-                        channel: channel.clone(),
-                        entries,
-                        expanded: false,
-                    },
-                )
+                .upsert_tool_group(ts.to_string(), GroupState::new(channel.clone(), entries))
                 .await;
             let content = super::tool_group::render(&group, ts);
             let upd = SlackApiChatUpdateRequest::new(channel, content, ts.clone());
@@ -670,11 +717,7 @@ async fn sync_step_group<'a>(
         None => {
             // First step: post with a placeholder ts in the button id, then
             // re-render with the real ts.
-            let group = GroupState {
-                channel: channel.clone(),
-                entries,
-                expanded: false,
-            };
+            let group = GroupState::new(channel.clone(), entries);
             let content = super::tool_group::render(&group, &SlackTs::new("0".into()));
             let mut req = SlackApiChatPostMessageRequest::new(channel.clone(), content);
             if let Some(ref ts) = thread_ts {
@@ -698,22 +741,20 @@ async fn sync_step_group<'a>(
     }
 }
 
-/// Post a reply with the context footer attached, as its own message.
+/// Post the salvaged answer as its own message.
 ///
-/// The salvage path for a turn whose final response is empty: there is no
-/// earlier message to edit the footer into, so it goes out with the text.
+/// The salvage path for a turn whose final response is empty: the folded
+/// narration is the only answer there is, promoted out of the step group
+/// (#1805). Clean prose: the ctx budget lives on the settled line only
+/// (#1806).
 async fn post_final_text<'a>(
     session: &SlackClientSession<'a, slack_morphism::hyper_tokio::SlackClientHyperHttpsConnector>,
     channel_id: &str,
     thread_ts: Option<&SlackTs>,
     text: &str,
-    footer: &str,
 ) {
     let mrkdwn = crate::utils::slack_fmt::markdown_to_mrkdwn(text);
-    let mut blocks = super::blocks::blocks_from_mrkdwn(&mrkdwn);
-    if !footer.is_empty() {
-        blocks.push(super::blocks::context_footer(footer));
-    }
+    let blocks = super::blocks::blocks_from_mrkdwn(&mrkdwn);
     let mut req = SlackApiChatPostMessageRequest::new(
         SlackChannelId::new(channel_id.to_string()),
         SlackMessageContent::new()
@@ -729,36 +770,105 @@ async fn post_final_text<'a>(
     }
 }
 
-async fn append_footer_via_update<'a>(
+/// Settle the turn's step group (#1797): stamp the delivery outcome (or the
+/// background-wait state) onto the group and re-render its message once the
+/// answer is out. The Slack mirror of Telegram's settled flow header, and
+/// since #1806 the turn's ONLY ctx-budget carrier: answer messages are clean
+/// prose. A no-op when the turn never opened a group (plain
+/// tool-less replies). A Finished turn that ends with detached background
+/// tasks settles into the waiting state instead; the flip back to Finished
+/// happens at the channel's next inbound event (see `flip_waiting_group`),
+/// because a completion IS such an event.
+#[allow(clippy::too_many_arguments)]
+async fn settle_step_group<'a>(
     session: &SlackClientSession<'a, slack_morphism::hyper_tokio::SlackClientHyperHttpsConnector>,
+    slack_state: &Arc<SlackState>,
+    agent: &crate::brain::agent::AgentService,
+    session_id: Uuid,
+    channel: SlackChannelId,
     channel_id: &str,
-    ts: &SlackTs,
-    text: &str,
-    footer: &str,
+    group_ts: &Arc<Mutex<Option<SlackTs>>>,
+    outcome: super::tool_group::TurnOutcome,
+    ctx_footer: &str,
 ) {
-    if footer.is_empty() {
+    let Some(ts) = group_ts.lock().await.clone() else {
         return;
+    };
+    let bg = agent
+        .background_manager()
+        .map(|bm| bm.running_tasks(session_id).len())
+        .unwrap_or(0);
+    let ctx = (!ctx_footer.is_empty()).then(|| ctx_footer.to_string());
+    let Some(group) = slack_state
+        .settle_tool_group(ts.as_ref(), outcome, bg, ctx)
+        .await
+    else {
+        return;
+    };
+    let content = super::tool_group::render(&group, &ts);
+    let upd = SlackApiChatUpdateRequest::new(channel, content, ts.clone());
+    if let Err(e) = session.chat_update(&upd).await {
+        tracing::warn!("Slack: chat_update failed (step group settle, ts={ts}): {e}");
     }
-    let plain_text = format!("{text}\n\n{footer}");
-    let mut blocks = super::blocks::blocks_from_mrkdwn(text);
-    blocks.push(super::blocks::context_footer(footer));
+    if group.settled.as_ref().is_some_and(|s| s.waiting) {
+        slack_state
+            .note_waiting_group(channel_id.to_string(), ts.to_string(), session_id)
+            .await;
+    }
+}
+
+/// Flip a background-waiting step group to its terminal line (#1797).
+///
+/// A group that settled while detached tasks were still running reads
+/// "⏳ Waiting for N background tasks" with a rolling clock. A completion is
+/// delivered as the channel's next inbound turn, so this runs at the top of
+/// handle_message: recount the session's tasks — zero flips the line to
+/// `✅ Finished · N tool calls · ctx · ⏱️`, anything else refreshes the
+/// count and stays waiting. The ctx string is the one captured at first
+/// settle, so the budget never changes under the user. Cheap no-op when
+/// nothing on this channel is waiting.
+async fn flip_waiting_group(
+    client: &Arc<SlackHyperClient>,
+    state: &Arc<HandlerState>,
+    channel_id: &str,
+) {
+    let Some((ts, session_id)) = state.slack_state.take_waiting_group_for(channel_id).await else {
+        return;
+    };
+    let bg = state
+        .agent
+        .background_manager()
+        .map(|bm| bm.running_tasks(session_id).len())
+        .unwrap_or(0);
+    let token = SlackApiToken::new(SlackApiTokenValue::from(state.current_bot_token()));
+    let session = client.open_session(&token);
+    let Some(group) = state
+        .slack_state
+        .settle_tool_group(
+            &ts,
+            super::tool_group::TurnOutcome::Finished,
+            bg,
+            None, // keep the ctx stamped at first settle
+        )
+        .await
+    else {
+        // Aged out of retention: nothing left to flip.
+        return;
+    };
+    let content = super::tool_group::render(&group, &SlackTs::new(ts.clone()));
     let upd = SlackApiChatUpdateRequest::new(
         SlackChannelId::new(channel_id.to_string()),
-        SlackMessageContent::new()
-            .with_text(plain_text.clone())
-            .with_blocks(blocks),
-        ts.clone(),
+        content,
+        SlackTs::new(ts.clone()),
     );
     if let Err(e) = session.chat_update(&upd).await {
-        tracing::warn!("Slack: footer blocks update failed ({e}) — retrying as plain text");
-        let plain = SlackApiChatUpdateRequest::new(
-            SlackChannelId::new(channel_id.to_string()),
-            SlackMessageContent::new().with_text(plain_text),
-            ts.clone(),
-        );
-        if let Err(e) = session.chat_update(&plain).await {
-            tracing::warn!("Slack: ctx footer update failed, footer dropped: {e}");
-        }
+        tracing::warn!("Slack: chat_update failed (waiting-group flip, ts={ts}): {e}");
+    }
+    if group.settled.as_ref().is_some_and(|s| s.waiting) {
+        state
+            .slack_state
+            .note_waiting_group(channel_id.to_string(), ts, session_id)
+            .await;
     }
 }
 
@@ -801,6 +911,11 @@ async fn handle_message(
             return;
         }
     };
+
+    // A previous turn on this channel may have settled with detached
+    // background tasks still running; its step group is waiting on this flip
+    // (#1797). No-op when nothing is waiting.
+    flip_waiting_group(&client, &state, &channel_id).await;
 
     // Resolve user display name via Slack API (cached per conversation turn)
     let user_name = {
@@ -1676,53 +1791,38 @@ async fn handle_message(
         .store_cancel_token(session_id, cancel_token.clone())
         .await;
 
-    // Post a "thinking" placeholder so the user knows we're processing
-    let thinking_ts: Arc<Mutex<Option<SlackTs>>> = Arc::new(Mutex::new(None));
+    let turn_group_ts: Arc<Mutex<Option<SlackTs>>> = Arc::new(Mutex::new(None));
+    let turn_group_ts_final = turn_group_ts.clone();
+    // Open the flow group at turn start (#1808): the counter and the 🕒
+    // clock must cover the thinking latency too, not start at the first
+    // tool call. The old static placeholder is gone, the
+    // live group with its rolling clock IS the processing feedback.
     {
         let token = SlackApiToken::new(SlackApiTokenValue::from(state.current_bot_token()));
         let session = client.open_session(&token);
-        let mut req = SlackApiChatPostMessageRequest::new(
+        sync_step_group(
+            &session,
+            &state.slack_state,
             SlackChannelId::new(channel_id.clone()),
-            SlackMessageContent::new().with_text("_thinking..._".to_string()),
-        );
-        if let Some(ref ts) = thread_ts {
-            req = req.with_thread_ts(ts.clone());
-        }
-        if let Ok(resp) = session.chat_post_message(&req).await {
-            *thinking_ts.lock().await = Some(resp.ts);
-        }
+            thread_ts.clone(),
+            &turn_group_ts,
+            Vec::new(),
+        )
+        .await;
     }
-
-    // Track sent intermediate message timestamps so we can delete them before
-    // sending the final response (prevents duplicate content on Slack).
-    // Per-turn record of intermediate posts: (slack_ts, content_hash). Both
-    // are needed at final-response time:
-    //   * `slack_ts` to delete the intermediate from the channel.
-    //   * `content_hash` to detect when the final's body matches an
-    //     intermediate verbatim — in which case the intermediate IS the
-    //     answer and we keep it instead of delete+repost.
-    // Per-TURN scope, not global. Earlier I used `state.seen_responses` (a
-    // 5-minute window keyed by channel + hash on HandlerState) and it
-    // suppressed legitimate final posts whenever the same body recurred
-    // across separate user prompts — observed at 01:18 / 01:32 / 01:39+
-    // today, same hash dropping five different turns. The eviction window
-    // doesn't matter when the hash gets re-inserted on every turn that
-    // happens to produce the same answer; the only correct scope is one
-    // turn.
-    // (ts, content hash, posted mrkdwn text). The text rides along so the
-    // footer paths can rebuild the message for a chat.update (#459).
-    let sent_intermediate_ts: Arc<Mutex<Vec<(SlackTs, u64, String)>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let sent_intermediate_ts_final = sent_intermediate_ts.clone();
+    // Roll the flow clock between tool events (#1807): one ticker per turn,
+    // self-stopping on settle so it never outlives the group.
+    spawn_flow_ticker(
+        client.clone(),
+        state.slack_state.clone(),
+        turn_group_ts.clone(),
+    );
 
     // Track every IntermediateText `tokio::spawn` handle so the
-    // final-response branch can await ALL of them before reading the
-    // `sent_intermediate_ts` list. Without this, the spawn-then-push race
-    // produced visible duplicates: stream emits IntermediateText, spawn
-    // fires `chat_post_message` + push (~200-500ms), stream ends, final
-    // handler reads list while it's still empty, classifies the
-    // intermediate as not-yet-posted, and posts the same body a second
-    // time. Sync `std::sync::Mutex` because the progress callback closure
+    // final-response branch can await ALL of them before settling, so the
+    // step group is fully updated before the answer lands. Narration folds
+    // into the group (#943), nothing posts standalone. Sync
+    // `std::sync::Mutex` because the progress callback closure
     // is synchronous and we only ever drain (no contention across
     // .await).
     let intermediate_handles: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
@@ -1737,6 +1837,11 @@ async fn handle_message(
     let steps: Arc<Mutex<Vec<super::tool_group::GroupEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let steps_final = steps.clone();
 
+    // ts of the turn's step-group message, shared by the progress callbacks
+    // and the delivery tail: the settle pass (#1797) stamps the group only
+    // after the answer is out, and it reaches the same ts the callbacks
+    // posted.
+
     // Build progress callback — sends tool call status as Slack messages
     #[allow(clippy::type_complexity)]
     let progress_cb: crate::brain::agent::ProgressCallback = {
@@ -1746,11 +1851,10 @@ async fn handle_message(
 
         let tools = steps;
         // ts of the single grouped tool message for this turn, once posted.
-        let tool_group_ts: Arc<Mutex<Option<SlackTs>>> = Arc::new(Mutex::new(None));
+        let tool_group_ts = turn_group_ts.clone();
         let bot_token_cb = state.current_bot_token();
         let channel_cb = SlackChannelId::new(channel_id.clone());
         let client_cb = client.clone();
-        let thinking_ts_cb = thinking_ts.clone();
         let thread_ts_cb = thread_ts.clone();
         let tool_group_ts_outer = tool_group_ts.clone();
 
@@ -1760,7 +1864,6 @@ async fn handle_message(
             let tools = tools.clone();
             let tool_group_ts_cb = tool_group_ts_outer.clone();
             let slack_state_grp = slack_state_outer.clone();
-            let _ts_ref = sent_intermediate_ts.clone();
             let token = SlackApiToken::new(SlackApiTokenValue::from(bot_token_cb.clone()));
             let channel = channel_cb.clone();
             let client = client_cb.clone();
@@ -1771,22 +1874,10 @@ async fn handle_message(
                     tool_name,
                     tool_input,
                 } => {
-                    let thinking_ts = thinking_ts_cb.clone();
                     let group_ts = tool_group_ts_cb.clone();
                     let ctx = crate::utils::tool_context_hint(&tool_name, &tool_input);
                     tokio::spawn(async move {
                         let session = client.open_session(&token);
-                        // Delete the "thinking..." placeholder on first tool call
-                        if let Some(ts) = thinking_ts.lock().await.take() {
-                            let del = SlackApiChatDeleteRequest::new(channel.clone(), ts.clone());
-                            if let Err(e) = session.chat_delete(&del).await {
-                                tracing::warn!(
-                                    "Slack: chat_delete failed (thinking placeholder on tool start, ts={}): {}",
-                                    ts,
-                                    e
-                                );
-                            }
-                        }
                         // Append to the turn's grouped tool message (#371),
                         // collapsed by default with an Expand toggle (#373).
                         let entries = {
@@ -1834,11 +1925,7 @@ async fn handle_message(
                             let group = slack_state_grp
                                 .upsert_tool_group(
                                     ts.to_string(),
-                                    GroupState {
-                                        channel: channel.clone(),
-                                        entries,
-                                        expanded: false,
-                                    },
+                                    GroupState::new(channel.clone(), entries),
                                 )
                                 .await;
                             let content = super::tool_group::render(&group, ts);
@@ -1857,7 +1944,8 @@ async fn handle_message(
                     let thread_ts_heal = thread_ts_inner.clone();
                     tokio::spawn(async move {
                         let session = client.open_session(&token);
-                        let text = format!("🔧 {}", message);
+                        let text =
+                            format!("🔧 {}", crate::utils::sanitize::normalize_dashes(&message));
                         let mut req = SlackApiChatPostMessageRequest::new(
                             channel,
                             SlackMessageContent::new().with_text(text),
@@ -1872,7 +1960,6 @@ async fn handle_message(
                 }
                 ProgressEvent::IntermediateText { text, .. } => {
                     let thread_ts_resp = thread_ts_inner.clone();
-                    let ts_ref = sent_intermediate_ts.clone();
                     // Strip LLM-hallucinated artifacts (<!-- tools-v2: ... -->,
                     // <tool_call> XML blocks, etc.) BEFORE posting. The
                     // final-response handler does this on text_only; this is
@@ -1897,7 +1984,6 @@ async fn handle_message(
                     // doesn't break hash-match against the final.
                     let (text_clean, _vid_paths) = crate::utils::extract_vid_markers(&text_clean);
                     let text_clone = text_clean;
-                    let _ = &ts_ref; // narration no longer becomes a standalone message
                     let group_ts = tool_group_ts_cb.clone();
                     let handle = tokio::spawn(async move {
                         if text_clone.trim().is_empty() {
@@ -2002,23 +2088,6 @@ async fn handle_message(
 
     state.slack_state.remove_cancel_token(session_id).await;
 
-    // Delete the "thinking..." placeholder if it's still around
-    {
-        let token = SlackApiToken::new(SlackApiTokenValue::from(state.current_bot_token()));
-        let session = client.open_session(&token);
-        if let Some(ts) = thinking_ts.lock().await.take() {
-            let del =
-                SlackApiChatDeleteRequest::new(SlackChannelId::new(channel_id.clone()), ts.clone());
-            if let Err(e) = session.chat_delete(&del).await {
-                tracing::warn!(
-                    "Slack: chat_delete failed (thinking placeholder, ts={}): {}",
-                    ts,
-                    e
-                );
-            }
-        }
-    }
-
     match result {
         Ok(response) => {
             // Extract <<IMG:path>> and <<VID:path>> markers. IMG paths are
@@ -2068,13 +2137,9 @@ async fn handle_message(
             let token = SlackApiToken::new(SlackApiTokenValue::from(state.current_bot_token()));
             let session = client.open_session(&token);
 
-            // Await every IntermediateText spawn before reading the
-            // intermediates list. This closes the spawn-then-push race
-            // that produced visible duplicates: stream emits IntermediateText,
-            // spawn fires `chat_post_message` (~hundreds of ms), stream ends
-            // ~immediately, final handler used to read `sent_intermediate_ts`
-            // while it was still empty, classify the in-flight intermediate as
-            // not-yet-posted, and post the same body a second time.
+            // Await every IntermediateText spawn before touching the answer
+            // path, so the step group carries every folded note before the
+            // final response branch reads it (spawn-then-read race).
             let pending = {
                 let mut g = intermediate_handles_final.lock().expect("poisoned");
                 std::mem::take(&mut *g)
@@ -2091,36 +2156,11 @@ async fn handle_message(
                 }
             }
 
-            // Resolve intermediate-vs-final overlap PER TURN.
-            //
-            // Three outcomes possible after this block:
-            //   1. An intermediate already posted the same body as the final →
-            //      keep it as the visible answer, delete only the OTHER
-            //      intermediates, and skip the final post entirely. Avoids
-            //      delete+repost, which previously produced visible duplicates
-            //      when chat_delete silently failed.
-            //   2. No intermediate matched the final → delete all intermediates
-            //      (they were partial chunks), then post the final.
-            //   3. There were no intermediates → just post the final.
-            //
-            // The dedup is strictly intra-turn. The earlier global
-            // `state.seen_responses` map (5-minute window) caused legit final
-            // posts to be suppressed across separate user prompts whenever
-            // the same body recurred — observed at 01:18/01:32/01:39+ today,
-            // five turns dropped on the same hash.
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            text_only.hash(&mut hasher);
-            let final_hash = hasher.finish();
-
-            let intermediates = sent_intermediate_ts_final.lock().await.clone();
-
             // Context budget footer (display-only: never stored in the DB,
-            // never fed to TTS). Computed BEFORE the delivery-shape branches
-            // because every completed turn must show it (#456): the final
-            // post appends it, and the intermediate-as-answer paths, which
-            // skip the final post entirely, post it standalone.
+            // never fed to TTS). Sole carrier since #1806: the settled
+            // step-group line. Answer messages are clean prose; intermediates
+            // never post standalone since #943, so there is nothing to
+            // dedup the final against.
             let ctx_max = state.agent.context_limit_for_session(session_id);
             let footer = crate::utils::format_ctx_footer(
                 response.context_tokens,
@@ -2139,20 +2179,12 @@ async fn handle_message(
             // Observed at 01:53 today: bot's only response was a streaming
             // intermediate, the final was empty, my dedup deleted the
             // intermediate and posted nothing.
+            // Post-#943 the intermediates list below is always empty — narration
+            // folds into the step group and nothing posts standalone — so the
+            // empty-final answer is the salvage path: it promotes the folded
+            // notes to the answer message and consumes them out of the group
+            // (#1805), mirroring Telegram's take_folded_final reclaim.
             if text_only.trim().is_empty() {
-                if !intermediates.is_empty() {
-                    tracing::info!(
-                        "Slack: final response is empty — keeping {} intermediate(s) as the visible answer",
-                        intermediates.len(),
-                    );
-                    // The kept intermediates ARE the completion: the footer
-                    // edits into the LAST one, display-only, exactly like
-                    // Telegram — never a standalone post below (#459).
-                    if let Some((ts, _hash, text)) = intermediates.last() {
-                        append_footer_via_update(&session, &channel_id, ts, text, &footer).await;
-                    }
-                    return;
-                }
                 // Nothing was posted standalone, because narration now folds
                 // into the step group (#943). When the final is empty that
                 // folded text is the only answer there is, and leaving it
@@ -2163,8 +2195,51 @@ async fn handle_message(
                         "Slack: final response is empty — posting the folded narration as the answer ({} chars)",
                         answer.len()
                     );
-                    post_final_text(&session, &channel_id, thread_ts.as_ref(), &answer, &footer)
-                        .await;
+                    post_final_text(&session, &channel_id, thread_ts.as_ref(), &answer).await;
+                    // Consume the notes out of the group (#1805): the answer
+                    // message now carries them, and a group still displaying
+                    // the same text turns every expanded group into a visible
+                    // duplicate — the exact shape reported on #1805.
+                    let remaining = super::tool_group::consume_notes(&steps_final.lock().await);
+                    let group_ts_snapshot = turn_group_ts_final.lock().await.clone();
+                    if let Some(ts) = group_ts_snapshot {
+                        if remaining.is_empty() {
+                            // The group was narration only: its message is an
+                            // empty shell now that the answer stands alone.
+                            let del = SlackApiChatDeleteRequest::new(
+                                SlackChannelId::new(channel_id.clone()),
+                                ts.clone(),
+                            );
+                            if let Err(e) = session.chat_delete(&del).await {
+                                tracing::warn!(
+                                    "Slack: chat_delete failed (consumed note-only group, ts={ts}): {e}"
+                                );
+                            }
+                            *turn_group_ts_final.lock().await = None;
+                        } else {
+                            sync_step_group(
+                                &session,
+                                &state.slack_state,
+                                SlackChannelId::new(channel_id.clone()),
+                                thread_ts.clone(),
+                                &turn_group_ts_final,
+                                remaining,
+                            )
+                            .await;
+                        }
+                    }
+                    settle_step_group(
+                        &session,
+                        &state.slack_state,
+                        &state.agent,
+                        session_id,
+                        SlackChannelId::new(channel_id.clone()),
+                        &channel_id,
+                        &turn_group_ts_final,
+                        super::tool_group::TurnOutcome::Finished,
+                        &footer,
+                    )
+                    .await;
                 } else {
                     // Neither a final nor any narration. Say so: a turn that
                     // deliberately posts nothing is indistinguishable from one
@@ -2172,73 +2247,18 @@ async fn handle_message(
                     tracing::warn!(
                         "Slack: turn produced neither a final response nor narration — nothing to post"
                     );
-                }
-                return;
-            }
-
-            let mut matching_keep: Vec<SlackTs> = Vec::new();
-            let mut to_delete: Vec<SlackTs> = Vec::new();
-            for (ts, hash, _text) in &intermediates {
-                if *hash == final_hash {
-                    matching_keep.push(ts.clone());
-                } else {
-                    to_delete.push(ts.clone());
-                }
-            }
-            if !to_delete.is_empty() {
-                tracing::info!(
-                    "Slack: deleting {} non-matching intermediate(s) before final response",
-                    to_delete.len()
-                );
-                for ts in &to_delete {
-                    let del = SlackApiChatDeleteRequest::new(
+                    settle_step_group(
+                        &session,
+                        &state.slack_state,
+                        &state.agent,
+                        session_id,
                         SlackChannelId::new(channel_id.clone()),
-                        ts.clone(),
-                    );
-                    if let Err(e) = session.chat_delete(&del).await {
-                        tracing::warn!(
-                            "Slack: chat_delete failed (non-matching intermediate, ts={}): {}",
-                            ts,
-                            e
-                        );
-                    }
-                }
-            }
-            if !matching_keep.is_empty() {
-                tracing::info!(
-                    "Slack: skipping final post — {} intermediate(s) already carry this content (hash={})",
-                    matching_keep.len(),
-                    final_hash,
-                );
-                // The matching intermediate(s) stay visible as the answer.
-                // Channel-messages DB record still gets written below for
-                // future context queries.
-                if !text_only.trim().is_empty() {
-                    let cm = DbChannelMessage::new(
-                        "slack".into(),
-                        channel_id.clone(),
-                        Some(channel_name.clone()),
-                        "bot:opencrabs".to_string(),
-                        "OpenCrabs".to_string(),
-                        text_only.clone(),
-                        "text".into(),
-                        None,
+                        &channel_id,
+                        &turn_group_ts_final,
+                        super::tool_group::TurnOutcome::Finished,
+                        &footer,
                     )
-                    .with_thread(thread_ts.as_ref().map(|ts| ts.to_string()), None);
-                    if let Err(e) = state.channel_msg_repo.insert(&cm).await {
-                        tracing::warn!(
-                            "Slack: failed to record bot reply in channel_messages: {}",
-                            e
-                        );
-                    }
-                }
-                // The kept intermediate carries the answer but not the ctx
-                // footer (the final post that normally appends it is being
-                // skipped) — edit the footer into it, display-only (#459).
-                // Its posted body hash-matched the final, so text_only IS
-                // its content.
-                if let Some(ts) = matching_keep.first() {
-                    append_footer_via_update(&session, &channel_id, ts, &text_only, &footer).await;
+                    .await;
                 }
                 return;
             }
@@ -2276,29 +2296,17 @@ async fn handle_message(
                 .into_iter()
                 .map(|s| s.to_string())
                 .collect();
-            for (i, chunk) in chunks.iter().enumerate() {
+            for chunk in chunks.iter() {
                 if chunk.is_empty() {
                     continue;
                 }
-                let is_last = i + 1 == chunks.len();
                 // Rich delivery (#455): the chunk goes out as Block Kit
                 // sections/dividers, with the plain text kept as the
                 // notification fallback. A rejected blocks post retries
                 // text-only so delivery never regresses on a Block Kit
                 // error (invalid block, limit change, ...).
-                let mut blocks = super::blocks::blocks_from_mrkdwn(chunk);
-                // The ctx footer rides the LAST message as a context block:
-                // small grey type that reads as metadata, not conversation
-                // (#457). The plain-text fallback keeps it appended so it is
-                // never lost when blocks are rejected.
-                let fallback_text = if is_last && !footer.is_empty() {
-                    if !blocks.is_empty() {
-                        blocks.push(super::blocks::context_footer(&footer));
-                    }
-                    format!("{chunk}\n\n{footer}")
-                } else {
-                    chunk.clone()
-                };
+                let blocks = super::blocks::blocks_from_mrkdwn(chunk);
+                let fallback_text = chunk.clone();
                 let content = if blocks.is_empty() {
                     SlackMessageContent::new().with_text(fallback_text.clone())
                 } else {
@@ -2328,12 +2336,12 @@ async fn handle_message(
                 }
             }
 
-            // Post-completion sweep: defense-in-depth for any IntermediateText
-            // spawn that pushed AFTER the dedup check above (e.g. a stream
-            // chunk delivered post-stream-end, or any future progress source
-            // that races with the final post). Drain remaining handles, await
-            // them, re-read the list, and delete any late entry that matches
-            // `final_hash` and wasn't already classified.
+            // Post-completion sweep: await any IntermediateText spawn that
+            // fired after the pre-answer drain (e.g. a stream chunk delivered
+            // post-stream-end) so the step group is fully updated before the
+            // reply is recorded and settled. Narration folds into the group
+            // (#943): nothing posts standalone, so there is nothing to
+            // delete here.
             let late_pending = {
                 let mut g = intermediate_handles_final.lock().expect("poisoned");
                 std::mem::take(&mut *g)
@@ -2341,31 +2349,6 @@ async fn handle_message(
             for h in late_pending {
                 if let Err(e) = h.await {
                     tracing::warn!(error = %e, "Slack late intermediate post task panicked");
-                }
-            }
-            let final_intermediates = sent_intermediate_ts_final.lock().await.clone();
-            let already_seen: std::collections::HashSet<String> = matching_keep
-                .iter()
-                .chain(to_delete.iter())
-                .map(|t| t.to_string())
-                .collect();
-            for (ts, hash, _text) in &final_intermediates {
-                if *hash == final_hash && !already_seen.contains(&ts.to_string()) {
-                    tracing::info!(
-                        "Slack: post-completion sweep — deleting late intermediate ts={} (hash matches final)",
-                        ts
-                    );
-                    let del = SlackApiChatDeleteRequest::new(
-                        SlackChannelId::new(channel_id.clone()),
-                        ts.clone(),
-                    );
-                    if let Err(e) = session.chat_delete(&del).await {
-                        tracing::warn!(
-                            "Slack: chat_delete failed (post-completion sweep, ts={}): {}",
-                            ts,
-                            e
-                        );
-                    }
                 }
             }
 
@@ -2393,6 +2376,22 @@ async fn handle_message(
                     );
                 }
             }
+
+            // The answer is out: settle the step group into its terminal
+            // line (#1797), before the voice-note detour so the status never
+            // lags the delivery.
+            settle_step_group(
+                &session,
+                &state.slack_state,
+                &state.agent,
+                session_id,
+                SlackChannelId::new(channel_id.clone()),
+                &channel_id,
+                &turn_group_ts_final,
+                super::tool_group::TurnOutcome::Finished,
+                &footer,
+            )
+            .await;
 
             // If input was audio AND TTS is enabled, also upload a voice note
             // (OGG/Opus) alongside the text reply. Slack doesn't have a
@@ -2434,6 +2433,20 @@ async fn handle_message(
         }
         Err(ref e) if matches!(e, crate::brain::agent::AgentError::Cancelled) => {
             tracing::info!("Slack: agent call cancelled for session {}", session_id);
+            let token = SlackApiToken::new(SlackApiTokenValue::from(state.current_bot_token()));
+            let session = client.open_session(&token);
+            settle_step_group(
+                &session,
+                &state.slack_state,
+                &state.agent,
+                session_id,
+                SlackChannelId::new(channel_id.clone()),
+                &channel_id,
+                &turn_group_ts_final,
+                super::tool_group::TurnOutcome::Cancelled,
+                "",
+            )
+            .await;
         }
         Err(e) => {
             tracing::error!("Slack: agent error: {}", e);
@@ -2444,7 +2457,7 @@ async fn handle_message(
             // failure messages.
             let error_msg = format!("❌ Error\n\n{}", crate::brain::agent::format_user_error(&e));
             let mut request = SlackApiChatPostMessageRequest::new(
-                SlackChannelId::new(channel_id),
+                SlackChannelId::new(channel_id.clone()),
                 SlackMessageContent::new().with_text(error_msg),
             );
             if let Some(ref ts) = thread_ts {
@@ -2453,6 +2466,475 @@ async fn handle_message(
             if let Err(e) = session.chat_post_message(&request).await {
                 tracing::warn!(error = %e, "failed to post Slack message");
             }
+            settle_step_group(
+                &session,
+                &state.slack_state,
+                &state.agent,
+                session_id,
+                SlackChannelId::new(channel_id.clone()),
+                &channel_id,
+                &turn_group_ts_final,
+                {
+                    // Classify like Telegram's settle: a timeout is its own
+                    // outcome (#1797), everything else is a plain failure.
+                    let es = e.to_string().to_lowercase();
+                    if es.contains("timed out") || es.contains("timeout") || es.contains("deadline")
+                    {
+                        super::tool_group::TurnOutcome::TimedOut
+                    } else {
+                        super::tool_group::TurnOutcome::Failed
+                    }
+                },
+                "",
+            )
+            .await;
+        }
+    }
+}
+
+/// Run the turn a follow-up suggestion tap started (#1838).
+///
+/// The tap used to ride the bare single-completion send: zero tools, zero
+/// progress events, and a channel that went silent from the echo until the
+/// final answer landed minutes later — which read as a dead button. This is
+/// the `handle_message` display path reduced to what a tap needs: the flow
+/// group is born before the agent starts thinking (live status from second
+/// zero), tool steps and narration fold into it, chained suggestions still
+/// render, and the final answer settles the group the same way.
+async fn run_followup_turn(
+    state: Arc<HandlerState>,
+    client: Arc<SlackHyperClient>,
+    session_id: Uuid,
+    channel_id: String,
+    text: String,
+) {
+    use super::tool_group::{GroupEntry, GroupState, TurnOutcome};
+    use crate::brain::agent::ProgressEvent;
+
+    let channel = SlackChannelId::new(channel_id.clone());
+
+    // Follow-up interrupt (handle_message parity): cancel any turn still
+    // running for this session before starting new work.
+    state.slack_state.cancel_session(session_id).await;
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    state
+        .slack_state
+        .store_cancel_token(session_id, cancel_token.clone())
+        .await;
+
+    // Open the flow group immediately (#1838): the 🕒 clock must cover the
+    // thinking latency too, so the live status posts before the turn starts.
+    let turn_group_ts: Arc<Mutex<Option<SlackTs>>> = Arc::new(Mutex::new(None));
+    {
+        let token = SlackApiToken::new(SlackApiTokenValue::from(state.current_bot_token()));
+        let session = client.open_session(&token);
+        sync_step_group(
+            &session,
+            &state.slack_state,
+            channel.clone(),
+            None,
+            &turn_group_ts,
+            Vec::new(),
+        )
+        .await;
+    }
+    spawn_flow_ticker(
+        client.clone(),
+        state.slack_state.clone(),
+        turn_group_ts.clone(),
+    );
+
+    let steps: Arc<Mutex<Vec<GroupEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    // Track IntermediateText spawns so the group is fully updated before the
+    // answer posts (handle_message #943 ordering).
+    let intermediate_handles: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let progress_cb: crate::brain::agent::ProgressCallback = {
+        let tools = steps.clone();
+        let group_ts = turn_group_ts.clone();
+        let bot_token = state.current_bot_token();
+        let channel = channel.clone();
+        let client = client.clone();
+        let slack_state_grp = state.slack_state.clone();
+        let handles = intermediate_handles.clone();
+
+        Arc::new(move |session_id, event| {
+            let tools = tools.clone();
+            let group_ts = group_ts.clone();
+            let token = SlackApiToken::new(SlackApiTokenValue::from(bot_token.clone()));
+            let channel = channel.clone();
+            let client = client.clone();
+            let slack_state_grp = slack_state_grp.clone();
+            match event {
+                ProgressEvent::ToolStarted {
+                    tool_name,
+                    tool_input,
+                } => {
+                    let ctx = crate::utils::tool_context_hint(&tool_name, &tool_input);
+                    tokio::spawn(async move {
+                        let session = client.open_session(&token);
+                        let entries = {
+                            let mut t = tools.lock().await;
+                            t.push(GroupEntry::Tool {
+                                name: tool_name,
+                                context: ctx,
+                                status: None,
+                            });
+                            t.clone()
+                        };
+                        sync_step_group(
+                            &session,
+                            &slack_state_grp,
+                            channel,
+                            None,
+                            &group_ts,
+                            entries,
+                        )
+                        .await;
+                    });
+                }
+                ProgressEvent::ToolCompleted {
+                    tool_name, success, ..
+                } => {
+                    tokio::spawn(async move {
+                        let session = client.open_session(&token);
+                        let entries = {
+                            let mut t = tools.lock().await;
+                            if let Some(GroupEntry::Tool { status, .. }) =
+                                t.iter_mut().rev().find(|e| {
+                                    matches!(
+                                        e,
+                                        GroupEntry::Tool { name, status: None, .. }
+                                            if *name == tool_name
+                                    )
+                                })
+                            {
+                                *status = Some(success);
+                            }
+                            t.clone()
+                        };
+                        if let Some(ts) = group_ts.lock().await.as_ref() {
+                            let group = slack_state_grp
+                                .upsert_tool_group(
+                                    ts.to_string(),
+                                    GroupState::new(channel.clone(), entries),
+                                )
+                                .await;
+                            let content = super::tool_group::render(&group, ts);
+                            let upd = SlackApiChatUpdateRequest::new(channel, content, ts.clone());
+                            if let Err(e) = session.chat_update(&upd).await {
+                                tracing::warn!(
+                                    "Slack tap: chat_update failed (tool group status, ts={ts}): {e}"
+                                );
+                            }
+                        }
+                    });
+                }
+                ProgressEvent::IntermediateText { text, .. } => {
+                    // Same cleaning as handle_message's fold path: artifacts
+                    // and media markers must not leak into the note.
+                    let text = crate::utils::sanitize::strip_llm_artifacts(&text);
+                    let (text_clean, _img) = crate::utils::extract_img_markers(&text);
+                    let (text_clean, _vid) = crate::utils::extract_vid_markers(&text_clean);
+                    if text_clean.trim().is_empty() {
+                        return;
+                    }
+                    let handle = tokio::spawn(async move {
+                        let session = client.open_session(&token);
+                        let text_fmt = crate::utils::slack_fmt::markdown_to_mrkdwn(&text_clean);
+                        let entries = {
+                            let mut t = tools.lock().await;
+                            t.push(GroupEntry::Note(text_fmt));
+                            t.clone()
+                        };
+                        sync_step_group(
+                            &session,
+                            &slack_state_grp,
+                            channel,
+                            None,
+                            &group_ts,
+                            entries,
+                        )
+                        .await;
+                    });
+                    if let Ok(mut g) = handles.lock() {
+                        g.push(handle);
+                    }
+                }
+                ProgressEvent::SelfHealingAlert { message } => {
+                    tokio::spawn(async move {
+                        let session = client.open_session(&token);
+                        let text =
+                            format!("🔧 {}", crate::utils::sanitize::normalize_dashes(&message));
+                        let req = SlackApiChatPostMessageRequest::new(
+                            channel,
+                            SlackMessageContent::new().with_text(text),
+                        );
+                        if let Err(e) = session.chat_post_message(&req).await {
+                            tracing::warn!(error = %e, "Slack tap: self-healing alert post failed");
+                        }
+                    });
+                }
+                ProgressEvent::RetryAttempt {
+                    attempt,
+                    max,
+                    reason,
+                } => {
+                    tokio::spawn(async move {
+                        let session = client.open_session(&token);
+                        let text = format!("⏳ Retry {attempt}/{max} — {reason}");
+                        let req = SlackApiChatPostMessageRequest::new(
+                            channel,
+                            SlackMessageContent::new().with_text(text),
+                        );
+                        if let Err(e) = session.chat_post_message(&req).await {
+                            tracing::warn!(error = %e, "Slack tap: retry notice post failed");
+                        }
+                    });
+                }
+                ProgressEvent::ProviderSwitched {
+                    to_name, to_model, ..
+                } => {
+                    tokio::spawn(async move {
+                        let session = client.open_session(&token);
+                        let text = format!("🔄 Now using {to_name}/{to_model}");
+                        let req = SlackApiChatPostMessageRequest::new(
+                            channel,
+                            SlackMessageContent::new().with_text(text),
+                        );
+                        if let Err(e) = session.chat_post_message(&req).await {
+                            tracing::warn!(error = %e, "Slack tap: provider switch post failed");
+                        }
+                    });
+                }
+                // Chained suggestions (#599): buttons under the tap's answer
+                // resolve their channel from the session route.
+                ProgressEvent::SuggestedOptions(options) => {
+                    let raw_options: Vec<String> =
+                        options.into_iter().map(|item| item.label).collect();
+                    tokio::spawn(async move {
+                        super::suggest_options::render_suggestions(
+                            &slack_state_grp,
+                            session_id,
+                            raw_options,
+                        )
+                        .await;
+                    });
+                }
+                _ => {}
+            }
+        })
+    };
+
+    let approval_cb = make_approval_callback(state.slack_state.clone());
+
+    let result = state
+        .agent
+        .send_message_with_tools_and_display(
+            session_id,
+            text.clone(),
+            Some(text),
+            None,
+            Some(cancel_token),
+            Some(approval_cb),
+            Some(progress_cb),
+            "slack",
+            Some(&channel_id),
+            None,
+        )
+        .await;
+
+    state.slack_state.remove_cancel_token(session_id).await;
+
+    // Drain narration-spawn tasks before the final posts so the group is
+    // settled from its complete contents.
+    let pending = {
+        let mut g = intermediate_handles.lock().expect("poisoned");
+        std::mem::take(&mut *g)
+    };
+    for h in pending {
+        if let Err(e) = h.await {
+            tracing::warn!(error = %e, "Slack tap: intermediate fold task panicked");
+        }
+    }
+
+    let token = SlackApiToken::new(SlackApiTokenValue::from(state.current_bot_token()));
+    let session = client.open_session(&token);
+
+    match result {
+        Ok(response) => {
+            let (text_only, img_paths) = crate::utils::extract_img_markers(&response.content);
+            let (text_only, _vid_paths) = crate::utils::extract_vid_markers(&text_only);
+            let text_only = crate::utils::sanitize::strip_llm_artifacts(&text_only);
+            let text_only = redact_secrets(&text_only);
+
+            let ctx_max = state.agent.context_limit_for_session(session_id);
+            let footer = crate::utils::format_ctx_footer(
+                response.context_tokens,
+                ctx_max,
+                response.tokens_per_second,
+            );
+
+            if text_only.trim().is_empty() {
+                // Empty-final salvage (#951/#1805): the folded notes are the
+                // only answer there is — promote them before settling.
+                if let Some(answer) = super::tool_group::notes_text(&steps.lock().await) {
+                    post_final_text(&session, &channel_id, None, &answer).await;
+                    let remaining = super::tool_group::consume_notes(&steps.lock().await);
+                    if let Some(ts) = turn_group_ts.lock().await.clone() {
+                        if remaining.is_empty() {
+                            let del = SlackApiChatDeleteRequest::new(channel.clone(), ts.clone());
+                            if let Err(e) = session.chat_delete(&del).await {
+                                tracing::warn!(
+                                    "Slack tap: chat_delete failed (consumed note-only group, ts={ts}): {e}"
+                                );
+                            }
+                            *turn_group_ts.lock().await = None;
+                        } else {
+                            sync_step_group(
+                                &session,
+                                &state.slack_state,
+                                channel.clone(),
+                                None,
+                                &turn_group_ts,
+                                remaining,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                settle_step_group(
+                    &session,
+                    &state.slack_state,
+                    &state.agent,
+                    session_id,
+                    channel.clone(),
+                    &channel_id,
+                    &turn_group_ts,
+                    TurnOutcome::Finished,
+                    &footer,
+                )
+                .await;
+                return;
+            }
+
+            for img_path in img_paths {
+                match tokio::fs::read(&img_path).await {
+                    Ok(bytes) => {
+                        let fname = std::path::Path::new(&img_path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("image.png")
+                            .to_string();
+                        let content_type =
+                            crate::brain::tools::slack_send::content_type_for(&fname);
+                        if let Err(e) = super::upload::upload_external(
+                            &session,
+                            channel.clone(),
+                            bytes,
+                            &fname,
+                            content_type,
+                            None,
+                        )
+                        .await
+                        {
+                            tracing::error!("Slack tap: failed to upload generated image: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Slack tap: failed to read image {}: {}", img_path, e);
+                    }
+                }
+            }
+
+            let chunks: Vec<String> = split_message(&text_only, 3000)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+            for chunk in chunks.iter() {
+                if chunk.is_empty() {
+                    continue;
+                }
+                let blocks = super::blocks::blocks_from_mrkdwn(chunk);
+                let fallback_text = chunk.clone();
+                let content = if blocks.is_empty() {
+                    SlackMessageContent::new().with_text(fallback_text.clone())
+                } else {
+                    SlackMessageContent::new()
+                        .with_text(fallback_text.clone())
+                        .with_blocks(blocks)
+                };
+                let request = SlackApiChatPostMessageRequest::new(channel.clone(), content);
+                if let Err(e) = session.chat_post_message(&request).await {
+                    tracing::warn!("Slack tap: blocks post failed ({e}) — retrying as plain text");
+                    let plain = SlackApiChatPostMessageRequest::new(
+                        channel.clone(),
+                        SlackMessageContent::new().with_text(fallback_text),
+                    );
+                    if let Err(e) = session.chat_post_message(&plain).await {
+                        tracing::error!("Slack tap: failed to send reply: {e}");
+                    }
+                }
+            }
+
+            settle_step_group(
+                &session,
+                &state.slack_state,
+                &state.agent,
+                session_id,
+                channel.clone(),
+                &channel_id,
+                &turn_group_ts,
+                TurnOutcome::Finished,
+                &footer,
+            )
+            .await;
+        }
+        Err(ref e) if matches!(e, crate::brain::agent::AgentError::Cancelled) => {
+            tracing::info!("Slack tap: agent call cancelled for session {session_id}");
+            settle_step_group(
+                &session,
+                &state.slack_state,
+                &state.agent,
+                session_id,
+                channel.clone(),
+                &channel_id,
+                &turn_group_ts,
+                TurnOutcome::Cancelled,
+                "",
+            )
+            .await;
+        }
+        Err(e) => {
+            tracing::error!("Slack follow-up tap turn failed: {e}");
+            let error_msg = format!("❌ Error\n\n{}", crate::brain::agent::format_user_error(&e));
+            let request = SlackApiChatPostMessageRequest::new(
+                channel.clone(),
+                SlackMessageContent::new().with_text(error_msg),
+            );
+            if let Err(pe) = session.chat_post_message(&request).await {
+                tracing::warn!(error = %pe, "Slack tap: failed to post error");
+            }
+            let es = e.to_string().to_lowercase();
+            let outcome =
+                if es.contains("timed out") || es.contains("timeout") || es.contains("deadline") {
+                    TurnOutcome::TimedOut
+                } else {
+                    TurnOutcome::Failed
+                };
+            settle_step_group(
+                &session,
+                &state.slack_state,
+                &state.agent,
+                session_id,
+                channel.clone(),
+                &channel_id,
+                &turn_group_ts,
+                outcome,
+                "",
+            )
+            .await;
         }
     }
 }
