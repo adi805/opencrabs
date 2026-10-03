@@ -867,6 +867,13 @@ pub struct DiscordConfig {
     /// Default: false.
     #[serde(default)]
     pub bang_new_thread: bool,
+    /// Post this channel's outbound messages with `SUPPRESS_NOTIFICATIONS`
+    /// (1 << 12): recipients get the unread badge but no push/desktop
+    /// notification. Intended for scheduled/report fan-out that should not
+    /// ping the owner. A per-call `silent` param on `discord_send`
+    /// overrides this either way. Default: false.
+    #[serde(default)]
+    pub suppress_notifications: bool,
 }
 
 impl Default for DiscordConfig {
@@ -884,6 +891,7 @@ impl Default for DiscordConfig {
             trace_narration: default_true(),
             auto_thread_min_chars: 0,
             bang_new_thread: false,
+            suppress_notifications: false,
         }
     }
 }

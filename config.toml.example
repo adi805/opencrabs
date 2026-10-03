@@ -631,6 +631,11 @@ allowed_channels = ["channel_id"]       # Where the bot operates (empty = all ch
                                         # instead of posting each as a separate message.
                                         # Default: true. Set false to post each intermediate as
                                         # its own message.
+# suppress_notifications = false        # Post this channel's outbound messages silently: recipients
+                                        # get the unread badge but no push/desktop notification.
+                                        # For scheduled/report fan-out that should not ping the server.
+                                        # A per-call `silent` param on discord_send overrides it either
+                                        # way. Default: false.
 # Slash commands are projected from commands.toml (no knob needed). The bot needs
 # the "applications.commands" OAuth2 scope at invite time, not just "bot": without
 # it the gateway connects and chat works, but every command registration returns

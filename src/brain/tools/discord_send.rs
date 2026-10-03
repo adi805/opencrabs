@@ -206,6 +206,10 @@ impl Tool for DiscordSendTool {
                 "caption": {
                     "type": "string",
                     "description": "Optional caption text for send_file"
+                },
+                "silent": {
+                    "type": "boolean",
+                    "description": "Post with SUPPRESS_NOTIFICATIONS: recipients get the unread badge but no push/desktop notification. Applies to send, reply, send_embed, send_file. Omit to use the channel default (channels.discord.suppress_notifications, false). Set true for scheduled/report output that should not ping the server; set false to force a loud send on a quiet channel."
                 }
             },
             "required": ["action"]
@@ -267,17 +271,37 @@ impl Tool for DiscordSendTool {
 
         let guild_id_opt = self.discord_state.guild_id().await;
 
+        // C1: resolve silent delivery once. An explicit `silent` param wins
+        // over the channel default so one scheduled job can stay loud on a
+        // quiet channel and vice versa. Only the actions that create a fresh
+        // message consult it (send/reply/send_embed/send_file); edit/react and
+        // the rest never set create-time flags.
+        let silent = crate::channels::discord::flags::resolve_silent(
+            input.get("silent").and_then(|v| v.as_bool()),
+            crate::config::Config::current()
+                .channels
+                .discord
+                .suppress_notifications,
+        );
+
         use serenity::model::id::{ChannelId, GuildId, MessageId, RoleId, UserId};
 
         match action.as_str() {
             // ── send ─────────────────────────────────────────────────────────
             "send" => {
+                use serenity::builder::CreateMessage;
                 let text = pget!(get_str(&input, "message")).to_string();
                 let channel_id = pget!(channel_or_err(channel_id_opt));
                 let channel = ChannelId::new(channel_id);
                 let chunks = crate::channels::discord::handler::split_message(&text, 2000);
                 for chunk in chunks {
-                    if let Err(e) = channel.say(&http, chunk).await {
+                    // C1: build through apply_silent rather than `channel.say`,
+                    // which has no flags field on its builder.
+                    let builder = crate::channels::discord::flags::apply_silent(
+                        CreateMessage::new().content(chunk),
+                        silent,
+                    );
+                    if let Err(e) = channel.send_message(&http, builder).await {
                         return Ok(ToolResult::error(format!("Failed to send: {e}")));
                     }
                 }
@@ -295,9 +319,12 @@ impl Tool for DiscordSendTool {
                 let message_id = pget!(get_id(&input, "message_id"));
                 let channel = ChannelId::new(channel_id);
                 let reference = MessageReference::from((channel, MessageId::new(message_id)));
-                let builder = CreateMessage::new()
-                    .content(text.as_str())
-                    .reference_message(reference);
+                let builder = crate::channels::discord::flags::apply_silent(
+                    CreateMessage::new()
+                        .content(text.as_str())
+                        .reference_message(reference),
+                    silent,
+                );
                 match channel.send_message(&http, builder).await {
                     Ok(_) => Ok(ToolResult::success(format!(
                         "Reply sent to message {message_id}."
@@ -775,6 +802,7 @@ impl Tool for DiscordSendTool {
             }
 
             "send_file" => {
+                use crate::channels::discord::guard::{FileSize, check_batch};
                 use serenity::builder::{CreateAttachment, CreateMessage};
                 use serenity::model::id::ChannelId;
                 let channel_id = pget!(channel_or_err(channel_id_opt));
