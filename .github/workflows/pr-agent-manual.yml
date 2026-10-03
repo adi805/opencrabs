@@ -4,9 +4,18 @@
 # lives in someone else's repo, and the action has no workflow_dispatch handler,
 # so those reviews run the published CLI instead.
 #
-# Needs secret PR_AGENT_PAT: a personal access token with "repo" scope. The
-# built-in GITHUB_TOKEN is scoped to this repository and cannot read or comment
-# on another one.
+# Needs secret PR_AGENT_PAT: a FINE-GRAINED personal access token, scoped to the
+# single repository under review, with Metadata: read (GitHub requires it on every
+# fine-grained token), Contents: read, Pull requests: write and Issues: write.
+# A classic token with the "repo" scope is refused on purpose: that scope reaches
+# every repository its owner can see, so a compromised package, action, or
+# transitive dependency inside the CLI could rewrite all of them, not just the
+# repo the PR lives in. A fine-grained token narrows the blast radius only when
+# it actually names one repository: scoped to "All repositories" it is as broad
+# as a classic token, and GitHub's API does not expose the difference, so this
+# step warns and the operator confirms the scope by hand.
+# The check below fails the run unless the token is fine-grained, or the
+# dispatcher explicitly accepts the wider blast radius with allow_broad_pat.
 name: PR Agent (manual)
 
 on:
@@ -25,6 +34,11 @@ on:
           - review
           - describe
           - improve
+      allow_broad_pat:
+        description: "Proceed even if PR_AGENT_PAT is a classic (broad) token"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -35,15 +49,64 @@ jobs:
   run:
     name: ${{ inputs.command }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - name: Require PR_AGENT_PAT
+      - name: Check PR_AGENT_PAT scope
         env:
           PAT: ${{ secrets.PR_AGENT_PAT }}
+          PR_URL: ${{ inputs.pr_url }}
+          ALLOW_BROAD: ${{ inputs.allow_broad_pat }}
         run: |
           if [ -z "$PAT" ]; then
-            echo "::error::PR_AGENT_PAT is not set. Reviewing a PR outside this repository needs a personal access token with 'repo' scope; the built-in GITHUB_TOKEN cannot see other repositories. Add it under Settings > Secrets and variables > Actions."
+            echo "::error::PR_AGENT_PAT is not set. Reviewing a PR outside this repository needs a fine-grained personal access token scoped to the repo under review (Contents: read, Pull requests: write, Issues: write); the built-in GITHUB_TOKEN cannot see other repositories. Add it under Settings > Secrets and variables > Actions."
             exit 1
           fi
+
+          REPO=$(printf '%s' "$PR_URL" | sed -n 's#^https://github.com/\([^/]*/[^/]*\)/pull/[0-9][0-9]*.*#\1#p')
+          if [ -z "$REPO" ]; then
+            echo "::error::pr_url must look like https://github.com/<owner>/<repo>/pull/<number>, got: $PR_URL"
+            exit 1
+          fi
+
+          HDRS=$(mktemp)
+          CODE=$(curl -sS -o /dev/null -D "$HDRS" -w '%{http_code}' \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO" || true)
+          # A 200 here is NOT proof that the token can comment on the PR: GitHub
+          # answers this endpoint with 200 for every public repository, even to a
+          # token that has no access to it, and the upstream repos this workflow
+          # targets are public. The call only rules out a token that is invalid
+          # or outright rejected. It cannot confirm the permissions PR-Agent
+          # needs (Pull requests: write, Issues: write).
+          if [ "$CODE" != "200" ]; then
+            echo "::error::PR_AGENT_PAT was rejected for $REPO (HTTP $CODE). A fine-grained token has to name that repository in its scope, with Contents: read."
+            exit 1
+          fi
+
+          WHO=$(curl -sS -H "Authorization: Bearer $PAT" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/user" | sed -n 's/.*"login":[ ]*"\([^"]*\)".*/\1/p' | head -1)
+
+          # Classic tokens and OAuth apps return X-OAuth-Scopes; fine-grained
+          # tokens and GitHub App tokens do not. A non-empty header therefore
+          # means this token reaches more repos than the one being reviewed.
+          SCOPES=$(tr -d '\r' < "$HDRS" | awk 'tolower($1) == "x-oauth-scopes:" { sub(/^[^:]*:[ ]*/, ""); print }')
+          if [ -n "$SCOPES" ]; then
+            if [ "$ALLOW_BROAD" = "true" ]; then
+              echo "::warning::PR_AGENT_PAT is a classic token (X-OAuth-Scopes: $SCOPES), so it can write to every repository its owner can reach, not just $REPO. Proceeding because allow_broad_pat=true."
+            else
+              echo "::error::PR_AGENT_PAT is a classic token (X-OAuth-Scopes: $SCOPES), which grants read/write to every repository its owner can reach. Replace it with a fine-grained token scoped to $REPO only (Contents: read, Pull requests: write, Issues: write), or re-dispatch with allow_broad_pat=true if you accept the wider blast radius."
+              exit 1
+            fi
+          else
+            # No scope header: fine-grained or App token. GitHub's API does not
+            # expose a fine-grained token's repository selection, so a token
+            # scoped to All repositories is indistinguishable here from one
+            # scoped to $REPO. Warn instead of claiming the blast radius shrank.
+            echo "::warning::PR_AGENT_PAT sends no X-OAuth-Scopes header, so it is a fine-grained or GitHub App token. GitHub does not expose a fine-grained token's repository selection through the API, so this step cannot confirm it is limited to $REPO: a token scoped to All repositories looks identical here. Verify under Settings > Developer settings > Personal access tokens that it names only $REPO."
+          fi
+
+          echo "PR_AGENT_PAT authenticated as ${WHO:-an unknown account}, and GitHub accepted it for $REPO (HTTP 200). Read access to a public repository is not what that proves; the token still has to carry Pull requests: write and Issues: write for the review to post."
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
@@ -55,8 +118,9 @@ jobs:
           PR_CMD: ${{ inputs.command }}
           OPENAI__KEY: ${{ secrets.PR_AGENT_KEY }}
           OPENAI__API_BASE: "https://api.inferhub.dev/v1"
-          CONFIG__MODEL: "openai/ali/deepseek-v4.1-flash"
-          CONFIG__FALLBACK_MODELS: '["openai/ali/qwen3.8-flash"]'
+          CONFIG__MODEL: "openai/ag/gemini-3.8-flash-high"
+          CONFIG__FALLBACK_MODELS: '["openai/ag/gemini-3.7-flash-high"]'
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "128000"
+          CONFIG__AI_TIMEOUT: "300"
           GITHUB__USER_TOKEN: ${{ secrets.PR_AGENT_PAT }}
         run: pr-agent --pr_url "$PR_URL" "$PR_CMD"
