@@ -199,10 +199,12 @@ fn the_key_lparam_carries_scan_code_and_state_bits() {
     // repeat count 1 in bits 0..15, scan code in 16..23, extended in 24.
     assert_eq!(key_lparam(0x50, true, false) as u32, 0x0150_0001);
     assert_eq!(key_lparam(0x50, false, false) as u32, 0x0050_0001);
-    // A release additionally reports the key as previously down (29) and
-    // transitioning up (30).
-    assert_eq!(key_lparam(0x50, false, true) as u32, 0x6050_0001);
-    assert_eq!(key_lparam(0x1C, true, true) as u32, 0x611C_0001);
+    // A release additionally reports the key as previously down (30) and
+    // transitioning up (31). Bit 29 stays clear: it is the context code (ALT
+    // held), not part of the release state, and setting it would describe a
+    // chord that was never pressed.
+    assert_eq!(key_lparam(0x50, false, true) as u32, 0xC050_0001);
+    assert_eq!(key_lparam(0x1C, true, true) as u32, 0xC11C_0001);
 }
 
 #[test]

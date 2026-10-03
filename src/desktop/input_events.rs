@@ -233,16 +233,17 @@ pub fn click_events(desktop: &Rect, button: MouseButton, at: ScreenPoint) -> Opt
 /// posted key ends up looking received while doing nothing. Packing it costs
 /// one function; the alternative is a class of silent no-ops.
 ///
-/// Bit 24 is the extended flag, bit 29 the previous key state and bit 30 the
-/// transition state. Both of the last two are set only on a release, which is
-/// what distinguishes the two otherwise-identical messages.
+/// Bit 24 is the extended flag. On a release the previous-key-state bit (30)
+/// and the transition bit (31) are set; bit 29 is the context code (ALT held),
+/// which a synthetic key press is not, so setting it would misdescribe the
+/// message rather than merely being ignored.
 pub fn key_lparam(scan: u16, extended: bool, released: bool) -> isize {
     let mut value: u32 = 1 | (u32::from(scan) << 16);
     if extended {
         value |= 1 << 24;
     }
     if released {
-        value |= 1 << 29 | 1 << 30;
+        value |= 1 << 30 | 1 << 31;
     }
     value as i32 as isize
 }

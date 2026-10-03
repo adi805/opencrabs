@@ -153,7 +153,7 @@ impl fmt::Display for WindowList {
                 w.rect.left,
                 w.rect.top,
                 w.class,
-                w.title
+                escape_text(&w.title)
             )?;
         }
         if self.truncated {
@@ -161,6 +161,28 @@ impl fmt::Display for WindowList {
         }
         Ok(())
     }
+}
+
+/// Make a window-supplied string safe to print on one line.
+///
+/// Titles and class names come from other applications, so they are attacker-
+/// adjacent input: a newline would break the one-line-per-window contract and
+/// let a title impersonate a following record, and an ANSI escape could move
+/// the cursor or recolour the terminal the report is read in. Control
+/// characters become their `\n`/`\r`/`\t` spellings; anything else
+/// non-printable becomes a replacement so the length stays honest.
+pub fn escape_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push('\u{FFFD}'),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// A channel value at or below this counts as "no ink".

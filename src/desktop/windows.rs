@@ -10,10 +10,10 @@
 
 use super::model::{MAX_WINDOWS, Rect, WindowInfo, WindowList, keep_candidate};
 use super::win32::{
-    EnumWindows, GetClassNameW, GetCurrentProcessId, GetForegroundWindow, GetProcessWindowStation,
-    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-    NO_ACTIVE_CONSOLE_SESSION, ProcessIdToSessionId, TEXT_BUF_CHARS, WTSGetActiveConsoleSessionId,
-    WinRect,
+    DWMWA_CLOAKED, DwmGetWindowAttribute, EnumWindows, GetClassNameW, GetCurrentProcessId,
+    GetForegroundWindow, GetProcessWindowStation, GetUserObjectInformationW, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, NO_ACTIVE_CONSOLE_SESSION,
+    ProcessIdToSessionId, TEXT_BUF_CHARS, UOI_NAME, WTSGetActiveConsoleSessionId, WinRect,
 };
 use std::io;
 
@@ -29,6 +29,28 @@ fn read_wide_text(read: impl Fn(*mut u16, i32) -> i32) -> String {
     String::from_utf16_lossy(&buffer[..len])
 }
 
+/// Whether the Desktop Window Manager is currently showing a window.
+///
+/// `IsWindowVisible` answers a different question: a window on another virtual
+/// desktop, or a suspended UWP app, keeps that bit set and a positive rectangle
+/// while the compositor is not showing it at all, so offering it as a click
+/// target invites an action aimed at something nobody can see. A query that
+/// fails is read as "not cloaked": this is a refinement, and dropping every
+/// window because one attribute is unavailable would be worse than the rare
+/// stale hit it prevents.
+fn is_cloaked(hwnd: isize) -> bool {
+    let mut cloaked = 0i32;
+    let ok = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut i32,
+            std::mem::size_of::<i32>() as u32,
+        )
+    };
+    ok == 0 && cloaked != 0
+}
+
 /// Accumulator handed to the callback through a pointer-sized `LPARAM`.
 struct Collector {
     windows: Vec<WindowInfo>,
@@ -41,13 +63,6 @@ unsafe extern "system" fn collect_window(hwnd: isize, param: isize) -> i32 {
     // `list_windows` passed to `EnumWindows`, which outlives the walk, and
     // nothing else holds a reference to it during the callback.
     let sink = unsafe { &mut *(param as *mut Collector) };
-
-    if sink.windows.len() >= MAX_WINDOWS {
-        // Stop the walk: a snapshot that keeps growing past the cap is worse
-        // than one that admits it stopped.
-        sink.truncated = true;
-        return 0;
-    }
 
     let mut raw = WinRect {
         left: 0,
@@ -66,8 +81,18 @@ unsafe extern "system" fn collect_window(hwnd: isize, param: isize) -> i32 {
     };
     let visible = unsafe { IsWindowVisible(hwnd) } != 0;
     let class = read_wide_text(|buffer, max| unsafe { GetClassNameW(hwnd, buffer, max) });
-    if !keep_candidate(visible, &rect, &class) {
+    if !keep_candidate(visible, &rect, &class) || is_cloaked(hwnd) {
         return 1;
+    }
+
+    // A kept window is the only thing that can push past the cap, so this is
+    // where the flag belongs: setting it at the top of the walk would mark a
+    // list truncated when the 257th window is one the filter would have
+    // dropped, and the boundary case (the walk ending exactly at the cap with
+    // no further window) would never set it at all.
+    if sink.windows.len() >= MAX_WINDOWS {
+        sink.truncated = true;
+        return 0;
     }
 
     let title = read_wide_text(|buffer, max| unsafe { GetWindowTextW(hwnd, buffer, max) });
@@ -114,8 +139,30 @@ pub fn interactive_session() -> bool {
     if active != NO_ACTIVE_CONSOLE_SESSION && active == session {
         return true;
     }
+    // The handle being non-null is not the answer: a non-interactive logon
+    // still holds a window-station handle. The interactive station is the one
+    // named WinSta0; a service's station (Service-0x0-...) has no desktop a
+    // person is looking at, so treating any handle as proof would report a
+    // seat that cannot show anything.
     let station = unsafe { GetProcessWindowStation() };
-    station != 0
+    if station == 0 {
+        return false;
+    }
+    let mut name = [0u16; TEXT_BUF_CHARS];
+    let read = unsafe {
+        GetUserObjectInformationW(
+            station,
+            UOI_NAME,
+            name.as_mut_ptr(),
+            (name.len() * std::mem::size_of::<u16>()) as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if read == 0 {
+        return false;
+    }
+    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    String::from_utf16_lossy(&name[..len]).eq_ignore_ascii_case("WinSta0")
 }
 
 /// Top-level windows an agent could act on, front of z-order first.

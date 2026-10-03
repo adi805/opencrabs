@@ -27,6 +27,16 @@ use super::input::{Input, WinPoint};
 /// `u32` session id nowhere else, which is why the API can use it as "none".
 pub const NO_ACTIVE_CONSOLE_SESSION: u32 = 0xFFFF_FFFF;
 
+/// `GetUserObjectInformationW` index for a window station's name. The
+/// interactive station is `WinSta0`; a non-interactive logon still has a
+/// station handle, so the handle alone is not proof that a desktop is there.
+pub const UOI_NAME: i32 = 2;
+
+/// `DwmGetWindowAttribute` index for the cloaked flag. A window the DWM is not
+/// showing (another virtual desktop, a suspended UWP app) still answers
+/// `IsWindowVisible` with true.
+pub const DWMWA_CLOAKED: u32 = 14;
+
 /// Cap for a title or class we read back. Windows truncates at the requested
 /// length and reports the characters copied, so this bounds memory instead of
 /// requiring a length-then-allocate round trip.
@@ -88,6 +98,7 @@ pub struct BitmapInfo {
     pub colors: [RgbQuad; 1],
 }
 
+#[link(name = "user32")]
 unsafe extern "system" {
     // ---- window enumeration (see `super::windows`) ----
 
@@ -117,6 +128,16 @@ unsafe extern "system" {
     /// no interactive station: a service, or a process spawned from a
     /// non-interactive logon.
     pub fn GetProcessWindowStation() -> isize;
+    /// Reads a property of a window-station/user object. Used with [`UOI_NAME`]
+    /// to read the station's name: a non-interactive logon can still hold a
+    /// station handle, but its name is not `WinSta0`.
+    pub fn GetUserObjectInformationW(
+        object: isize,
+        index: i32,
+        info: *mut u16,
+        length: u32,
+        needed: *mut u32,
+    ) -> i32;
     pub fn GetCurrentProcessId() -> u32;
     pub fn ProcessIdToSessionId(process_id: u32, session_id: *mut u32) -> i32;
     pub fn WTSGetActiveConsoleSessionId() -> u32;
@@ -155,6 +176,7 @@ unsafe extern "system" {
 // The input lane's signatures. A second block rather than one long one, so
 // that the section comments above each group stay next to the functions they
 // describe instead of pointing into a list.
+#[link(name = "user32")]
 unsafe extern "system" {
     // ---- input synthesis (see `super::input_windows`) ----
 
@@ -190,4 +212,15 @@ unsafe extern "system" {
     /// Current cursor position, in screen coordinates. Read-only, and the
     /// receipt that a posted click left the human's pointer where it was.
     pub fn GetCursorPos(point: *mut WinPoint) -> i32;
+}
+
+// The desktop-composition lane. A separate block because it is a different
+// library: `dwmapi`, not `user32`.
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    /// Reports whether the Desktop Window Manager is showing a window. A window
+    /// on another virtual desktop, or a suspended UWP app, is cloaked: it still
+    /// answers `IsWindowVisible` with true and keeps a positive rectangle, so
+    /// this is the only way to tell it is not actually on the desktop.
+    pub fn DwmGetWindowAttribute(hwnd: isize, attribute: u32, value: *mut i32, size: u32) -> i32;
 }

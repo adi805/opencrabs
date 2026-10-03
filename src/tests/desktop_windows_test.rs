@@ -226,14 +226,26 @@ fn a_successful_capture_to_png_is_never_a_blank_file() {
             );
         }
         Err(error) => {
-            // Allowed: the window may not paint itself. What is not allowed is a
-            // PNG left behind claiming to be one.
-            assert!(
-                !path.exists(),
-                "capture failed but left a file behind: {error}"
-            );
+            // Two outcomes wear the same Err. A window that cannot paint at all
+            // leaves nothing behind. A BLANK capture is different: the frame is
+            // written before the error on purpose, so the evidence survives for
+            // whoever debugs it, and the file is expected. Asserting "no file"
+            // for both would fail the run on exactly the behaviour the write
+            // order exists to produce.
+            let message = error.to_string();
+            if message.contains("captured blank") {
+                assert!(
+                    path.exists(),
+                    "a blank capture must leave its frame behind for inspection: {message}"
+                );
+            } else {
+                assert!(
+                    !path.exists(),
+                    "capture failed but left a file behind: {message}"
+                );
+            }
             println!(
-                "[desktop] {:?} could not be photographed: {error}",
+                "[desktop] {:?} could not be photographed: {message}",
                 window.title
             );
         }

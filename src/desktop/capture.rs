@@ -90,6 +90,24 @@ impl DibSurface {
         }
         Ok(surface)
     }
+
+    /// Put the DC's previous object back, so the capture bitmap is no longer
+    /// selected into it.
+    ///
+    /// `GetDIBits` requires this: its documentation says the bitmap must not be
+    /// selected into a device context when it is read, and reading one that is
+    /// still selected can fail or return unreliable pixels. Drop restores it
+    /// too, so this zeroes `previous` to keep that from running twice.
+    fn deselect(&mut self) {
+        if self.previous != 0 && self.previous != HGDI_ERROR {
+            // Safety: `previous` is what `SelectObject` returned for `mem_dc`
+            // in `new`, and `mem_dc` is still live.
+            unsafe {
+                SelectObject(self.mem_dc, self.previous);
+            }
+            self.previous = 0;
+        }
+    }
 }
 
 impl Drop for DibSurface {
@@ -156,7 +174,7 @@ pub fn capture_window(hwnd: isize) -> io::Result<Capture> {
         )));
     }
     let (width, height) = (rect.width(), rect.height());
-    let surface = DibSurface::new(width, height)?;
+    let mut surface = DibSurface::new(width, height)?;
 
     let painted = unsafe { PrintWindow(hwnd, surface.mem_dc, PW_RENDERFULLCONTENT) };
     if painted == 0 {
@@ -164,6 +182,11 @@ pub fn capture_window(hwnd: isize) -> io::Result<Capture> {
             "PrintWindow did not paint window {hwnd} ({width}x{height})"
         )));
     }
+
+    // The bitmap was selected into `mem_dc` for PrintWindow to paint into.
+    // GetDIBits reads it back and requires it not to be selected, so put the
+    // DC's previous object back first.
+    surface.deselect();
 
     let mut buffer = vec![0u8; (width as usize) * (height as usize) * 4];
     let mut info = BitmapInfo {

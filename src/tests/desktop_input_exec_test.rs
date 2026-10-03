@@ -28,7 +28,7 @@
 //! deliberately never press it.
 
 use crate::desktop::Key;
-use crate::desktop::{Delivery, inject_key, inject_text, interactive_session};
+use crate::desktop::{Delivery, inject_key, inject_text, interactive_session, list_windows};
 use crate::tests::desktop_input_util::{
     capture_stable, close_window, note, spawn_marker_window, stop, wait_for_title, wait_for_window,
     write_png,
@@ -77,6 +77,25 @@ fn input_dump_a_typed_command_changes_the_window_title() {
             panic!("{why} before typing a command");
         }
     };
+
+    // capture_stable takes seconds, and focus can move in that time. The guard
+    // above ran before it, so read the foreground again now: this job presses
+    // Enter, and the failure the guard exists to prevent is typing into
+    // whatever gained focus while the frame was being taken.
+    let foreground = match list_windows() {
+        Ok(list) => list.foreground().map(|w| w.hwnd),
+        Err(why) => {
+            stop(&mut child);
+            panic!("{why} while re-reading the foreground window");
+        }
+    };
+    if foreground != Some(window.hwnd) {
+        stop(&mut child);
+        panic!(
+            "focus moved off the marker window while it was being photographed; this job sends \
+             Enter, so nothing was injected anywhere"
+        );
+    }
 
     let command = format!("title {}", done_marker());
     let typed = match inject_text(&command) {

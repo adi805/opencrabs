@@ -16,6 +16,17 @@
 //! rectangles, or comparing our pixels against a screenshot taken by a
 //! differently-aware process) is how clicks land offset on a laptop running
 //! 150% scaling while working correctly on every CI runner.
+//!
+//! Scope limit, deliberate: a posted message goes to the top-level window it
+//! names, and a message posted at a window is not delivered to its child
+//! controls. So a window whose interactive parts are separate child windows (a
+//! dialog's edit box or button) may receive nothing when addressed by its
+//! top-level handle; the route that reaches a child is [`inject_click`] and
+//! [`inject_text`], which go through the OS input stream and hit whatever is
+//! under the point or holds focus. Finding a child handle would mean walking
+//! `EnumChildWindows` and mapping screen points to it, which is a larger
+//! change than this module's contract ("address one window, do not move the
+//! human's pointer") allows.
 
 use super::input::{Delivery, Input, MouseButton, ScreenPoint, WinPoint};
 use super::input_events::{
@@ -24,7 +35,8 @@ use super::input_events::{
 };
 use super::model::Rect;
 use super::win32::{
-    GetCursorPos, GetSystemMetrics, MapVirtualKeyW, PostMessageW, ScreenToClient, SendInput,
+    GetCursorPos, GetSystemMetrics, GetWindowRect, MapVirtualKeyW, PostMessageW, ScreenToClient,
+    SendInput, WinRect,
 };
 use std::io;
 
@@ -241,6 +253,31 @@ fn post(hwnd: isize, messages: &[super::input_events::PostedMessage]) -> io::Res
 /// Does not move the cursor and does not take keyboard focus. See
 /// [`Delivery::Queued`] for what this does not prove.
 pub fn click_window(hwnd: isize, button: MouseButton, at: ScreenPoint) -> io::Result<Delivery> {
+    // Refuse a click that is not on the window rather than let ScreenToClient
+    // turn it into a client coordinate outside 0..=65535, which `mouse_lparam`
+    // would then wrap into a different pixel. This is the same "refuse, do not
+    // clamp" contract `inject_click` keeps, for the same reason: the edge of
+    // the window belongs to whatever is behind it.
+    let mut raw = WinRect::default();
+    if unsafe { GetWindowRect(hwnd, &mut raw) } == 0 {
+        return Err(io::Error::other(format!(
+            "GetWindowRect failed for window {hwnd}"
+        )));
+    }
+    if at.x < raw.left || at.x >= raw.right || at.y < raw.top || at.y >= raw.bottom {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "point ({},{}) is outside window {hwnd} ({}x{} at {},{})",
+                at.x,
+                at.y,
+                raw.right - raw.left,
+                raw.bottom - raw.top,
+                raw.left,
+                raw.top
+            ),
+        ));
+    }
     let client = client_point(hwnd, at)?;
     post(hwnd, &posted_click_messages(button, client))
 }
