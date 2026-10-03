@@ -459,6 +459,18 @@ jobs:
       - name: Scan the tree
         run: python3 scripts/check-windows-footguns.py --root src
 
+      # A duplicate top-level declaration only errors on the target that
+      # expands it: on 2026-10-03 a merged duplicate `mod winlock;` inside a
+      # cfg(windows) gate passed lint, build, test and audit, and died 21
+      # minutes into the Windows build with E0428. Same class, same required
+      # job, seconds of cost, so the Windows build stops being the only
+      # witness.
+      - name: Duplicate-decl linter proves its own teeth
+        run: python3 scripts/check-duplicate-decls.py --self-test
+
+      - name: Scan for duplicate top-level declarations
+        run: python3 scripts/check-duplicate-decls.py --root src
+
   # ── Stage 3: Test on Linux (gated on lint + audit, parallel with build) ──
   # Tests run on Linux only — macOS gets build verification via
   # the `build` job above. ZeroClaw uses the same split because the
@@ -723,17 +735,31 @@ jobs:
   ci-gate:
     name: CI Required Gate
     if: always()
-    # windows-build is deliberately NOT in the required set. It is the most
-    # expensive job here (a cold Windows build measured 51m09s),
-    # it measured 51m09s cold, and at ~160 PR runs a fortnight that is ~136h
-    # of 2x-billed runner time against the 3 Windows builds release.yml
-    # actually ran in the same window. #627 removed the original job from the
-    # gate for exactly that reason. It stays as an advisory signal; Windows
-    # remains release-blocking via release.yml's build matrix before any tag.
-    # windows-footguns IS in the required set, which is not in tension with
-    # the paragraph above: same class of finding (Windows-specific) at a
-    # python-pass cost, so blocking on it buys certainty for seconds.
-    needs: [lint, build, test, audit, windows-footguns]
+    # FORK POLICY, deliberately different from upstream: windows-build IS in
+    # the required set on this branch. Upstream's reasoning is kept here as
+    # the record of what it weighed: a cold Windows build measured 51m09s,
+    # and at ~160 PR runs a fortnight that is ~136h of 2x-billed runner time
+    # against the 3 Windows builds release.yml actually ran in the same
+    # window; #627 removed the original job from the gate for exactly that
+    # reason, and Windows stays release-blocking via release.yml before any
+    # tag.
+    # Neither premise holds on this fork. It exists to ship Windows
+    # binaries, so an advisory Windows leg means the merge gate can report
+    # green on code that does not compile on the one platform this fork is
+    # for; and its volume is a weekly upstream sync, not 160 PRs a fortnight,
+    # so the cost half of the trade is a fraction of upstream's. The job also
+    # self-limits through windows-filter: a change that touches no Windows
+    # path concludes skipped, and the check below fails only on failure or
+    # cancelled, so docs-only PRs keep the turnaround they always had.
+    # The gap is not hypothetical. On 2026-10-03 the upstream sync merge left
+    # a duplicate `mod winlock;` inside a cfg(windows) gate. Lint, build,
+    # test, audit and windows-footguns all passed, because on Linux and macOS
+    # a gated item is never expanded and the collision cannot be seen. Only
+    # the Windows build could report E0428, and it reported it 21 minutes in.
+    # Price of this line: for Windows-relevant PRs the gate now waits on the
+    # longer of the macOS build (~40m) and a cold Windows build (~50m); warm
+    # rust-cache runs land near 10m.
+    needs: [lint, build, test, audit, windows-footguns, windows-build]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
