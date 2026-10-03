@@ -193,65 +193,41 @@ jobs:
           CXXFLAGS: -march=armv8-a+crypto
         run: cargo build --locked --profile ci --target ${{ matrix.target }} ${{ matrix.features }}
 
-  # ── Stage 2b: Windows build (gated on lint, parallel with build) ─────────
-  # Windows is where platform-specific regressions actually ship: the `sh -c`
-  # hardcode in four child-spawn sites lived for months with CI green,
-  # because tests run on Linux (where `sh` exists) and Windows was never
-  # built here (#627 — the old job chronically hit the 40m cap with
-  # --all-features and cold caches). It catches spawn-path and cfg(windows) compile breakage at
-  # PR time, and since this commit it also EXECUTES the artifact once: the
-  # --version smoke step below is the first signal in this repo's history
-  # that opencrabs.exe actually starts. Compiling was never evidence of
-  # that (#1759). Still no full test suite here: the ci-gate job comment
-  # carries the #627 cost history behind that decision. The
-  # release recipe (CMake + NASM) compiles the llama-cpp-sys-2 C++ wrapper;
-  # `--profile ci` (thin LTO, 16 codegen units) plus rust-cache keep the
-  # wall-clock inside the cap that killed the original job.
-  windows-build:
-    name: Build (windows)
-    needs: [lint, audit]
+  # ── Stage 2a2: Windows path filter (decides whether Stage 2b runs) ────────
+  # Path filter, fail-open. A 51-minute GitHub-hosted build on every push
+  # to every PR is the cost that got the original job deleted (#627), and
+  # most PRs here cannot break Windows. Fire on the paths that have
+  # actually produced Windows-only breakage: the dependency graph and
+  # toolchain, the platform abstraction, the spawn and read paths, and
+  # this workflow itself. Anything we cannot determine builds anyway, and
+  # a `windows` label forces a build for the cases this list misses.
+  # Deliberate gap: a new cfg(windows) block in an unlisted file is not
+  # caught here. release.yml's matrix still builds Windows before any tag
+  # ships, which is the coverage #627 relied on; Stage 2b only moves that
+  # signal earlier for the paths where it pays for itself.
+  #
+  # Its own job rather than a step inside Stage 2b (#1831). A step-level
+  # `if:` skips the steps but the job still concludes success, so the merge
+  # box and `gh pr checks` rendered "Build (windows): pass" on a run that
+  # had compiled nothing. A job-level gate on this output is the only shape
+  # that renders the honest "skipped". Hosted Linux because it is a clone
+  # plus a grep: no toolchain, no cache, seconds.
+  windows-filter:
+    name: Windows path filter
+    # Carries the event gate Stage 2b used to own. On a main push neither
+    # job is evaluated, so a routine commit still pays for lint + test +
+    # audit only.
     if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
-    runs-on: windows-latest
-    # 60 min: a COLD windows-latest run needs ~48 (33 compile incl. llama's
-    # cmake C++ + ~15 for the thin-LTO link of a 4-vCPU runner); warm runs
-    # from rust-cache land near 10. The original 40 cap killed a build that
-    # was minutes from linking. Keep a cap so a true hang can't burn 360.
-    # 90 (not 60) while the scoped-test step rides along: the cfg(test) lib
-    # compiles on top of the build. The job is NOT in the required gate, so
-    # the extra ceiling is a priced trade for the first-ever Windows
-    # execution receipts, not silent drift.
-    timeout-minutes: 90
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      run: ${{ steps.relevant.outputs.run }}
     steps:
-      # fetch-depth 0: the path filter below diffs against the PR base sha.
+      # fetch-depth 0: the filter below diffs against the PR base sha.
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: Install Rust (from rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
-
-      # No `save-if` restriction: this job only runs on PRs and
-      # workflow_dispatch, so a `refs/heads/main`-only save-if never fires —
-      # the cache would stay cold forever. Saving in the run's own scope
-      # lets the 2nd..Nth push of a PR hit warm artifacts.
-      - uses: swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-
-      # Path filter, fail-open. A 51-minute GitHub-hosted build on every push
-      # to every PR is the cost that got the original job deleted (#627), and
-      # most PRs here cannot break Windows. Fire on the paths that have
-      # actually produced Windows-only breakage: the dependency graph and
-      # toolchain, the platform abstraction, the spawn and read paths, and
-      # this workflow itself. Anything we cannot determine builds anyway, and
-      # a `windows` label forces a build for the cases this list misses.
-      # Deliberate gap: a new cfg(windows) block in an unlisted file is not
-      # caught here. release.yml's matrix still builds Windows before any tag
-      # ships, which is the coverage #627 relied on; this job only moves that
-      # signal earlier for the paths where it pays for itself.
       - name: Windows-relevant changes?
         id: relevant
         shell: bash
@@ -276,7 +252,12 @@ jobs:
           files=$(git diff --name-only "$base" HEAD)
           echo "changed files:"
           echo "$files"
-          pattern='^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|build\.rs|\.github/workflows/ci\.yml|src/utils/(shell|cwd)\.rs|src/brain/tools/(bash|read)\.rs|src/tui/app/input\.rs|src/config/(winlock|profile)\.rs|src/cli/service_windows\.rs)$'
+          # The last two paths are #1823: the files whose tests assert
+          # Windows behaviour, so the runtime lane fires when they change.
+          # src/cli/service_windows.rs IS listed: on this fork that carrier
+          # exists (#9), so the Scheduled Task lifecycle is compiled and
+          # exercised by the scoped-test slice below on every change to it.
+          pattern='^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|build\.rs|\.github/workflows/ci\.yml|src/utils/(shell|cwd)\.rs|src/brain/tools/(bash|read)\.rs|src/tui/app/input\.rs|src/config/(winlock|profile)\\.rs|src/cli/service_windows\\.rs)$'
           if echo "$files" | grep -qE "$pattern"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
@@ -284,16 +265,61 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # ── Stage 2b: Windows build (gated on lint, audit, path filter) ─────────
+  # Windows is where platform-specific regressions actually ship: the `sh -c`
+  # hardcode in four child-spawn sites lived for months with CI green,
+  # because tests run on Linux (where `sh` exists) and Windows was never
+  # built here (#627 — the old job chronically hit the 40m cap with
+  # --all-features and cold caches). It catches spawn-path and cfg(windows)
+  # compile breakage at PR time, and since #1823 it also EXECUTES the binary
+  # it built: the --version smoke step below is the first signal in this
+  # repo's history that opencrabs.exe actually starts, because compile-green
+  # was never starts-green (#1759). Still no full test suite: the ci-gate job
+  # comment carries the #627 cost history behind that decision. The
+  # release recipe (CMake + NASM) compiles the llama-cpp-sys-2 C++ wrapper;
+  # `--profile ci` (thin LTO, 16 codegen units) plus rust-cache keep the
+  # wall-clock inside the cap that killed the original job.
+  windows-build:
+    name: Build (windows)
+    needs: [lint, audit, windows-filter]
+    # Job-level, not step-level (#1831): when the filter says no, GitHub
+    # concludes this job skipped. A needed job that was skipped or failed
+    # also lands here, since outputs.run stays empty.
+    if: needs.windows-filter.outputs.run == 'true'
+    runs-on: windows-latest
+    # 60 min: a COLD windows-latest run needs ~48 (33 compile incl. llama's
+    # cmake C++ + ~15 for the thin-LTO link of a 4-vCPU runner); warm runs
+    # from rust-cache land near 10. The original 40 cap killed a build that
+    # was minutes from linking. Keep a cap so a true hang can't burn 360.
+    # 90 (not 60) while the scoped-test step rides along: the cfg(test) lib
+    # compiles on top of the build. The job is NOT in the required gate, so
+    # the extra ceiling is a priced trade for the first-ever Windows
+    # execution receipts, not silent drift.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      # No `save-if` restriction: this job only runs on PRs and
+      # workflow_dispatch, so a `refs/heads/main`-only save-if never fires —
+      # the cache would stay cold forever. Saving in the run's own scope
+      # lets the 2nd..Nth push of a PR hit warm artifacts.
+      - uses: swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
       - name: Install CMake (Windows)
-        if: steps.relevant.outputs.run == 'true'
         uses: lukka/get-cmake@latest
 
       - name: Install NASM (Windows)
-        if: steps.relevant.outputs.run == 'true'
         uses: ilammy/setup-nasm@v1
 
       - name: Build
-        if: steps.relevant.outputs.run == 'true'
         shell: bash
         env:
           AWS_LC_SYS_CMAKE_BUILDER: '1'
@@ -313,21 +339,19 @@ jobs:
         # doesn't pull the esaxx object — the shape that ships releases.
         run: cargo build --locked --profile ci --target x86_64-pc-windows-msvc --all-features
 
-      # compile-green was never starts-green: a binary that dies on DLL
-      # load, console init, or allocator config at startup sails through a
-      # build-only job. This step runs the ci-profile binary THIS job just
-      # built: proof that a Windows-linked opencrabs.exe starts and answers
-      # --version. It is not the release artifact (release.yml links its own
-      # release-profile binary) — the claim is deliberately bounded. #1759
-      # shipped into a pipeline that could not distinguish the two.
+      # No step-level `if:` on either step below, deliberately. This job is
+      # gated at job level on needs.windows-filter.outputs.run (#1831) and
+      # has no `steps.relevant` context, so `steps.relevant.outputs.run`
+      # would evaluate falsy, both steps would be skipped, and the job would
+      # still conclude success: the exact fake-green shape #1855 removed
+      # from this file.
       - name: "Smoke (windows): execute the binary it built"
-        if: steps.relevant.outputs.run == 'true'
         shell: bash
         run: |
           # Actions' bash runs with -e: without the guard, a failing exe
           # would die AT the substitution and the echo below would never
-          # run — the exact case whose diagnostic we want. stderr rides in
-          # too (DLL-load failures land there).
+          # run, which is precisely the case whose diagnostic we want.
+          # stderr rides in too (DLL-load failures land there).
           set +e
           ver=$(./target/x86_64-pc-windows-msvc/ci/opencrabs.exe --version 2>&1)
           status=$?
@@ -338,44 +362,55 @@ jobs:
 
       # Scoped execution: only the modules whose tests assert platform
       # behaviour. Full-suite Windows was rejected twice (#627 cost, and
-      # POSIX-semantics failures that are not bugs). Slice members:
-      #   config::winlock      (from #3) cross-handle contention +
-      #                        fail-closed terminate proof -- cfg(windows):
-      #                        these run NOWHERE ELSE
-      #   cli::service_windows (from #9) PS builders, parser, injection
-      #   tests::utils_shell_test          the shell_pair probe contract
-      #   tests::utils_cwd_test            drive-letter + lookalike dirs
-      #   tests::browser_default_windows_test  browser path detection
-      #   tests::profile_test                  lock-owner stamp parsing and
-      #                        reused-PID resolution: 67 tests that exist on
-      #                        THIS base, so Windows gives real receipts on
-      #                        day 1 instead of a zero-match tripwire. The
-      #                        round-9 finding (a Windows-only test failure)
-      #                        lived in exactly this module, and no CI job
-      #                        could have seen it: Windows ran no tests.
-      # The first two do not exist on this branch's base: the per-filter
-      # tripwire below reports them as ZERO-MATCH until #3/#9 merge,
-      # rather than pretending green. That silence-is-failure property is
-      # the point of looping filters instead of one combined cargo test.
-      # fail-soft by design: the honest day-1 state is "unknown until run".
-      # Flip continue-on-error once the receipts are green, not before.
+      # POSIX-semantics failures that are not bugs). Every member below
+      # exists on this tree, so Windows gives real receipts on day 1 instead
+      # of a zero-match tripwire:
+      #   config::winlock                     3 tests, cross-handle
+      #                                       contention and fail-closed
+      #                                       terminate proof, cfg(windows):
+      #                                       these run nowhere else
+      #   tests::utils_shell_test            12 tests, the shell_pair probe
+      #                                       contract
+      #   tests::utils_cwd_test               5 tests, drive-letter and
+      #                                       lookalike dirs
+      #   tests::browser_default_windows_test  6 tests, browser path
+      #                                       detection
+      #   tests::profile_test                67 tests, lock-owner stamp
+      #                                       parsing and reused-PID
+      #                                       resolution. The round-9
+      #                                       finding (a Windows-only test
+      #                                       failure) lived in exactly this
+      #                                       module, and no CI job could
+      #                                       have seen it: Windows ran no
+      #                                       tests.
+      #   cli::service_windows               11 tests, PS builders, the line
+      #                                       protocol parser, injection and the
+      #                                       Scheduled Task lifecycle. Its carrier
+      #                                       EXISTS on this fork (#9), so it is
+      #                                       listed here and gets real receipts
+      #                                       instead of a zero-match tripwire.
+      # continue-on-error: true is the honest day-1 state, not a dodge: 104
+      # tests here have never executed on Windows in this repo's history, so
+      # their outcome is unknown and must not block a PR. The smoke step
+      # above is NOT soft, because a binary that does not start is a hard
+      # fail. Flip continue-on-error to false once the receipts are green,
+      # in the PR that reports them.
       - name: "Scoped tests (windows): platform-behaviour slice"
-        if: steps.relevant.outputs.run == 'true'
         continue-on-error: true
         shell: bash
         run: |
           # One filter per module, each individually judged. A combined
           # `cargo test -- a b c` that silently matches nothing looks green;
-          # per-module zero-detection here is a SCREAM (module renamed, not
-          # yet merged, or renamed by a sibling PR), not a pass -- the same
-          # anti-fake-green principle the footgun gate's --self-test enforces.
+          # per-module zero-detection here is a SCREAM (a module renamed by a
+          # sibling PR), not a pass, the same anti-fake-green principle the
+          # footgun gate's --self-test enforces.
           # Actions' bash runs with -e, so an unguarded substitution exits AT
           # the assignment and `rc=$?` below is never reached: the loop would
           # abort on the first failing module, print none of the captured
-          # output, and skip every module after it. The smoke step above
-          # carries the same guard for the same reason. One more trap: with
-          # `--lib`, cargo writes "test result: FAILED. N passed" on failure,
-          # so parsing `$out` must not assume the ok-form.
+          # output, and skip every module after it. The smoke step carries
+          # the same guard for the same reason. One more trap: with `--lib`,
+          # cargo writes "test result: FAILED. N passed" on failure, so
+          # parsing $out must not assume the ok-form.
           status=0
           for m in config::winlock cli::service_windows tests::utils_shell_test \
                    tests::utils_cwd_test tests::browser_default_windows_test \
@@ -392,28 +427,35 @@ jobs:
               printf '%s\n' "$out" | tail -20
               status=1
             elif [ -z "$n" ] || [ "$n" -eq 0 ]; then
-              echo "::warning::Windows slice ZERO-MATCH: $m names no tests here (renamed or not yet merged)"
+              echo "::warning::Windows slice ZERO-MATCH: $m names no tests here (renamed by a sibling PR)"
               status=1
             else
               echo "Windows slice PASS: $m ($n tests)"
             fi
           done
           exit $status
-  # ── Windows footgun gate (seconds, every PR, no path filter) ──────
-  # The windows-build job is deliberately path-filtered to keep #627's
-  # bill down, which means a spawn-path or POSIX-API regression in an
-  # unlisted file surfaces for the first time at RELEASE time -- that is
-  # literally how #1759 shipped. This gate covers the lexically detectable
-  # half of that class on every push for the cost of one python run:
-  # self-test first (a linter that learned to find nothing fails loudly),
-  # then the tree.
+
+  # ── Windows footgun gate (static, cheap, blocks the merge) ─────────────
+  # The only python step in this workflow, and deliberately not part of the
+  # Windows build lane: it scans source text, so it costs seconds instead
+  # of the 51m09s that keeps windows-build out of the required gate below.
+  # A footgun finding blocks the PR rather than scrolling by as advisory,
+  # which is the whole point of running it on every push.
+  #
+  # `--self-test` runs FIRST and on its own line: it plants every rule and
+  # every cfg shape, so a linter regression fails here instead of turning
+  # the scan green by matching nothing. That is the difference between a
+  # gate and decoration.
   windows-footguns:
     name: Windows footguns
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+
       - name: Linter proves its own teeth
         run: python3 scripts/check-windows-footguns.py --self-test
+
       - name: Scan the tree
         run: python3 scripts/check-windows-footguns.py --root src
 
@@ -681,17 +723,16 @@ jobs:
   ci-gate:
     name: CI Required Gate
     if: always()
-    # windows-build is deliberately NOT in the required set. It is the only
-    # GitHub-hosted job here (everything else runs on the self-hosted Mac),
+    # windows-build is deliberately NOT in the required set. It is the most
+    # expensive job here (a cold Windows build measured 51m09s),
     # it measured 51m09s cold, and at ~160 PR runs a fortnight that is ~136h
     # of 2x-billed runner time against the 3 Windows builds release.yml
     # actually ran in the same window. #627 removed the original job from the
     # gate for exactly that reason. It stays as an advisory signal; Windows
     # remains release-blocking via release.yml's build matrix before any tag.
-    # windows-footguns IS required: it is an ubuntu python pass measured in
-    # seconds, and a footgun finding must block the PR, not scroll by as an
-    # advisory (the whole point of the gate is that nothing lints the
-    # cfg(windows) arms on their way in otherwise).
+    # windows-footguns IS in the required set, which is not in tension with
+    # the paragraph above: same class of finding (Windows-specific) at a
+    # python-pass cost, so blocking on it buys certainty for seconds.
     needs: [lint, build, test, audit, windows-footguns]
     runs-on: ubuntu-latest
     steps:

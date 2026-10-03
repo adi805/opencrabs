@@ -14,7 +14,10 @@ use crate::brain::agent::service::session_routes::{
     register_session_route, register_turn_probe,
 };
 use crate::brain::tools::subagent::SessionNotifyTool;
-use crate::brain::tools::r#trait::Tool;
+use crate::brain::tools::r#trait::{Tool, ToolExecutionContext};
+use crate::db::models::Session;
+use crate::db::{Database, NotifyQueueRepository, SessionBindingRepository, SessionRepository};
+use crate::services::ServiceContext;
 
 fn msg() -> QueuedUserMessage {
     QueuedUserMessage {
@@ -23,6 +26,54 @@ fn msg() -> QueuedUserMessage {
         origin: crate::brain::agent::PushOrigin::Other,
         bg_meta: None,
     }
+}
+
+#[tokio::test]
+#[expect(clippy::await_holding_lock)]
+async fn absent_session_fails_loudly_without_queue_residue() {
+    let _guard = test_guard();
+    let db = Database::connect_in_memory().await.expect("in-memory DB");
+    db.run_migrations().await.expect("migrations");
+    let absent = Uuid::new_v4();
+    let mut context = ToolExecutionContext::new(Uuid::new_v4()).with_session_notify_enabled(true);
+    context.service_context = Some(ServiceContext::new(db.pool().clone()));
+
+    let result = SessionNotifyTool
+        .execute(
+            serde_json::json!({"target_session": absent.to_string(), "message": "probe"}),
+            &context,
+        )
+        .await
+        .expect("tool returns a verdict");
+
+    assert!(
+        !result.success,
+        "absent session must fail loudly: {result:?}"
+    );
+    assert_eq!(
+        result.metadata.get("notify_state").map(String::as_str),
+        Some("undeliverable")
+    );
+    assert_eq!(
+        result.metadata.get("notify_reason").map(String::as_str),
+        Some("no_such_session")
+    );
+    // A failing verdict carries its text in `error`, not `output`:
+    // `ToolResult::error` deliberately leaves `output` empty, and
+    // `build_tool_result_content` renders `error` to the caller
+    // (tool_loop.rs). Asserting on `output` here would pass on a verdict
+    // that told the model nothing — which is the defect this test exists to
+    // catch, so read the field the caller actually reads.
+    let detail = result.error.as_deref().unwrap_or_default();
+    assert!(detail.contains("a2a_send"), "got: {detail:?}");
+    assert!(
+        NotifyQueueRepository::new(db.pool().clone())
+            .all()
+            .await
+            .expect("queue query")
+            .is_empty(),
+        "a rejected target must never leave durable queue residue"
+    );
 }
 
 #[tokio::test]
@@ -46,7 +97,8 @@ async fn test_notify_pushes_carry_sessionnotify_origin_for_topic_echo() {
         }),
     );
 
-    let context = crate::brain::tools::r#trait::ToolExecutionContext::new(Uuid::new_v4());
+    let context = crate::brain::tools::r#trait::ToolExecutionContext::new(Uuid::new_v4())
+        .with_session_notify_enabled(true);
     let outcome = SessionNotifyTool
         .execute(
             serde_json::json!({"target_session": session.to_string(), "message": "ping"}),
@@ -178,7 +230,8 @@ async fn test_tool_reports_refusal_with_remedy() {
     expect_channel_route(session);
     register_turn_probe(session, std::sync::Arc::new(|| true));
 
-    let context = crate::brain::tools::r#trait::ToolExecutionContext::new(Uuid::new_v4());
+    let context = crate::brain::tools::r#trait::ToolExecutionContext::new(Uuid::new_v4())
+        .with_session_notify_enabled(true);
     let outcome = SessionNotifyTool
         .execute(
             serde_json::json!({"target_session": session.to_string(), "message": "ping"}),
@@ -213,7 +266,8 @@ async fn test_tool_interrupt_param_reaches_delivery() {
     );
     register_turn_probe(session, std::sync::Arc::new(|| true));
 
-    let context = crate::brain::tools::r#trait::ToolExecutionContext::new(Uuid::new_v4());
+    let context = crate::brain::tools::r#trait::ToolExecutionContext::new(Uuid::new_v4())
+        .with_session_notify_enabled(true);
     let outcome = SessionNotifyTool
         .execute(
             serde_json::json!({
@@ -429,7 +483,8 @@ async fn test_tool_reports_redirect_to_occupant() {
     );
     register_session_route(occupant, std::sync::Arc::new(|_id, _queued| {}));
 
-    let context = crate::brain::tools::r#trait::ToolExecutionContext::new(Uuid::new_v4());
+    let context = crate::brain::tools::r#trait::ToolExecutionContext::new(Uuid::new_v4())
+        .with_session_notify_enabled(true);
     let outcome = SessionNotifyTool
         .execute(
             serde_json::json!({"target_session": session.to_string(), "message": "ping"}),
@@ -504,5 +559,199 @@ async fn test_ownership_mirror_keys_dm_and_general_buckets_separately() {
         ChannelOwnership::Occupied {
             occupant: successor
         }
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn existing_unbound_session_is_refused_without_queue_residue() {
+    // #574, refusal half. A session with no `session_bindings` row can never
+    // drain a queue: no channel can ever claim it. Pre-#574 the tool knew
+    // that and still returned a SUCCESS receipt while parking the message
+    // permanently — the park outlived every restart, because nothing could
+    // ever clear it.
+    let _guard = test_guard();
+    let db = Database::connect_in_memory().await.expect("in-memory DB");
+    db.run_migrations().await.expect("migrations");
+    let target = Session::new(Some("headless target".into()), None, None);
+    SessionRepository::new(db.pool().clone())
+        .create(&target)
+        .await
+        .expect("seed session");
+    // The in-memory awaiting-channel mark is kept DELIBERATELY. Pre-fix it is
+    // what made `deliver_to_session` park this target and the tool report
+    // success, so the setup is what makes this test a discriminator rather
+    // than a restatement of the assertion. The refusal must fire before that
+    // park is ever reached, which is why no queue row may survive.
+    crate::brain::agent::service::restart_recovery::expect_channel_route(target.id);
+
+    let mut context = ToolExecutionContext::new(Uuid::new_v4()).with_session_notify_enabled(true);
+    context.service_context = Some(ServiceContext::new(db.pool().clone()));
+    let result = SessionNotifyTool
+        .execute(
+            serde_json::json!({"target_session": target.id.to_string(), "message": "probe"}),
+            &context,
+        )
+        .await
+        .expect("tool returns a verdict");
+
+    assert!(
+        !result.success,
+        "an unbound target must fail loudly instead of parking: {result:?}"
+    );
+    assert_eq!(
+        result.metadata.get("notify_state").map(String::as_str),
+        Some("undeliverable")
+    );
+    assert_eq!(
+        result.metadata.get("notify_reason").map(String::as_str),
+        Some("unclaimed_no_binding")
+    );
+    // Same field discipline as the absent-session test above: a failing
+    // verdict carries its text in `error`, and asserting on `output` would
+    // pass on a verdict that told the model nothing.
+    let detail = result.error.as_deref().unwrap_or_default();
+    assert!(detail.contains("a2a_send"), "got: {detail:?}");
+    assert!(
+        NotifyQueueRepository::new(db.pool().clone())
+            .all()
+            .await
+            .expect("queue query")
+            .is_empty(),
+        "a refused target must never leave durable queue residue"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn bound_but_unclaimed_session_still_parks_as_awaiting_channel_claim() {
+    // #574, park half — the control for the refusal above. A session that HAS
+    // a binding but whose channel has not claimed it since restart is exactly
+    // what the durable queue exists for (#1206): it will be delivered as soon
+    // as that channel next binds. Collapsing this arm into the refusal would
+    // silently drop real deliveries, so it is pinned separately.
+    let _guard = test_guard();
+    let db = Database::connect_in_memory().await.expect("in-memory DB");
+    db.run_migrations().await.expect("migrations");
+    let target = Session::new(Some("channel-bound target".into()), None, None);
+    SessionRepository::new(db.pool().clone())
+        .create(&target)
+        .await
+        .expect("seed session");
+    SessionBindingRepository::new(db.pool().clone())
+        .upsert(target.id.to_string(), "telegram", "12345", Some(40695))
+        .await
+        .expect("seed binding");
+    crate::brain::agent::service::restart_recovery::expect_channel_route(target.id);
+
+    let mut context = ToolExecutionContext::new(Uuid::new_v4()).with_session_notify_enabled(true);
+    context.service_context = Some(ServiceContext::new(db.pool().clone()));
+    let result = SessionNotifyTool
+        .execute(
+            serde_json::json!({"target_session": target.id.to_string(), "message": "probe"}),
+            &context,
+        )
+        .await
+        .expect("tool returns a verdict");
+
+    assert!(
+        result.success,
+        "a bound-but-unclaimed session must still park: {result:?}"
+    );
+    assert_eq!(
+        result.metadata.get("notify_state").map(String::as_str),
+        Some("queued")
+    );
+    assert_eq!(
+        result.metadata.get("notify_reason").map(String::as_str),
+        Some("awaiting_channel_claim")
+    );
+    assert!(result.output.contains("has not claimed it since"));
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn unbound_session_with_a_live_route_still_delivers() {
+    // #574, control for the refusal's PREDICATE. A durable binding is how a
+    // session survives a restart; it is not the only way to be REACHABLE. A
+    // channel holding the session right now has registered an in-memory
+    // route, so refusing on the binding alone would reject a live,
+    // deliverable target. This pins that the refusal does not fire there.
+    let _guard = test_guard();
+    let db = Database::connect_in_memory().await.expect("in-memory DB");
+    db.run_migrations().await.expect("migrations");
+    let target = Session::new(Some("live but unbound".into()), None, None);
+    SessionRepository::new(db.pool().clone())
+        .create(&target)
+        .await
+        .expect("seed session");
+    let delivered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = delivered.clone();
+    register_session_route(
+        target.id,
+        std::sync::Arc::new(move |_id, _queued| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }),
+    );
+
+    let mut context = ToolExecutionContext::new(Uuid::new_v4()).with_session_notify_enabled(true);
+    context.service_context = Some(ServiceContext::new(db.pool().clone()));
+    let result = SessionNotifyTool
+        .execute(
+            serde_json::json!({"target_session": target.id.to_string(), "message": "probe"}),
+            &context,
+        )
+        .await
+        .expect("tool returns a verdict");
+
+    assert!(
+        result.success,
+        "a session with a live route is reachable and must deliver: {result:?}"
+    );
+    assert_eq!(
+        result.metadata.get("notify_state").map(String::as_str),
+        Some("delivered")
+    );
+    assert_eq!(
+        delivered.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the registered route callback must actually have been invoked"
+    );
+}
+
+/// #1802 kill switch: a default context (flag unset) refuses every action.
+#[tokio::test]
+async fn kill_switch_default_off_refuses_send_and_status() {
+    let context = crate::brain::tools::r#trait::ToolExecutionContext::new(Uuid::new_v4());
+
+    let send_err = SessionNotifyTool
+        .execute(
+            serde_json::json!({
+                "target_session": Uuid::new_v4().to_string(),
+                "message": "probe"
+            }),
+            &context,
+        )
+        .await
+        .expect_err("send must refuse while the kill switch is off");
+    assert!(
+        send_err.to_string().contains("disabled by config"),
+        "unexpected error: {send_err:?}"
+    );
+
+    let status_err = SessionNotifyTool
+        .execute(
+            serde_json::json!({
+                "target_session": Uuid::new_v4().to_string(),
+                "action": "status",
+                "notify_id": Uuid::new_v4().to_string()
+            }),
+            &context,
+        )
+        .await
+        .expect_err("status must refuse while the kill switch is off");
+    assert!(
+        status_err.to_string().contains("disabled by config"),
+        "unexpected error: {status_err:?}"
     );
 }

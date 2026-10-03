@@ -25,6 +25,8 @@ pub mod timeout;
 pub(crate) mod types;
 pub mod update;
 pub mod voice_flag_flips;
+#[cfg(windows)]
+pub(crate) mod winlock;
 
 pub use provider_registry::{ProviderRegistry, ProviderRegistryConfig};
 pub use registry_client::{Model, Provider, RegistryClient};

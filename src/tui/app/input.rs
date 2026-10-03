@@ -452,6 +452,12 @@ impl App {
         // If this was a plain click (no drag motion), treat it as a click-select.
         let Some(anchor) = self.drag_anchor.take() else {
             self.drag_current = None;
+            // Click-to-open (#1772): a token under the cursor resolving to a
+            // URL or an existing path launches and consumes the click.
+            // Anywhere else keeps the existing fold/select semantics.
+            if self.try_open_clicked(col, row) {
+                return;
+            }
             self.handle_click_select(row);
             return;
         };
@@ -466,6 +472,54 @@ impl App {
             self.notification = Some("Copied to clipboard".to_string());
             self.notification_shown_at = Some(std::time::Instant::now());
         }
+    }
+
+    /// Screen coordinates → rendered line under the cursor → clickable token
+    /// → launch. Returns true when the click opened something (or copied the
+    /// path after a failed launch), consuming it. Coordinate math mirrors
+    /// `extract_drag_selection`: `Padding(1,1,1,0)` puts the first text row at
+    /// `chat_area_y + 1` and content one cell past `chat_area_x`.
+    fn try_open_clicked(&mut self, col: u16, row: u16) -> bool {
+        let chat_height = self.chat_area_height as usize;
+        if chat_height == 0 {
+            return false;
+        }
+        let top_pad = 1u16;
+        let Some(row_in_chat) = row.checked_sub(self.chat_area_y + top_pad) else {
+            return false;
+        };
+        let row_in_chat = row_in_chat as usize;
+        if row_in_chat >= chat_height.saturating_sub(top_pad as usize) {
+            return false;
+        }
+        let line_idx = self.chat_render_scroll + row_in_chat;
+        let Some(line) = self.chat_rendered_lines.get(line_idx) else {
+            return false;
+        };
+        let content_left = self.chat_area_x + 1;
+        let col_in_line = col.saturating_sub(content_left) as usize;
+        let Some(target) = super::clickable::target_at(line, col_in_line) else {
+            return false;
+        };
+        match super::clickable::open(&target) {
+            Ok(()) => {
+                self.notification = Some(format!("Opened {}", target.label()));
+                self.notification_shown_at = Some(std::time::Instant::now());
+            }
+            // No launcher on this box (or it refused): the token was still
+            // the click's intent, so copy it instead of a dead end — same
+            // fallback the session-files overlay uses.
+            Err(_) => {
+                let copied = Self::copy_to_clipboard(&target.label());
+                self.notification = Some(if copied {
+                    format!("Copied {} (no launcher available)", target.label())
+                } else {
+                    format!("Could not open {}", target.label())
+                });
+                self.notification_shown_at = Some(std::time::Instant::now());
+            }
+        }
+        true
     }
 
     /// Turn a pair of terminal-screen coordinates into the plain-text that was
@@ -1054,6 +1108,36 @@ impl App {
         })
     }
 
+    /// Attach the clipboard's raw image bytes, if any, and track the file in
+    /// the session. Shared by the empty bracketed paste and Ctrl+V so both
+    /// routes attach, track and announce identically. `what` names the source
+    /// in the notification. Returns whether an image was attached.
+    pub(crate) fn attach_image_from_clipboard(&mut self, what: &str) -> bool {
+        let Some(att) = Self::attach_clipboard_image() else {
+            return false;
+        };
+        let label = att.name.clone();
+        if let Some(session) = &self.current_session {
+            let file_svc = self.file_service.clone();
+            let sid = session.id;
+            let path = std::path::PathBuf::from(&att.path);
+            tokio::spawn(async move {
+                if let Err(e) = file_svc.get_or_create_file(sid, path, None).await {
+                    tracing::warn!("Failed to track pasted image: {e}");
+                }
+            });
+        }
+        self.attachments.push(att);
+        self.notification = Some(format!("📎 Attached {what}: {label}"));
+        self.notification_shown_at = Some(std::time::Instant::now());
+        // The paste resolves the hint for this clipboard content; the probe
+        // re-arms it only when the content changes (#1816).
+        self.clipboard_hint = None;
+        self.clipboard_hint_shown_at = None;
+        self.clipboard_hint_suppressed = true;
+        true
+    }
+
     /// Read TEXT from the OS clipboard (pbpaste / wl-paste / xclip). `None`
     /// when every backend fails or the clipboard holds nothing usable.
     // Each platform's `return` is the exit of its own cfg block; on the one
@@ -1157,16 +1241,21 @@ impl App {
     /// drag-drop uses, so every file type and every receipt matches. Plain
     /// text (or an unresolvable path) inserts at the cursor, keeping Ctrl+V a
     /// working paste key on terminals that never bracket-paste.
+    ///
+    /// No usable text (a screenshot copied to the clipboard carries image
+    /// classes only, #1811) falls back to the clipboard's raw image bytes.
     pub(crate) fn attach_from_clipboard(&mut self) {
-        let Some(text) = Self::read_clipboard_text() else {
-            tracing::debug!("Ctrl+V: clipboard text unreadable");
-            return;
+        let clip = Self::read_clipboard_text();
+        let text = match super::clipboard_route::route_for_clipboard_text(clip.as_deref()) {
+            super::clipboard_route::ClipboardRoute::Text(t) => t.to_string(),
+            super::clipboard_route::ClipboardRoute::Image => {
+                if !self.attach_image_from_clipboard("clipboard image") {
+                    tracing::debug!("Ctrl+V: clipboard holds neither text nor an image");
+                }
+                return;
+            }
         };
         let trimmed = text.trim().to_string();
-        if trimmed.is_empty() {
-            tracing::debug!("Ctrl+V: clipboard text empty after trim");
-            return;
-        }
 
         if Self::resolve_dropped_path(&trimmed).is_some() {
             // File-shaped: ride the full pipeline so classification,
@@ -2134,11 +2223,12 @@ impl App {
             // and its reasoning details. Scoped to that turn so a long
             // transcript does not reflow out from under the user.
             self.toggle_newest_turn(true);
-        } else if event.code == KeyCode::Char('v') && event.modifiers == KeyModifiers::CONTROL {
-            // Ctrl+V (#1740): paste/attach from the OS clipboard. File-shaped
-            // clipboard text attaches through the same pipeline as a drop
-            // (any file type); plain text inserts at the cursor, so terminals
-            // that never bracket-paste still get a working paste key.
+        } else if keys::is_clipboard_paste(&event) {
+            // Ctrl+V (#1740), or Cmd+V passed through as SUPER (#1812): paste
+            // or attach from the OS clipboard. File-shaped clipboard text
+            // attaches through the same pipeline as a drop (any file type);
+            // plain text inserts at the cursor, so terminals that never
+            // bracket-paste still get a working paste key.
             self.attach_from_clipboard();
         } else if keys::is_page_up(&event) {
             let before = self.scroll_offset;
@@ -2350,10 +2440,7 @@ impl App {
                 KeyCode::Char('@') => {
                     self.open_file_picker().await?;
                 }
-                KeyCode::Char(c)
-                    if !event.modifiers.contains(KeyModifiers::CONTROL)
-                        || event.modifiers.contains(KeyModifiers::ALT) =>
-                {
+                KeyCode::Char(c) if keys::types_character(event.modifiers) => {
                     // Reject chars that are fragments of mouse tracking CSI
                     // sequences leaked through tmux pane switches.  Pattern:
                     // ESC [ < Ps ; Ps ; Ps M  — the ESC is eaten by crossterm

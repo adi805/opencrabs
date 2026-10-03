@@ -14,6 +14,11 @@ use serde_json::{Value, json};
 
 use crate::config::{Config, types::ProviderConfig};
 
+/// The config-option id this agent publishes, and the only `configId`
+/// `session/set_config_option` accepts (#1815 F5). Named here so the payload
+/// builder and the setter cannot disagree about the key.
+pub const CONFIG_OPTION_MODEL: &str = "model";
+
 /// Slash commands for the ACP `available_commands_update` push: the built-in
 /// table the TUI autocompletes from, the installed skills, and the user's
 /// commands.toml entries. Names are normalised to ACP shape (no leading
@@ -42,45 +47,130 @@ pub fn commands_payload() -> Vec<Value> {
     out
 }
 
-/// Build the ACP `models` payload: `{ availableModels, currentModelId }`.
-///
-/// `current_override` is the ACP session's pinned pair (`--model` or a prior
-/// `session/set_model`); when absent the first usable configured provider's
-/// default model is reported, mirroring `resolve_provider_from_config`.
-pub fn models_payload(config: &Config, current_override: Option<&str>) -> Value {
-    let mut available: Vec<Value> = Vec::new();
-    let mut first_pair: Option<String> = None;
+/// One configured model: the provider it belongs to, how that provider is
+/// labelled, the model name, and the `provider/model` pair a client sends back.
+struct ModelEntry {
+    provider: String,
+    display: String,
+    model: String,
+    pair: String,
+}
 
+/// Walk the provider registry once and drop anything unusable. Both payload
+/// shapes render from this list, so `models` (the field MonoCode reads) and
+/// `configOptions` (the field v1 defines) cannot drift apart.
+fn collect_models(config: &Config) -> Vec<ModelEntry> {
+    let mut entries: Vec<ModelEntry> = Vec::new();
     for (id, display, requires_api_key, cfg) in config.providers.provider_registry() {
         let Some(c) = cfg else { continue };
         if !c.enabled || (requires_api_key && c.api_key.is_none()) {
             continue;
         }
-        push_provider_models(&mut available, id, display, c, &mut first_pair);
+        push_provider_models(&mut entries, id, display, c);
     }
     if let Some((name, cfg)) = config.providers.active_custom() {
-        push_provider_models(&mut available, name, name, cfg, &mut first_pair);
+        push_provider_models(&mut entries, name, name, cfg);
     }
+    entries
+}
 
-    let current = current_override
+/// The session's current pair: an explicit pin if there is one, otherwise the
+/// first usable configured model.
+fn current_pair(entries: &[ModelEntry], current_override: Option<&str>) -> String {
+    current_override
         .map(str::to_string)
-        .or(first_pair)
-        .unwrap_or_default();
+        .or_else(|| entries.first().map(|e| e.pair.clone()))
+        .unwrap_or_default()
+}
+
+/// Build the ACP `models` payload: `{ availableModels, currentModelId }`.
+///
+/// `current_override` is the ACP session's pinned pair (`--model` or a prior
+/// model switch); when absent the first usable configured provider's default
+/// model is reported, mirroring `resolve_provider_from_config`.
+///
+/// `models` is not a v1 field: `NewSessionResponse` knows `sessionId`, `modes`,
+/// `configOptions` and `_meta` only. It stays because MonoCode renders its
+/// picker from it, and dropping it would break a client that already works.
+/// Schema-clean clients read `config_options_payload` instead (#1815 F4).
+pub fn models_payload(config: &Config, current_override: Option<&str>) -> Value {
+    let entries = collect_models(config);
+    let available: Vec<Value> = entries
+        .iter()
+        .map(|e| {
+            json!({
+                "modelId": e.pair,
+                "name": format!("{} / {}", e.display, e.model),
+            })
+        })
+        .collect();
     json!({
         "availableModels": available,
-        "currentModelId": current,
+        "currentModelId": current_pair(&entries, current_override),
     })
 }
 
+/// Build the `configOptions` payload for the same catalog: a single select
+/// option with `category: "model"`, values grouped per provider.
+///
+/// Emitted alongside `models` because a client generated strictly from the
+/// schema drops unknown root fields, which made the model picker invisible
+/// outside the MonoCode pairing (#1815 F4).
+///
+/// Both halves of the contract exist now: selection travels through
+/// `session/set_config_option` (the official write path, #1815 F5) and through
+/// `_opencrabs/set_model`, and both call the same switch.
+///
+/// SHAPE HONESTY: official v1 `SessionConfigOption` requires only `id` and
+/// `name`, and defines nothing but `id`, `name`, `description`, `category` and
+/// `_meta`. The `type`, `currentValue` and grouped `options` fields below come
+/// from the UNSTABLE schema (`schema.unstable.json` / `v2/schema.json`), which
+/// is what #1815 was filed against and what MonoCode reads today. They are not
+/// v1-stable, so a strict v1 client sees a labeled option it cannot enumerate
+/// and keeps working: every extra field is additive. Do not cite this as the
+/// v1 shape.
+pub fn config_options_payload(config: &Config, current_override: Option<&str>) -> Value {
+    let entries = collect_models(config);
+    if entries.is_empty() {
+        return json!([]);
+    }
+    let mut groups: Vec<Value> = Vec::new();
+    for e in &entries {
+        let option = json!({ "value": e.pair, "name": e.model });
+        if let Some(existing) = groups
+            .iter_mut()
+            .find(|g| g["group"].as_str() == Some(&e.provider))
+        {
+            existing["options"]
+                .as_array_mut()
+                .expect("group built with an options array")
+                .push(option);
+        } else {
+            groups.push(json!({
+                "group": e.provider,
+                "name": e.display,
+                "options": [option],
+            }));
+        }
+    }
+    json!([{
+        "id": CONFIG_OPTION_MODEL,
+        "name": "Model",
+        "description": "Provider and model used for this session",
+        "category": "model",
+        "type": "select",
+        "currentValue": current_pair(&entries, current_override),
+        "options": groups,
+    }])
+}
+
 /// Emit one entry per configured model, falling back to the provider's
-/// default model when the runtime list is empty. `first_pair` records the
-/// first emitted pair so the caller can name a current model.
+/// default model when the runtime list is empty.
 fn push_provider_models(
-    available: &mut Vec<Value>,
+    entries: &mut Vec<ModelEntry>,
     id: &str,
     display: &str,
     cfg: &ProviderConfig,
-    first_pair: &mut Option<String>,
 ) {
     let mut models: Vec<&str> = cfg
         .models
@@ -96,13 +186,11 @@ fn push_provider_models(
         models.push(d);
     }
     for model in models {
-        let pair = format!("{id}/{model}");
-        if first_pair.is_none() {
-            *first_pair = Some(pair.clone());
-        }
-        available.push(json!({
-            "modelId": pair,
-            "name": format!("{display} / {model}"),
-        }));
+        entries.push(ModelEntry {
+            provider: id.to_string(),
+            display: display.to_string(),
+            model: model.to_string(),
+            pair: format!("{id}/{model}"),
+        });
     }
 }

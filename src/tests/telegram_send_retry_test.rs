@@ -8,6 +8,7 @@
 //! multi-hour flood-ban window (8288s observed) cannot park the agent turn
 //! for hours. Small windows keep #297 semantics unchanged.
 
+use crate::channels::telegram::governor::test_support;
 use crate::channels::telegram::handler::send_retrying_rate_limit;
 use std::cell::Cell;
 use std::time::Duration;
@@ -20,6 +21,10 @@ fn rate_limited<T>() -> Result<T, teloxide::RequestError> {
 
 #[tokio::test]
 async fn waits_out_rate_limits_then_delivers() {
+    // #1832: `wait_out` arms the process-wide GLOBAL_COOLDOWN and advances
+    // the shared virtual clock, so this must not run beside guarded tests.
+    let _guard = test_support::registry_guard().await;
+    let _cooldown = crate::tests::telegram_cooldown_lock::guard().await;
     let calls = Cell::new(0u32);
     let out = send_retrying_rate_limit("test send", || {
         let n = calls.get() + 1;
@@ -33,6 +38,9 @@ async fn waits_out_rate_limits_then_delivers() {
 
 #[tokio::test]
 async fn exhausted_retries_propagate_the_error() {
+    // #1832: arms GLOBAL_COOLDOWN via `wait_out`, see above.
+    let _guard = test_support::registry_guard().await;
+    let _cooldown = crate::tests::telegram_cooldown_lock::guard().await;
     let calls = Cell::new(0u32);
     let out: Result<(), _> = send_retrying_rate_limit("test send", || {
         calls.set(calls.get() + 1);
@@ -46,6 +54,8 @@ async fn exhausted_retries_propagate_the_error() {
 
 #[tokio::test]
 async fn non_rate_limit_error_propagates_immediately() {
+    let _guard = test_support::registry_guard().await;
+    let _cooldown = crate::tests::telegram_cooldown_lock::guard().await;
     let calls = Cell::new(0u32);
     let out: Result<(), _> = send_retrying_rate_limit("test send", || {
         calls.set(calls.get() + 1);
@@ -61,6 +71,8 @@ async fn non_rate_limit_error_propagates_immediately() {
 
 #[tokio::test]
 async fn first_try_success_sends_once() {
+    let _guard = test_support::registry_guard().await;
+    let _cooldown = crate::tests::telegram_cooldown_lock::guard().await;
     let calls = Cell::new(0u32);
     let out = send_retrying_rate_limit("test send", || {
         calls.set(calls.get() + 1);
@@ -78,6 +90,8 @@ async fn first_try_success_sends_once() {
 /// total), since retrying burns 90s for no gain when the window is hours long.
 #[tokio::test(start_paused = true)]
 async fn oversized_windows_are_capped_not_slept_in_full() {
+    let _guard = test_support::registry_guard().await;
+    let _cooldown = crate::tests::telegram_cooldown_lock::guard().await;
     let calls = Cell::new(0u32);
     let start = tokio::time::Instant::now();
     let out: Result<(), _> = send_retrying_rate_limit("test send", || {
@@ -109,6 +123,9 @@ async fn oversized_windows_are_capped_not_slept_in_full() {
 /// Windows under the cap keep #297 semantics: waited in full, then retried.
 #[tokio::test(start_paused = true)]
 async fn small_windows_are_waited_in_full() {
+    // #1832: a 5s window arms GLOBAL_COOLDOWN for 7s via `wait_out`, see above.
+    let _guard = test_support::registry_guard().await;
+    let _cooldown = crate::tests::telegram_cooldown_lock::guard().await;
     let calls = Cell::new(0u32);
     let start = tokio::time::Instant::now();
     let out = send_retrying_rate_limit("test send", || {

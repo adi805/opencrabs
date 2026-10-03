@@ -423,8 +423,9 @@ impl EvolveTool {
         };
         #[cfg(windows)]
         {
-            // Past interrupted evolves leave .old-* siblings behind, and
-            // rename() does not overwrite on Windows. Sweep first: deleting
+            // Interrupted evolves leave .old-* siblings beside the binary,
+            // so collect them here as hygiene: the success path deletes its
+            // own copy, which bounds a crash to one leftover file. Deleting
             // an image another live process is running from fails with a
             // sharing violation, which we ignore; only truly dead orphans
             // get collected, so this can never pull a running binary's rug.
@@ -459,8 +460,9 @@ impl EvolveTool {
                 let _ = std::fs::remove_file(&tmp_path);
                 return Ok(ToolResult::error(format!(
                     "Cannot replace the running binary at {} on Windows: {e}. \
-                     The update download is intact; stop this process (scheduled task or \
-                     `opencrabs service stop`) and re-run evolve to swap it in.",
+                     The update download is intact. Stop this process (scheduled \
+                     task or `opencrabs service stop`) and re-run evolve to swap \
+                     it in.",
                     exe_path.display()
                 )));
             }
@@ -537,12 +539,16 @@ impl EvolveTool {
         // Post-swap verification
         if let Err(reason) = health_check_binary(&exe_path).await {
             if backup_path.exists() {
-                // Windows rename cannot overwrite an existing path, so clear
-                // the health-check-failed exe first. It is no longer a loaded
-                // image (the running process is served by the .old copy), so
-                // the delete should succeed; if it does not, the rename below
-                // lands in the CRITICAL arm with a truthful error. On Unix
-                // rename(2) replaces atomically — nothing to do.
+                // std::fs::rename does overwrite an existing target on
+                // Windows (MoveFileExW with a SetFileInformationByHandle
+                // fallback), so clearing the health-check-failed exe first
+                // is belt-and-braces for pre-1607 hosts and for filesystems
+                // without FileRenameInfoEx, not a prerequisite. The file is
+                // no longer a loaded image (the running process is served by
+                // the .old copy), so the delete should succeed; if it does
+                // not, the rename below lands in the CRITICAL arm with a
+                // truthful error. On Unix rename(2) replaces atomically, so
+                // there is nothing to do.
                 #[cfg(windows)]
                 let _ = std::fs::remove_file(&exe_path);
                 if let Err(e) = std::fs::rename(&backup_path, &exe_path) {

@@ -23,6 +23,7 @@ use uuid::Uuid;
 #[tokio::test]
 async fn plan_card_create_throttle_arms_the_global_cooldown() {
     let _guard = test_support::registry_guard().await;
+    let _cooldown = crate::tests::telegram_cooldown_lock::guard().await;
     test_support::reset(0);
     reset_global_cooldown();
     assert!(!is_global_cooldown_active(), "precondition: no cooldown");
@@ -42,6 +43,7 @@ async fn plan_card_create_throttle_arms_the_global_cooldown() {
 #[tokio::test]
 async fn plan_card_edit_throttle_arms_the_global_cooldown() {
     let _guard = test_support::registry_guard().await;
+    let _cooldown = crate::tests::telegram_cooldown_lock::guard().await;
     test_support::reset(0);
     reset_global_cooldown();
     assert!(!is_global_cooldown_active(), "precondition: no cooldown");
@@ -71,6 +73,7 @@ async fn plan_card_edit_throttle_arms_the_global_cooldown() {
 #[tokio::test]
 async fn a_non_throttle_card_failure_leaves_the_cooldown_alone() {
     let _guard = test_support::registry_guard().await;
+    let _cooldown = crate::tests::telegram_cooldown_lock::guard().await;
     test_support::reset(0);
     reset_global_cooldown();
 
