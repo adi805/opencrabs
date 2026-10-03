@@ -69,6 +69,7 @@ fn note_drop(channel: ChannelId, class: WriteClass) {
 }
 
 /// Governed `ChannelId::say`.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn say(
     http: &Http,
     channel: ChannelId,
@@ -85,6 +86,7 @@ pub(crate) async fn say(
 }
 
 /// Governed `ChannelId::send_message`.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn send(
     http: &Http,
     channel: ChannelId,
@@ -101,6 +103,7 @@ pub(crate) async fn send(
 }
 
 /// Governed `ChannelId::edit_message`.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn edit(
     http: &Http,
     channel: ChannelId,

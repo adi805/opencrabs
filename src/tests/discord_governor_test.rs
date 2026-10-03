@@ -36,16 +36,25 @@ async fn bucket_refuses_when_spent_and_recovers_after_virtual_refill() {
     rl_config!(enabled: true, create_burst: 1, creates_per_5s: 1, max_hold_secs: 1);
 
     // Burst of one: the first write is admitted straight away.
-    assert_eq!(governor::admit(CH, WriteClass::Create).await, Admission::Admit);
+    assert_eq!(
+        governor::admit(CH, WriteClass::Create).await,
+        Admission::Admit
+    );
 
     // Bucket now empty and the wait (5 s at 1 per 5 s) exceeds the 1 s hold,
     // so a droppable class is refused rather than parked.
-    assert_eq!(governor::admit(CH, WriteClass::Create).await, Admission::Drop);
+    assert_eq!(
+        governor::admit(CH, WriteClass::Create).await,
+        Admission::Drop
+    );
 
     // A full refill window elapses on the virtual clock: the bucket is whole
     // again and the write goes through.
     ts::advance(5_000);
-    assert_eq!(governor::admit(CH, WriteClass::Create).await, Admission::Admit);
+    assert_eq!(
+        governor::admit(CH, WriteClass::Create).await,
+        Admission::Admit
+    );
 
     let snap = governor::snapshot(CH).expect("channel was gated");
     assert_eq!(snap.creates, 2, "only the two admitted writes are counted");
@@ -58,10 +67,16 @@ async fn final_class_waits_instead_of_being_dropped() {
     ts::reset(0);
     rl_config!(enabled: true, edit_burst: 1, edits_per_5s: 1, max_hold_secs: 1);
 
-    assert_eq!(governor::admit(CH, WriteClass::Final).await, Admission::Admit);
+    assert_eq!(
+        governor::admit(CH, WriteClass::Final).await,
+        Admission::Admit
+    );
     // Same spent bucket as the drop case above, but a settle render must land:
     // the governor holds for the refill instead of discarding the answer.
-    assert_eq!(governor::admit(CH, WriteClass::Final).await, Admission::Admit);
+    assert_eq!(
+        governor::admit(CH, WriteClass::Final).await,
+        Admission::Admit
+    );
 
     let snap = governor::snapshot(CH).expect("channel was gated");
     assert_eq!(snap.edits, 2);
@@ -79,8 +94,14 @@ async fn content_class_is_never_dropped() {
     ts::reset(0);
     rl_config!(enabled: true, edit_burst: 1, edits_per_5s: 1, max_hold_secs: 1);
 
-    assert_eq!(governor::admit(CH, WriteClass::Final).await, Admission::Admit);
-    assert_eq!(governor::admit(CH, WriteClass::Final).await, Admission::Admit);
+    assert_eq!(
+        governor::admit(CH, WriteClass::Final).await,
+        Admission::Admit
+    );
+    assert_eq!(
+        governor::admit(CH, WriteClass::Final).await,
+        Admission::Admit
+    );
     assert_eq!(governor::snapshot(CH).unwrap().dropped, 0);
 }
 
@@ -94,7 +115,10 @@ async fn cooldown_ladder_grows_on_consecutive_429s() {
         cooldown_max_millis: 60_000
     );
 
-    assert!(!governor::is_cooldown_active(CH), "no cooldown before any 429");
+    assert!(
+        !governor::is_cooldown_active(CH),
+        "no cooldown before any 429"
+    );
 
     governor::record_429(CH, None);
     let first = governor::cooldown_remaining(CH).expect("cooldown armed");
@@ -140,7 +164,10 @@ async fn cooldown_is_capped_and_cleared_by_a_successful_write() {
     // Wait the window out, then a successful write clears the ladder.
     ts::advance(4_100);
     assert!(!governor::is_cooldown_active(CH), "window elapsed");
-    assert_eq!(governor::admit(CH, WriteClass::Create).await, Admission::Admit);
+    assert_eq!(
+        governor::admit(CH, WriteClass::Create).await,
+        Admission::Admit
+    );
     assert!(
         !governor::is_cooldown_active(CH),
         "an admitted write resets the backoff ladder"
@@ -172,7 +199,10 @@ async fn disabled_governor_admits_immediately() {
     rl_config!(enabled: false, create_burst: 0, creates_per_5s: 0);
 
     for _ in 0..5 {
-        assert_eq!(governor::admit(CH, WriteClass::Create).await, Admission::Admit);
+        assert_eq!(
+            governor::admit(CH, WriteClass::Create).await,
+            Admission::Admit
+        );
     }
     assert!(
         governor::snapshot(CH).is_none(),
@@ -195,8 +225,14 @@ async fn zero_refill_rate_fails_open_instead_of_wedging() {
         edits_per_5s: 0
     );
 
-    assert_eq!(governor::admit(CH, WriteClass::Create).await, Admission::Admit);
-    assert_eq!(governor::admit(CH, WriteClass::Final).await, Admission::Admit);
+    assert_eq!(
+        governor::admit(CH, WriteClass::Create).await,
+        Admission::Admit
+    );
+    assert_eq!(
+        governor::admit(CH, WriteClass::Final).await,
+        Admission::Admit
+    );
 }
 
 #[test]
@@ -207,9 +243,7 @@ fn parse_retry_after_reads_discord_payloads() {
 
     // Serenity sometimes hands back the window with a unit suffix.
     let suffixed = "429 rate limited, retry_after: 0.75";
-    assert!(
-        (governor::parse_retry_after(suffixed).unwrap().as_secs_f64() - 0.75).abs() < 0.001
-    );
+    assert!((governor::parse_retry_after(suffixed).unwrap().as_secs_f64() - 0.75).abs() < 0.001);
 
     assert!(governor::parse_retry_after("no window here").is_none());
     assert!(governor::parse_retry_after("retry_after: notanumber").is_none());
