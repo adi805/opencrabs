@@ -257,7 +257,7 @@ jobs:
           # src/cli/service_windows.rs IS listed: on this fork that carrier
           # exists (#9), so the Scheduled Task lifecycle is compiled and
           # exercised by the scoped-test slice below on every change to it.
-          pattern='^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|build\.rs|\.github/workflows/ci\.yml|src/utils/(shell|cwd)\.rs|src/brain/tools/(bash|read)\.rs|src/tui/app/input\.rs|src/config/(winlock|profile)\\.rs|src/cli/service_windows\\.rs)$'
+          pattern='^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|build\.rs|\.github/workflows/ci\.yml|src/utils/(shell|cwd)\.rs|src/brain/tools/(bash|read)\.rs|src/tui/app/input\.rs|src/config/(winlock|profile)\.rs|src/cli/service_windows\.rs)$'
           if echo "$files" | grep -qE "$pattern"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
