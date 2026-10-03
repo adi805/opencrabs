@@ -2,11 +2,11 @@
 //! field (and sometimes `choices`). Before the fix, serde rejected the whole
 //! chunk with "missing field `id`", so the provider's real token counts were
 //! dropped and the ledger fell back to a gross local estimate with
-//! `output_tokens = 0`. `OpenAiStreamChunk` now defaults both fields, and the
+//! `output_tokens = 0`. `[OI]StreamChunk` now defaults both fields, and the
 //! existing `!chunk.id.is_empty()` / `chunk.choices.is_empty()` guards already
 //! handle the empty defaults.
 
-use crate::brain::provider::OpenAiProvider;
+use crate::brain::provider::[OI]Provider;
 use crate::brain::provider::Provider;
 use crate::brain::provider::{ContentDelta, LLMRequest, Message, StreamEvent};
 use std::time::Duration;
@@ -49,7 +49,7 @@ async fn serve_sse(listener: TcpListener, body: String) {
     sock.flush().await.ok();
 }
 
-async fn collect_events(provider: &OpenAiProvider) -> Vec<StreamEvent> {
+async fn collect_events(provider: &[OI]Provider) -> Vec<StreamEvent> {
     let req = LLMRequest::new("test-model", vec![Message::user("ping")]);
     let mut stream = provider.stream(req).await.expect("stream opens");
     let mut events = Vec::new();
@@ -90,7 +90,7 @@ async fn usage_only_chunk_without_id_reaches_the_ledger() {
     );
     tokio::spawn(serve_sse(listener, sse));
 
-    let provider = OpenAiProvider::local(format!("http://127.0.0.1:{port}/chat/completions"));
+    let provider = [OI]Provider::local(format!("http://127.0.0.1:{port}/chat/completions"));
     let events = timeout(Duration::from_secs(10), collect_events(&provider))
         .await
         .expect("stream completes in time");
@@ -127,7 +127,7 @@ async fn usage_only_chunk_without_id_or_choices_reaches_the_ledger() {
     );
     tokio::spawn(serve_sse(listener, sse));
 
-    let provider = OpenAiProvider::local(format!("http://127.0.0.1:{port}/chat/completions"));
+    let provider = [OI]Provider::local(format!("http://127.0.0.1:{port}/chat/completions"));
     let events = timeout(Duration::from_secs(10), collect_events(&provider))
         .await
         .expect("stream completes in time");
