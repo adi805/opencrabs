@@ -4,18 +4,23 @@
 # lives in someone else's repo, and the action has no workflow_dispatch handler,
 # so those reviews run the published CLI instead.
 #
-# Needs secret PR_AGENT_PAT: a FINE-GRAINED personal access token, scoped to the
-# single repository under review, with Metadata: read (GitHub requires it on every
-# fine-grained token), Contents: read, Pull requests: write and Issues: write.
-# A classic token with the "repo" scope is refused on purpose: that scope reaches
-# every repository its owner can see, so a compromised package, action, or
-# transitive dependency inside the CLI could rewrite all of them, not just the
-# repo the PR lives in. A fine-grained token narrows the blast radius only when
-# it actually names one repository: scoped to "All repositories" it is as broad
-# as a classic token, and GitHub's API does not expose the difference, so this
-# step warns and the operator confirms the scope by hand.
-# The check below fails the run unless the token is fine-grained, or the
-# dispatcher explicitly accepts the wider blast radius with allow_broad_pat.
+# Needs secret PR_AGENT_PAT: a token that can write on the PR under review.
+# Which token works depends on who OWNS the repository being reviewed:
+#
+# - Repository owned by you (this fork's account): prefer a FINE-GRAINED token
+#   naming only that repository, with Contents: read, Pull requests: write and
+#   Issues: write. Narrowest blast radius GitHub offers.
+# - Repository owned by someone else (e.g. upstream work we contribute to):
+#   a fine-grained token cannot reach it AT ALL. GitHub only lets a fine-grained
+#   token name repositories owned by its resource owner, so reviewing a
+#   third-party repo requires a CLASSIC token. Use a dedicated one with ONLY the
+#   "repo" scope checked (no workflow, no admin:*, no delete_repo), set an
+#   expiry, and keep it separate from the token your local CLI logs in with.
+#   "repo" still reaches every repository its owner can see, so a compromised
+#   package, action, or transitive dependency inside the CLI could rewrite all
+#   of them, not just the repo the PR lives in. The run therefore refuses a
+#   classic token unless the dispatcher accepts that blast radius explicitly
+#   with allow_broad_pat=true.
 name: PR Agent (manual)
 
 on:
@@ -58,7 +63,7 @@ jobs:
           ALLOW_BROAD: ${{ inputs.allow_broad_pat }}
         run: |
           if [ -z "$PAT" ]; then
-            echo "::error::PR_AGENT_PAT is not set. Reviewing a PR outside this repository needs a fine-grained personal access token scoped to the repo under review (Contents: read, Pull requests: write, Issues: write); the built-in GITHUB_TOKEN cannot see other repositories. Add it under Settings > Secrets and variables > Actions."
+            echo "::error::PR_AGENT_PAT is not set. Reviewing a PR outside this repository needs a token that can write on that PR: a fine-grained token naming the repository (only possible when the repo belongs to you) or, for a third-party repo, a dedicated classic token with just the repo scope; the built-in GITHUB_TOKEN cannot see other repositories. Add it under Settings > Secrets and variables > Actions."
             exit 1
           fi
 
@@ -80,7 +85,7 @@ jobs:
           # or outright rejected. It cannot confirm the permissions PR-Agent
           # needs (Pull requests: write, Issues: write).
           if [ "$CODE" != "200" ]; then
-            echo "::error::PR_AGENT_PAT was rejected for $REPO (HTTP $CODE). A fine-grained token has to name that repository in its scope, with Contents: read."
+            echo "::error::PR_AGENT_PAT was rejected for $REPO (HTTP $CODE): the token is expired, revoked, or malformed. GitHub answers public repositories with 200 even to tokens that cannot write to them, so this step rules out a dead token, not a usable one."
             exit 1
           fi
 
@@ -95,7 +100,7 @@ jobs:
             if [ "$ALLOW_BROAD" = "true" ]; then
               echo "::warning::PR_AGENT_PAT is a classic token (X-OAuth-Scopes: $SCOPES), so it can write to every repository its owner can reach, not just $REPO. Proceeding because allow_broad_pat=true."
             else
-              echo "::error::PR_AGENT_PAT is a classic token (X-OAuth-Scopes: $SCOPES), which grants read/write to every repository its owner can reach. Replace it with a fine-grained token scoped to $REPO only (Contents: read, Pull requests: write, Issues: write), or re-dispatch with allow_broad_pat=true if you accept the wider blast radius."
+              echo "::error::PR_AGENT_PAT is a classic token (X-OAuth-Scopes: $SCOPES), which grants read/write to every repository its owner can reach. If $REPO belongs to you, replace it with a fine-grained token naming only that repository (Contents: read, Pull requests: write, Issues: write). If it is a third-party repo like an upstream you contribute to, no fine-grained token can reach it: keep the dedicated classic token (only the repo scope checked) and re-dispatch with allow_broad_pat=true to accept the wider blast radius."
               exit 1
             fi
           else
