@@ -162,12 +162,12 @@ jobs:
           # cheap and native. This does mean a tag cannot finish its release
           # while the Mac runner is offline: the darwin jobs queue until it
           # comes back rather than failing over to a hosted runner.
-          - os: self-hosted
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact_name: opencrabs
             asset_suffix: macos-amd64
 
-          - os: self-hosted
+          - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: opencrabs
             asset_suffix: macos-arm64
