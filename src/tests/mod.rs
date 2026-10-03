@@ -940,6 +940,7 @@ pub mod discord_handler_test;
 pub mod discord_history_dedup_test;
 pub mod discord_mention_only_test;
 pub mod discord_norm_key_test;
+pub mod discord_slash_defer_followup_test;
 pub mod discord_split_message_test;
 pub mod discord_table_convert_test;
 pub mod discord_thread_title_test;
