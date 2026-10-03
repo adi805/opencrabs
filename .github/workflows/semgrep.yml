@@ -7,11 +7,12 @@
 # catches what is wrong with the code.
 #
 # Baseline, not a blanket scan. This repo is a fork of a large upstream tree that
-# already carries findings we do not own (ws:// defaults in the browser manager,
-# a raw-SQL cron template, a shell-injection shape in prerelease.yml). A scan with
-# no baseline is red on day one and stays red forever, which only teaches everyone
-# to ignore the gate. --baseline-commit reports the findings the PR introduces and
-# nothing else, so the gate speaks about the change under review.
+# already carries findings we do not own (insecure websocket defaults in the
+# browser manager, a raw-SQL cron template, a shell-injection shape in
+# prerelease.yml). A scan with no baseline is red on day one and stays red forever,
+# which only teaches everyone to ignore the gate. --baseline-commit reports the
+# findings the PR introduces and nothing else, so the gate speaks about the change
+# under review.
 #
 # Policy: only ERROR-severity findings fail the job. MEDIUM/WARNING findings are
 # printed in full (log + job summary) so they stay visible without turning every
