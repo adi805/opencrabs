@@ -286,9 +286,10 @@ pub struct BrowserConfig {
     /// of spawning a new browser, so multiple profiles can share one Chromium.
     ///
     /// Prefer the `http://host:port` form — the manager queries `/json/version`
-    /// to discover the real devtools websocket URL. A bare `ws://host:port` is
-    /// also accepted (normalized to `http://` internally); a full
-    /// `ws://host:port/devtools/browser/<id>` URL is used as-is.
+    /// to discover the real devtools websocket URL. A bare websocket endpoint
+    /// (the `ws` scheme, host and port only) is also accepted (normalized to
+    /// `http://` internally); a full devtools browser websocket URL is used
+    /// as-is.
     ///
     /// Example: "http://localhost:9222"
     #[serde(default)]
