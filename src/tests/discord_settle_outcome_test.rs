@@ -10,11 +10,13 @@
 //!    or was cancelled with every tool green rendered a green check: a false
 //!    success signal on the card the user is actually watching.
 //!
-//! The guards below pin the contract: the outcome drives the icon, a
+//! The guards below pin the contract: the outcome drives the settled icon, a
 //! non-Finished turn says the result may be incomplete, and the progress trace
 //! is never deleted by settling.
 
-use crate::channels::discord::tool_group::{GroupEntry, GroupState, TurnOutcome, render_content};
+use crate::channels::discord::tool_group::{
+    GroupEntry, GroupState, SettledStatus, TurnOutcome, render_content,
+};
 use std::time::{Duration, Instant};
 
 /// `n` tools, every one of them GREEN — the exact shape that used to render a
@@ -29,15 +31,20 @@ fn green_tools(n: usize) -> Vec<GroupEntry> {
         .collect()
 }
 
-/// A settled group with `n` green tools and the given outcome. Expanded so the
-/// per-tool trace lines are part of the rendered body too.
+/// A settled group with `n` green tools and the given outcome, COLLAPSED.
+///
+/// Collapsed matters. `render_content` then yields the settled SUMMARY line
+/// alone; the per-tool trace lines are not in the body. That is deliberate: a
+/// green tool line legitimately renders `✅` (see `entry_icon`), so asserting
+/// "no check anywhere in the body" against an EXPANDED group fails on the
+/// trace rather than on the settled line, and tests the wrong thing.
 fn settled(n: usize, outcome: TurnOutcome) -> GroupState {
     GroupState {
         entries: green_tools(n),
-        expanded: true,
-        notes: vec!["Scanning the repository".to_string()],
+        expanded: false,
+        notes: Vec::new(),
         started_at: Instant::now(),
-        settled: Some(crate::channels::discord::tool_group::SettledStatus {
+        settled: Some(SettledStatus {
             outcome,
             elapsed: Duration::from_secs(90),
             ctx: Some("ctx: 84K/200K 42%".into()),
@@ -64,7 +71,8 @@ fn a_timeout_names_the_actual_tool_count_and_the_incomplete_result() {
 
 #[test]
 fn a_timeout_with_all_green_tools_never_renders_a_check() {
-    // The regression: three green tools + a timeout used to render "✅".
+    // The regression: three green tools + a timeout used to render "✅" as the
+    // settled signal, because the icon came from tool status, not the outcome.
     let body = render_content(&settled(3, TurnOutcome::TimedOut));
     assert!(
         !body.contains('✅'),
@@ -113,9 +121,12 @@ fn a_finished_turn_still_reads_as_success() {
 
 #[test]
 fn the_progress_trace_survives_the_settle() {
-    // AC-011: settling is a re-render, never a delete. The tool lines and the
-    // narration note are still in the body afterwards.
-    let body = render_content(&settled(3, TurnOutcome::TimedOut));
+    // AC-011: settling is a re-render, never a delete. Expanded so the per-tool
+    // trace lines and the narration note are part of the rendered body too.
+    let mut g = settled(3, TurnOutcome::TimedOut);
+    g.expanded = true;
+    g.notes = vec!["Scanning the repository".to_string()];
+    let body = render_content(&g);
     assert!(body.contains("tool0") && body.contains("tool2"), "{body}");
     assert!(
         body.contains("Scanning the repository"),
@@ -125,7 +136,10 @@ fn the_progress_trace_survives_the_settle() {
         !body.contains('🕒'),
         "the live clock is replaced by the frozen one: {body}"
     );
-    assert!(body.contains("⏱️ 1:30"), "frozen elapsed time: {body}");
+    assert!(
+        body.contains("1:30"),
+        "the elapsed clock is frozen at settle time: {body}"
+    );
 }
 
 #[test]
