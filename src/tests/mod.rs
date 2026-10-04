@@ -943,6 +943,7 @@ pub mod discord_handler_test;
 pub mod discord_history_dedup_test;
 pub mod discord_mention_only_test;
 pub mod discord_norm_key_test;
+pub mod discord_plan_card_test;
 pub mod discord_settle_outcome_test;
 pub mod discord_silence_budget_test;
 pub mod discord_slash_defer_followup_test;

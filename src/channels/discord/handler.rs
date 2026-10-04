@@ -184,6 +184,12 @@ pub(super) fn spawn_flow_ticker(
             if born.elapsed() > FLOW_TICKER_CAP {
                 break;
             }
+            // Plan card (FR-008): advance the checklist on the same 4 s beat
+            // the flow group uses. The session is resolved from the channel so
+            // the ticker signature stays unchanged.
+            if let Some(sid) = dstate.session_owner_by_channel(channel.get()).await {
+                super::plan_card::refresh_plan_card(&http, channel, &dstate, sid).await;
+            }
             let Some(mid) = *group_mid.lock().await else {
                 // Group not born yet: the turn has not reached its first
                 // tool call. Keep waiting.
@@ -1494,6 +1500,12 @@ pub(crate) async fn handle_message(
         Err(e) => tracing::warn!("Discord: turn-start group shell post failed: {e}"),
     }
 
+    // Plan card (FR-008): post or advance the session's checklist on the
+    // same turn-start beat as the flow shell, so an active plan is visible
+    // from the first tick. `refresh_plan_card` creates the card when none
+    // exists and removes it once the plan is gone.
+    super::plan_card::refresh_plan_card(&ctx.http, target, &discord_state, session_id).await;
+
     // Flow ticker (#1843): re-renders the bubble's clock every 4 s so the
     // timer does not freeze between tool events. Spawns after the turn-start
     // shell (#1845) so the group already exists; stops itself on
@@ -1844,6 +1856,11 @@ pub(crate) async fn handle_message(
             }
         }
     }
+    // Plan board (FR-008, #1880): reconcile this session's plan card after the
+    // turn, so a plan created, approved, advanced or discarded mid-turn shows
+    // its new state. ONE message per session, edited in place; a rendering
+    // identical to what the chat already shows costs no API call.
+    super::plan_card::refresh_plan_card(&ctx.http, target, &discord_state, session_id).await;
 }
 
 /// Classify a turn error into the terminal outcome stamped on the flow card
