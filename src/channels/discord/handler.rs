@@ -1204,6 +1204,7 @@ pub(crate) async fn handle_message(
                                     .upsert_tool_group(
                                         mid.get(),
                                         GroupState {
+                                            last_activity_at: Instant::now(),
                                             entries,
                                             notes: Vec::new(),
                                             expanded: false,
@@ -1226,6 +1227,7 @@ pub(crate) async fn handle_message(
                             }
                             None => {
                                 let group = GroupState {
+                                    last_activity_at: Instant::now(),
                                     entries,
                                     notes: Vec::new(),
                                     expanded: false,
@@ -1287,6 +1289,7 @@ pub(crate) async fn handle_message(
                                 .upsert_tool_group(
                                     mid.get(),
                                     GroupState {
+                                        last_activity_at: Instant::now(),
                                         entries,
                                         notes: Vec::new(),
                                         expanded: false,
@@ -1452,6 +1455,7 @@ pub(crate) async fn handle_message(
     // post failure the mid stays None and creation falls back to the first
     // tool call, the pre-#1845 behavior.
     let turn_shell = super::tool_group::GroupState {
+        last_activity_at: Instant::now(),
         entries: Vec::new(),
         notes: Vec::new(),
         expanded: false,

@@ -40,6 +40,7 @@ fn green_tools(n: usize) -> Vec<GroupEntry> {
 /// trace rather than on the settled line, and tests the wrong thing.
 fn settled(n: usize, outcome: TurnOutcome) -> GroupState {
     GroupState {
+        last_activity_at: Instant::now(),
         entries: green_tools(n),
         expanded: false,
         notes: Vec::new(),
