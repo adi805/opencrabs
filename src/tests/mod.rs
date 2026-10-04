@@ -930,6 +930,7 @@ pub mod windows_clipboard_test;
 pub mod brain_tools_whatsapp_send_test;
 pub mod channel_capabilities_preamble_test;
 pub mod channel_commands_test;
+pub mod discord_ack_reaction_test;
 pub mod discord_activity_text_test;
 pub mod discord_application_commands_test;
 pub mod discord_flow_ticker_test;
