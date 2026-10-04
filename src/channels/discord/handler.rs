@@ -1652,12 +1652,34 @@ pub(crate) async fn handle_message(
                 }
             }
 
+            // FR-007 (#1880): mechanical evidence footer for the answer.
+            //
+            // Source is the turn's tool group — the SAME `entries` the card
+            // renders, appended from real `ProgressEvent::ToolStarted` — so
+            // the line can never name a tool the turn did not run (NFR-003).
+            // Assembled HERE, at the channel layer, after the agent returned:
+            // the phantom gate inspects the model's output, so it never sees
+            // this line (AC-016). Appended to the WIRE text only — the
+            // channel_messages record below keeps the footerless body, so the
+            // next turn's group context is not fed a synthetic line.
+            let turn_mid: Option<u64> = (*turn_group_mid.lock().await).map(|m| m.get());
+            let send_text = match turn_mid {
+                Some(id) => match discord_state.tool_group_snapshot(id).await {
+                    Some(g) => match super::tool_group::evidence_line(&g) {
+                        Some(f) => format!("{text_only}\n\n{f}"),
+                        None => text_only.clone(),
+                    },
+                    None => text_only.clone(),
+                },
+                None => text_only.clone(),
+            };
+
             if skip_final_post {
                 // Answer already visible via the kept intermediate (#459's
                 // keep-intermediate outcome): skip the duplicate post. The
                 // settled flow group above carries the completion chrome.
             } else {
-                let chunks: Vec<String> = split_message(&text_only, 2000);
+                let chunks: Vec<String> = split_message(&send_text, 2000);
                 // Auto-thread (opt-in): long answers post a short teaser in
                 // the channel and the full body in a thread anchored to the
                 // turn's bubble (or the user's message). The channel stays
@@ -1674,8 +1696,8 @@ pub(crate) async fn handle_message(
                         .await
                     {
                         Ok(thread) => {
-                            let truncated = text_only.chars().count() > 280;
-                            let teaser: String = text_only.chars().take(280).collect();
+                            let truncated = send_text.chars().count() > 280;
+                            let teaser: String = send_text.chars().take(280).collect();
                             let teaser = format!(
                                 "{teaser}{}\n\n-# Full response in thread: <#{}>",
                                 if truncated { "…" } else { "" },
