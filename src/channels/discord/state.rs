@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::{interactions, tool_group};
+use super::{interactions, long_answer, tool_group};
 
 /// Shared Discord state for proactive messaging.
 ///
@@ -56,7 +56,7 @@ pub struct DiscordState {
     /// Long answers paged behind a button (FR-009), keyed by the id of the
     /// message carrying page 0. Insertion-ordered for pruning; bounded at
     /// `DiscordState::LONG_ANSWER_CAP` (see `long_answer`).
-    pub(super) long_answers: Mutex<(Vec<u64>, HashMap<u64, Vec<String>>)>,
+    pub(super) long_answers: Mutex<long_answer::LongAnswerStore>,
     /// Collapsible tool groups keyed by message id, so the Expand/Collapse
     /// interaction can re-render after the turn ended. Insertion-ordered
     /// for pruning; bounded at [`Self::TOOL_GROUP_CAP`] (see `tool_group`).

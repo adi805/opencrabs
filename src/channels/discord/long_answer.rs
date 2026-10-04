@@ -18,8 +18,16 @@
 //! construction — [`pager_row`] is the only builder and it emits exactly one
 //! row. A test pins that shape rather than trusting the caller.
 
+use std::collections::HashMap;
+
 use serenity::builder::{CreateActionRow, CreateButton};
 use serenity::model::application::ButtonStyle;
+
+/// Insertion-ordered store of paged answers: the ids of the messages carrying
+/// page 0, in insertion order, plus each answer's pages keyed by that id.
+/// Named rather than inlined so the [`DiscordState`] field stays readable;
+/// bounded by [`DiscordState::LONG_ANSWER_CAP`].
+pub(super) type LongAnswerStore = (Vec<u64>, HashMap<u64, Vec<String>>);
 
 /// `custom_id` prefix for a pager press: `longanswer:<message_id>:<page>`.
 pub(crate) const PAGER_PREFIX: &str = "longanswer:";
