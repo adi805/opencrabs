@@ -17,6 +17,7 @@ fn tool(name: &str, context: &str, status: Option<bool>) -> GroupEntry {
 
 fn group_with(entries: Vec<GroupEntry>, notes: Vec<String>) -> GroupState {
     GroupState {
+        last_activity_at: Instant::now(),
         entries,
         expanded: false,
         notes,
