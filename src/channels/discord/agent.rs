@@ -75,6 +75,7 @@ impl DiscordAgent {
 
             let agent = self.agent_service;
             let session_svc = self.session_service;
+            let service_context = self.service_context;
             let shared_session = self.shared_session_id;
             let discord_state = self.discord_state;
             let config_rx = self.config_rx;
@@ -87,6 +88,7 @@ impl DiscordAgent {
             let make_handler = || Handler {
                 agent: agent.clone(),
                 session_svc: session_svc.clone(),
+                service_context: service_context.clone(),
                 extra_sessions: extra_sessions.clone(),
                 shared_session: shared_session.clone(),
                 discord_state: discord_state.clone(),
@@ -134,6 +136,9 @@ impl DiscordAgent {
 struct Handler {
     agent: Arc<AgentService>,
     session_svc: SessionService,
+    /// Pool handle for the plan card's Discard (FR-008): `plan_mode::discard`
+    /// clears the session goal through `GoalManager`, which needs the pool.
+    service_context: ServiceContext,
     extra_sessions: Arc<Mutex<HashMap<u64, (Uuid, std::time::Instant)>>>,
     shared_session: Arc<Mutex<Option<Uuid>>>,
     discord_state: Arc<DiscordState>,
@@ -846,7 +851,7 @@ impl EventHandler for Handler {
                         // inside Discord's 3s window. Runs through the same
                         // resume path a background task uses, so the result
                         // lands in the channel like any other turn.
-                        let agent = self.agent_service.clone();
+                        let agent = self.agent.clone();
                         let http = ctx.http.clone();
                         let target = channel_id.get().to_string();
                         tokio::spawn(async move {
