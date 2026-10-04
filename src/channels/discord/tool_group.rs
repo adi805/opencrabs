@@ -313,6 +313,18 @@ fn summary_line(group: &GroupState) -> String {
     }
 }
 
+/// Mechanical evidence footer for the turn's final answer (FR-007, #1880).
+///
+/// Built from the SAME `entries` the tool card renders, which are appended
+/// from `ProgressEvent::ToolStarted` — the tool loop's real executions. The
+/// model's prose never reaches this function, so the footer cannot claim a
+/// tool the turn did not run (NFR-003, AC-014/AC-015). Wording, dedup, and
+/// the cap live in [`crate::channels::evidence`], shared with Telegram so
+/// the two surfaces cannot drift (NFR-002).
+pub(crate) fn evidence_line(group: &GroupState) -> Option<String> {
+    crate::channels::evidence::evidence_line(group.entries.iter().map(|e| e.name.as_str()))
+}
+
 /// Message body for the group in its current display state.
 pub(crate) fn render_content(group: &GroupState) -> String {
     let tools_part = if group.entries.len() == 1 && !group.expanded {
