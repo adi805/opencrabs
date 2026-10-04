@@ -855,18 +855,18 @@ impl EventHandler for Handler {
                         let http = ctx.http.clone();
                         let target = channel_id.get().to_string();
                         tokio::spawn(async move {
+                            // One let-chain rather than a nested `if let`:
+                            // clippy's `collapsible_if` fires on the nested
+                            // form under `-D warnings`, and edition 2024
+                            // allows the chained form.
                             if let Some(content) = crate::channels::bg_resume::run_resume_turn(
                                 agent, session_id, prompt, "discord", &target,
                             )
                             .await
-                            {
-                                if let Err(e) =
+                                && let Err(e) =
                                     writes::say(&http, channel_id, &content, Class::Final).await
-                                {
-                                    tracing::warn!(
-                                        "Discord: plan approval turn delivery failed: {e}"
-                                    );
-                                }
+                            {
+                                tracing::warn!("Discord: plan approval turn delivery failed: {e}");
                             }
                         });
                     }
