@@ -368,13 +368,20 @@ fn top_tools_body(a: &McAnalytics, w: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Label cell for the totals card: padded to the widest label in use
+/// (`RSI live`) and always followed by one separator space. The separator is
+/// what keeps a label that reaches or exceeds the pad width from butting its
+/// value against the text; `summary_row` used to pad to 6 with no separator,
+/// which rendered `Verify0 ok / 0 rollbk` and `RSI liveRSI has never run`.
+/// Same shape as `detail_popup`'s `{key:<8} `.
+pub(crate) fn summary_label(label: &str) -> String {
+    format!("{label:<8} ")
+}
+
 fn summary_row(label: &str, value: String) -> Line<'static> {
     Line::from(vec![
         Span::raw(" "),
-        Span::styled(
-            format!("{label:<6}"),
-            Style::default().fg(theme::text_dim()),
-        ),
+        Span::styled(summary_label(label), Style::default().fg(theme::text_dim())),
         Span::styled(value, Style::default().fg(theme::green())),
     ])
 }
@@ -500,4 +507,87 @@ fn trunc(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{summary_label, summary_row};
+
+    /// Every label the totals card actually uses must end with a separator, so
+    /// a value can never start flush against the label text.
+    #[test]
+    fn summary_label_always_leaves_a_separator_before_the_value() {
+        for label in [
+            "Tools", "Fails", "Recov", "Verify", "RSI", "RSI live", "Brain",
+        ] {
+            let cell = summary_label(label);
+            assert!(
+                cell.starts_with(label),
+                "{label:?} got truncated to {cell:?}"
+            );
+            assert!(
+                cell.ends_with(' '),
+                "{label:?} renders flush against its value: {cell:?}"
+            );
+        }
+    }
+
+    /// Short labels align to one column; the widest label keeps exactly one
+    /// space before the value. Pinning the widths so a future label change
+    /// that drops the separator fails here instead of on a rendered frame.
+    #[test]
+    fn summary_label_pads_to_a_common_column() {
+        assert_eq!(summary_label("RSI"), format!("{}{}", "RSI", " ".repeat(6)));
+        assert_eq!(
+            summary_label("Verify"),
+            format!("{}{}", "Verify", " ".repeat(3))
+        );
+        assert_eq!(summary_label("RSI live"), "RSI live ");
+    }
+
+    /// A label longer than the pad width must not lose its separator either:
+    /// `{:<N}` alone silently stops padding once the label exceeds N.
+    #[test]
+    fn summary_label_keeps_separator_beyond_the_pad_width() {
+        assert_eq!(
+            summary_label("Tools"),
+            format!("{}{}", "Tools", " ".repeat(4))
+        );
+        assert_eq!(summary_label("A longer label"), "A longer label ");
+    }
+
+    /// The reported defect lived in the row, not the label: `summary_row` used
+    /// to pad to 6 with no separator, so `Verify` rendered as `Verify0 ok / 0
+    /// rollbk` and `RSI live` as `RSI liveRSI has never run`. Asserting on
+    /// `summary_label` alone cannot catch that, because the bug is in how the
+    /// spans are combined. This asserts the joined text of every row the totals
+    /// card actually builds: the flush pairing must never appear, and the
+    /// padded label must still be followed by a space before its value.
+    #[test]
+    fn summary_row_keeps_a_gap_between_label_and_value() {
+        for (label, value) in [
+            ("Tools", "0 calls"),
+            ("Fails", "0 ok / 0 rollbk"),
+            ("Recov", "0 recovered"),
+            ("Verify", "0 ok / 0 rollbk"),
+            ("RSI", "0 applied"),
+            ("RSI live", "RSI has never run"),
+            ("Brain", "no usage yet"),
+        ] {
+            let joined: String = summary_row(label, value.to_string())
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            let padded = summary_label(label);
+            assert!(
+                !joined.contains(&format!("{label}{value}")),
+                "{label:?} runs into its value: {joined:?}"
+            );
+            assert!(
+                joined.contains(&format!("{padded}{value}")),
+                "{label:?} lost the separator before its value: {joined:?}"
+            );
+        }
+    }
 }
