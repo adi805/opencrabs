@@ -26,6 +26,7 @@ fn group(names: &[&str]) -> GroupState {
         expanded: false,
         started_at: Instant::now(),
         settled: None,
+        last_activity_at: Instant::now(),
     }
 }
 
