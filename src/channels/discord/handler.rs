@@ -19,7 +19,7 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use serenity::builder::{CreateAttachment, CreateMessage};
+use serenity::builder::{CreateAttachment, CreateMessage, EditMessage};
 use serenity::http::Http;
 use serenity::model::channel::{Message, MessageFlags, MessageSnapshot};
 use serenity::model::id::ChannelId;
@@ -183,6 +183,12 @@ pub(super) fn spawn_flow_ticker(
             tokio::time::sleep(FLOW_TICKER_INTERVAL).await;
             if born.elapsed() > FLOW_TICKER_CAP {
                 break;
+            }
+            // Plan card (FR-008): advance the checklist on the same 4 s beat
+            // the flow group uses. The session is resolved from the channel so
+            // the ticker signature stays unchanged.
+            if let Some(sid) = dstate.session_owner_by_channel(channel.get()).await {
+                super::plan_card::refresh_plan_card(&http, channel, &dstate, sid).await;
             }
             let Some(mid) = *group_mid.lock().await else {
                 // Group not born yet: the turn has not reached its first
@@ -1494,6 +1500,12 @@ pub(crate) async fn handle_message(
         Err(e) => tracing::warn!("Discord: turn-start group shell post failed: {e}"),
     }
 
+    // Plan card (FR-008): post or advance the session's checklist on the
+    // same turn-start beat as the flow shell, so an active plan is visible
+    // from the first tick. `refresh_plan_card` creates the card when none
+    // exists and removes it once the plan is gone.
+    super::plan_card::refresh_plan_card(&ctx.http, target, &discord_state, session_id).await;
+
     // Flow ticker (#1843): re-renders the bubble's clock every 4 s so the
     // timer does not freeze between tool events. Spawns after the turn-start
     // shell (#1845) so the group already exists; stops itself on
@@ -1697,12 +1709,49 @@ pub(crate) async fn handle_message(
                 // keep-intermediate outcome): skip the duplicate post. The
                 // settled flow group above carries the completion chrome.
             } else {
-                let chunks: Vec<String> = split_message(&send_text, 2000);
+                let chunks: Vec<String> = split_message(&send_text, super::long_answer::PAGE_CHARS);
+                // FR-009 (#1880): a long answer is a summary plus a pager,
+                // never a wall of consecutive messages (AC-020). Page 0 is
+                // posted in-channel; every later page answers EPHEMERALLY on
+                // press, so paging cannot re-bury the channel it exists to
+                // keep clean. Exactly one Action Row rides the message
+                // (AC-021).
+                let paged =
+                    if chunks.len() > 1 {
+                        let builder = CreateMessage::new().content(&chunks[0]);
+                        match writes::send(&ctx.http, target, builder, Class::Final).await {
+                            Ok(Some(sent)) => {
+                                let mid = sent.id.get();
+                                discord_state.store_long_answer(mid, chunks.clone()).await;
+                                let edit = EditMessage::new().components(vec![
+                                    super::long_answer::pager_row(mid, 0, chunks.len()),
+                                ]);
+                                if let Err(e) =
+                                    writes::edit(&ctx.http, target, sent.id, edit, Class::Edit)
+                                        .await
+                                {
+                                    tracing::warn!("Discord: pager attach failed: {e}");
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::warn!("Discord: long answer page 0 was dropped");
+                            }
+                            Err(e) => {
+                                tracing::error!("Discord: long answer page 0 failed: {e}");
+                            }
+                        }
+                        true
+                    } else {
+                        false
+                    };
                 // Auto-thread (opt-in): long answers post a short teaser in
                 // the channel and the full body in a thread anchored to the
                 // turn's bubble (or the user's message). The channel stays
                 // scannable; the deliverable stays whole.
-                let auto_thread = dc_cfg.auto_thread_min_chars > 0
+                // Mutually exclusive with the pager: an answer that already
+                // went out as page 0 must not also be threaded in full.
+                let auto_thread = !paged
+                    && dc_cfg.auto_thread_min_chars > 0
                     && text_only.chars().count() >= dc_cfg.auto_thread_min_chars;
                 if auto_thread {
                     let anchor = (*turn_group_mid.lock().await).unwrap_or(msg.id);
@@ -1745,7 +1794,7 @@ pub(crate) async fn handle_message(
                             }
                         }
                     }
-                } else {
+                } else if !paged {
                     for chunk in &chunks {
                         if let Err(e) = writes::say(&ctx.http, target, chunk, Class::Final).await {
                             tracing::error!("Discord: failed to send reply: {}", e);
@@ -1829,6 +1878,11 @@ pub(crate) async fn handle_message(
             }
         }
     }
+    // Plan board (FR-008, #1880): reconcile this session's plan card after the
+    // turn, so a plan created, approved, advanced or discarded mid-turn shows
+    // its new state. ONE message per session, edited in place; a rendering
+    // identical to what the chat already shows costs no API call.
+    super::plan_card::refresh_plan_card(&ctx.http, target, &discord_state, session_id).await;
 }
 
 /// Classify a turn error into the terminal outcome stamped on the flow card
