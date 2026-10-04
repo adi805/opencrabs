@@ -19,7 +19,7 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use serenity::builder::{CreateAttachment, CreateMessage};
+use serenity::builder::{CreateAttachment, CreateMessage, EditMessage};
 use serenity::http::Http;
 use serenity::model::channel::{Message, MessageFlags, MessageSnapshot};
 use serenity::model::id::ChannelId;
@@ -1675,12 +1675,49 @@ pub(crate) async fn handle_message(
                 // keep-intermediate outcome): skip the duplicate post. The
                 // settled flow group above carries the completion chrome.
             } else {
-                let chunks: Vec<String> = split_message(&text_only, 2000);
+                let chunks: Vec<String> = split_message(&text_only, super::long_answer::PAGE_CHARS);
+                // FR-009 (#1880): a long answer is a summary plus a pager,
+                // never a wall of consecutive messages (AC-020). Page 0 is
+                // posted in-channel; every later page answers EPHEMERALLY on
+                // press, so paging cannot re-bury the channel it exists to
+                // keep clean. Exactly one Action Row rides the message
+                // (AC-021).
+                let paged =
+                    if chunks.len() > 1 {
+                        let builder = CreateMessage::new().content(&chunks[0]);
+                        match writes::send(&ctx.http, target, builder, Class::Final).await {
+                            Ok(Some(sent)) => {
+                                let mid = sent.id.get();
+                                discord_state.store_long_answer(mid, chunks.clone()).await;
+                                let edit = EditMessage::new().components(vec![
+                                    super::long_answer::pager_row(mid, 0, chunks.len()),
+                                ]);
+                                if let Err(e) =
+                                    writes::edit(&ctx.http, target, sent.id, edit, Class::Edit)
+                                        .await
+                                {
+                                    tracing::warn!("Discord: pager attach failed: {e}");
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::warn!("Discord: long answer page 0 was dropped");
+                            }
+                            Err(e) => {
+                                tracing::error!("Discord: long answer page 0 failed: {e}");
+                            }
+                        }
+                        true
+                    } else {
+                        false
+                    };
                 // Auto-thread (opt-in): long answers post a short teaser in
                 // the channel and the full body in a thread anchored to the
                 // turn's bubble (or the user's message). The channel stays
                 // scannable; the deliverable stays whole.
-                let auto_thread = dc_cfg.auto_thread_min_chars > 0
+                // Mutually exclusive with the pager: an answer that already
+                // went out as page 0 must not also be threaded in full.
+                let auto_thread = !paged
+                    && dc_cfg.auto_thread_min_chars > 0
                     && text_only.chars().count() >= dc_cfg.auto_thread_min_chars;
                 if auto_thread {
                     let anchor = (*turn_group_mid.lock().await).unwrap_or(msg.id);
@@ -1723,7 +1760,7 @@ pub(crate) async fn handle_message(
                             }
                         }
                     }
-                } else {
+                } else if !paged {
                     for chunk in &chunks {
                         if let Err(e) = writes::say(&ctx.http, target, chunk, Class::Final).await {
                             tracing::error!("Discord: failed to send reply: {}", e);

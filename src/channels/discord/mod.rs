@@ -21,6 +21,7 @@ mod connection;
 pub(crate) mod governor;
 pub(crate) mod handler;
 pub(crate) mod interactions;
+pub(crate) mod long_answer;
 mod pending_interactions;
 pub(crate) mod poll;
 pub(crate) mod reactions;
