@@ -224,7 +224,7 @@ pub(crate) async fn route_followup_turn(
                                     .upsert_tool_group(
                                         mid.get(),
                                         GroupState {
-                                            last_activity_at: Instant::now(),
+                                            last_activity_at: std::time::Instant::now(),
                                             entries,
                                             notes: Vec::new(),
                                             expanded: false,
@@ -249,7 +249,7 @@ pub(crate) async fn route_followup_turn(
                             }
                             None => {
                                 let group = GroupState {
-                                    last_activity_at: Instant::now(),
+                                    last_activity_at: std::time::Instant::now(),
                                     entries,
                                     notes: Vec::new(),
                                     expanded: false,
@@ -313,7 +313,7 @@ pub(crate) async fn route_followup_turn(
                                 .upsert_tool_group(
                                     mid.get(),
                                     GroupState {
-                                        last_activity_at: Instant::now(),
+                                        last_activity_at: std::time::Instant::now(),
                                         entries,
                                         notes: Vec::new(),
                                         expanded: false,
@@ -464,7 +464,7 @@ pub(crate) async fn route_followup_turn(
     // second zero — the whole of #1852. On a post failure the mid stays
     // None and bubble creation falls back to the first tool event.
     let turn_shell = super::tool_group::GroupState {
-        last_activity_at: Instant::now(),
+        last_activity_at: std::time::Instant::now(),
         entries: Vec::new(),
         notes: Vec::new(),
         expanded: false,
