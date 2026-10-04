@@ -867,6 +867,94 @@ pub struct DiscordConfig {
     /// Default: false.
     #[serde(default)]
     pub bang_new_thread: bool,
+    /// Proactive write-budget governor knobs (#1888 follow-up, PRD FR-003),
+    /// `[channels.discord.rate_limiter]`.
+    #[serde(default)]
+    pub rate_limiter: DiscordRateLimiterConfig,
+}
+
+/// Proactive Discord write-governor knobs (`[channels.discord.rate_limiter]`).
+///
+/// Discord rate-limits writes per channel; bots get roughly 5 requests per
+/// 5 seconds for message creation, and edits draw on a comparable budget.
+/// The governor paces writes under that ceiling and backs off on 429 instead
+/// of hammering. Defaults below are deliberately conservative, and every knob
+/// is read live on each gate evaluation, so raising them needs no restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscordRateLimiterConfig {
+    /// Master switch. Default true. When false every write goes straight to
+    /// serenity with no pacing (pre-governor behavior).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Creates: token-bucket refill per channel, in requests per 5 seconds.
+    /// Default: 5 (Discord's documented per-channel bot ceiling).
+    #[serde(default = "default_discord_creates_per_5s")]
+    pub creates_per_5s: u32,
+    /// Creates: burst capacity of the bucket. Default: 5.
+    #[serde(default = "default_discord_create_burst")]
+    pub create_burst: u32,
+    /// Edits: token-bucket refill per channel, in requests per 5 seconds.
+    /// Default: 5.
+    #[serde(default = "default_discord_edits_per_5s")]
+    pub edits_per_5s: u32,
+    /// Edits: burst capacity of the bucket. Default: 5.
+    #[serde(default = "default_discord_edit_burst")]
+    pub edit_burst: u32,
+    /// Longest a non-final write may be HELD waiting for a token before it is
+    /// dropped instead. Cosmetic refreshes self-heal on the next tick, so
+    /// holding them past this serves nobody. Default: 10.
+    #[serde(default = "default_discord_max_hold_secs")]
+    pub max_hold_secs: u64,
+    /// First 429 cooldown per channel, in milliseconds; doubles on each
+    /// consecutive 429 up to `cooldown_max_millis`. Default: 1000.
+    #[serde(default = "default_discord_cooldown_base_millis")]
+    pub cooldown_base_millis: u64,
+    /// Ceiling for the exponential 429 cooldown. Default: 60000.
+    #[serde(default = "default_discord_cooldown_max_millis")]
+    pub cooldown_max_millis: u64,
+}
+
+impl Default for DiscordRateLimiterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            creates_per_5s: default_discord_creates_per_5s(),
+            create_burst: default_discord_create_burst(),
+            edits_per_5s: default_discord_edits_per_5s(),
+            edit_burst: default_discord_edit_burst(),
+            max_hold_secs: default_discord_max_hold_secs(),
+            cooldown_base_millis: default_discord_cooldown_base_millis(),
+            cooldown_max_millis: default_discord_cooldown_max_millis(),
+        }
+    }
+}
+
+fn default_discord_creates_per_5s() -> u32 {
+    5
+}
+
+fn default_discord_create_burst() -> u32 {
+    5
+}
+
+fn default_discord_edits_per_5s() -> u32 {
+    5
+}
+
+fn default_discord_edit_burst() -> u32 {
+    5
+}
+
+fn default_discord_max_hold_secs() -> u64 {
+    10
+}
+
+fn default_discord_cooldown_base_millis() -> u64 {
+    1000
+}
+
+fn default_discord_cooldown_max_millis() -> u64 {
+    60_000
 }
 
 impl Default for DiscordConfig {
@@ -884,6 +972,7 @@ impl Default for DiscordConfig {
             trace_narration: default_true(),
             auto_thread_min_chars: 0,
             bang_new_thread: false,
+            rate_limiter: DiscordRateLimiterConfig::default(),
         }
     }
 }

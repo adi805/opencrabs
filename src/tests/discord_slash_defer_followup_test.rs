@@ -97,7 +97,7 @@ fn token_delivery_precedes_the_plain_message_fallback() {
         .find("edit_original_interaction_response(")
         .expect("FR-002: the deferred ack must be edited with the answer");
     let fallback = body
-        .find("channel.say(&http, &payload)")
+        .find("writes::say(&http, channel, &payload")
         .expect("AC-005: a fallback plain message must exist for a dead token");
     assert!(
         edit < fallback,
