@@ -871,6 +871,10 @@ pub struct DiscordConfig {
     /// `[channels.discord.rate_limiter]`.
     #[serde(default)]
     pub rate_limiter: DiscordRateLimiterConfig,
+    /// Progress-card display knobs (FR-006 + FR-011),
+    /// `[channels.discord.progress]`.
+    #[serde(default)]
+    pub progress: ProgressDisplayConfig,
 }
 
 /// Proactive Discord write-governor knobs (`[channels.discord.rate_limiter]`).
@@ -957,6 +961,30 @@ fn default_discord_cooldown_max_millis() -> u64 {
     60_000
 }
 
+/// Progress-card display knobs (FR-006), `[channels.discord.progress]`.
+///
+/// `silence_warning_secs` is the idle threshold after which the live progress
+/// card says the agent is still working instead of looking frozen. `0`
+/// disables the line. Read at render time, never baked into the renderer, so
+/// the number stays configurable (AC-013).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressDisplayConfig {
+    #[serde(default = "default_silence_warning_secs")]
+    pub silence_warning_secs: u64,
+}
+
+impl Default for ProgressDisplayConfig {
+    fn default() -> Self {
+        Self {
+            silence_warning_secs: default_silence_warning_secs(),
+        }
+    }
+}
+
+fn default_silence_warning_secs() -> u64 {
+    90
+}
+
 impl Default for DiscordConfig {
     fn default() -> Self {
         Self {
@@ -973,6 +1001,7 @@ impl Default for DiscordConfig {
             auto_thread_min_chars: 0,
             bang_new_thread: false,
             rate_limiter: DiscordRateLimiterConfig::default(),
+            progress: ProgressDisplayConfig::default(),
         }
     }
 }

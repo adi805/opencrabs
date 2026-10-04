@@ -10,6 +10,7 @@ use std::time::Instant;
 
 fn live_group() -> GroupState {
     GroupState {
+        last_activity_at: Instant::now(),
         entries: (0..2)
             .map(|i| GroupEntry {
                 name: format!("tool{i}"),

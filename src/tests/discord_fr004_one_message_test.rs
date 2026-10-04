@@ -21,6 +21,7 @@ use crate::channels::discord::tool_group::{GroupEntry, GroupState, render_conten
 
 fn group(n: usize, expanded: bool) -> GroupState {
     GroupState {
+        last_activity_at: Instant::now(),
         entries: (0..n)
             .map(|i| GroupEntry {
                 name: format!("tool{i}"),

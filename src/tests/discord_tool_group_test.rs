@@ -20,6 +20,7 @@ fn entries(n: usize, done: bool) -> Vec<GroupEntry> {
 
 fn group(n: usize, done: bool, expanded: bool) -> GroupState {
     GroupState {
+        last_activity_at: Instant::now(),
         entries: entries(n, done),
         expanded,
         notes: Vec::new(),

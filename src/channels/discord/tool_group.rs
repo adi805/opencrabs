@@ -45,6 +45,11 @@ pub(crate) struct GroupState {
     /// later upsert. `elapsed` freezes at settle so toggling Expand later
     /// never grows the clock.
     pub settled: Option<SettledStatus>,
+    /// When the card last changed, stamped on every tool/note update
+    /// (FR-006). The live line compares it against the configured
+    /// silence threshold so a stalled turn says so instead of looking
+    /// frozen.
+    pub last_activity_at: Instant,
 }
 
 /// Frozen post-delivery chrome (#1841): the Discord twin of Slack's
@@ -127,7 +132,7 @@ fn entry_icon(status: Option<bool>) -> &'static str {
 /// `M:SS` elapsed clock (`H:MM:SS` past an hour), the Discord twin of
 /// Telegram's flow clock. The glyph lives with the caller so the live and
 /// settled segments can differ (`🕒` rolls, `⏱️` freezes at settle).
-fn clock(elapsed: Duration) -> String {
+fn format_clock(elapsed: Duration) -> String {
     let (h, m, s) = (
         elapsed.as_secs() / 3600,
         (elapsed.as_secs() % 3600) / 60,
@@ -138,6 +143,56 @@ fn clock(elapsed: Duration) -> String {
     } else {
         format!("{m}:{s:02}")
     }
+}
+
+/// Elapsed against the turn's thinking-loop budget (FR-011): `M:SS / M:SS`.
+/// The denominator is read from `[agent] thinking_loop_timeout_secs` at
+/// render time, never a literal (AC-013, AC-023). `None` (0 = guard
+/// disabled) keeps the bare elapsed clock.
+fn clock(elapsed: Duration, budget: Option<Duration>) -> String {
+    let elapsed = format_clock(elapsed);
+    match budget {
+        Some(b) => format!("{elapsed} / {}", format_clock(b)),
+        None => elapsed,
+    }
+}
+
+/// Thinking-loop budget for the clock denominator (FR-011), read from config.
+fn budget() -> Option<Duration> {
+    let secs = crate::config::Config::current()
+        .agent
+        .thinking_loop_timeout_secs;
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// Idle threshold for the "still working" line (FR-006), read from
+/// `[channels.discord.progress] silence_warning_secs`. `0` disables.
+fn silence_threshold() -> Option<Duration> {
+    let secs = crate::config::Config::current()
+        .channels
+        .discord
+        .progress
+        .silence_warning_secs;
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// The "still working" segment for a live turn that has gone quiet longer
+/// than the configured threshold (FR-006, AC-012). Names the last activity so
+/// a stalled card never reads as a hang. `None` while fresh, or once settled.
+fn silence_segment(group: &GroupState) -> Option<String> {
+    if group.settled.is_some() {
+        return None;
+    }
+    let threshold = silence_threshold()?;
+    let idle = group.last_activity_at.elapsed();
+    if idle < threshold {
+        return None;
+    }
+    let idle = format_clock(idle);
+    Some(match activity_segment(group) {
+        Some(activity) => format!("⚠️ still working · {activity} · no update for {idle}"),
+        None => format!("⚠️ still working · no update for {idle}"),
+    })
 }
 
 /// Longest activity segment in the live flow line (#1844). Display-only
@@ -229,7 +284,7 @@ fn summary_line(group: &GroupState) -> String {
             if let Some(ctx) = &s.ctx {
                 line.push_str(&format!(" · {ctx}"));
             }
-            line.push_str(&format!(" · ⏱️ {}", clock(s.elapsed)));
+            line.push_str(&format!(" · ⏱️ {}", clock(s.elapsed, budget())));
             line
         }
         None => {
@@ -245,10 +300,14 @@ fn summary_line(group: &GroupState) -> String {
             } else {
                 ("✅", String::new())
             };
-            let clock = format!("🕒 {}", clock(group.started_at.elapsed()));
-            match activity_segment(group) {
+            let clock = format!("🕒 {}", clock(group.started_at.elapsed(), budget()));
+            let base = match activity_segment(group) {
                 Some(activity) => format!("{icon} {activity} · {counts}{tail} · {clock}"),
                 None => format!("{icon} {counts}{tail} · {clock}"),
+            };
+            match silence_segment(group) {
+                Some(silence) => format!("{base}\n{silence}"),
+                None => base,
             }
         }
     }
@@ -357,6 +416,7 @@ impl DiscordState {
         let mut guard = self.tool_groups.lock().await;
         let (_, map) = &mut *guard;
         let group = map.get_mut(&message_id)?;
+        group.last_activity_at = Instant::now();
         group.notes.push(note);
         if group.notes.len() > NOTE_CAP {
             group.notes.remove(0);

@@ -1094,6 +1094,20 @@ pub(crate) async fn handle_message(
         .store_cancel_token(session_id, cancel_token.clone())
         .await;
 
+    // Acknowledge receipt before the first progress write (#1880 FR-010): a
+    // 👀 on the user's message so the turn never looks silently eaten.
+    // Best-effort: skipped while the channel is backing off from a 429,
+    // because the ack is transient and the reply itself is unaffected.
+    if super::governor::cooldown_remaining(msg.channel_id.get()).is_none() {
+        use serenity::model::channel::ReactionType;
+        if let Err(e) = msg
+            .react(&ctx.http, ReactionType::Unicode("👀".to_string()))
+            .await
+        {
+            tracing::warn!("Discord: ack reaction failed: {e}");
+        }
+    }
+
     // Sustained typing for the turn, continuing while the session has detached
     // work (#812). Discord had no turn-long pinger at all, so an ordinary turn
     // showed the dots briefly and a background command showed nothing: spawning
@@ -1204,6 +1218,7 @@ pub(crate) async fn handle_message(
                                     .upsert_tool_group(
                                         mid.get(),
                                         GroupState {
+                                            last_activity_at: Instant::now(),
                                             entries,
                                             notes: Vec::new(),
                                             expanded: false,
@@ -1226,6 +1241,7 @@ pub(crate) async fn handle_message(
                             }
                             None => {
                                 let group = GroupState {
+                                    last_activity_at: Instant::now(),
                                     entries,
                                     notes: Vec::new(),
                                     expanded: false,
@@ -1287,6 +1303,7 @@ pub(crate) async fn handle_message(
                                 .upsert_tool_group(
                                     mid.get(),
                                     GroupState {
+                                        last_activity_at: Instant::now(),
                                         entries,
                                         notes: Vec::new(),
                                         expanded: false,
@@ -1452,6 +1469,7 @@ pub(crate) async fn handle_message(
     // post failure the mid stays None and creation falls back to the first
     // tool call, the pre-#1845 behavior.
     let turn_shell = super::tool_group::GroupState {
+        last_activity_at: Instant::now(),
         entries: Vec::new(),
         notes: Vec::new(),
         expanded: false,
