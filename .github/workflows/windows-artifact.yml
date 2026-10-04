@@ -13,7 +13,7 @@ name: Windows binary (artifact)
 on:
   workflow_dispatch:
   push:
-    branches: [feat/windows-artifact]
+    branches: [feat/windows-artifact, feat/windows-desktop]
 
 jobs:
   windows-exe:
@@ -87,6 +87,15 @@ jobs:
           set -e
           echo "ui-dump exit=$status"
           ls -la target/ui-dump || echo "no target/ui-dump produced"
+          # Same gate as the capture step below, and for the same reason: this job
+          # is the evidence that the Windows renderer ran, and a filter that
+          # matches no test exits 0. Count the frames, do not trust the exit code.
+          frames=$(find target/ui-dump -type f -name '*.txt' 2>/dev/null | wc -l)
+          echo "ui-dump frames=$frames"
+          if [ "$frames" -eq 0 ]; then
+            echo "::error::the UI dump produced no frame files (test exit $status); refusing to hand back an empty artifact"
+            exit 1
+          fi
           exit $status
 
       - name: Upload the UI dump
@@ -95,7 +104,135 @@ jobs:
         with:
           name: opencrabs-ui-dump
           path: target/ui-dump
-          if-no-files-found: warn
+          if-no-files-found: error
+          retention-days: 30
+
+      # The other half of the same gap, and the one the UI dump cannot close: a
+      # render dump is the app's own buffer, not a photograph of a window on a
+      # desktop. This asks the OS to paint a window and reads the pixels back, so
+      # the artifact is what the window manager actually drew.
+      #
+      # It opens its own console window (CREATE_NEW_CONSOLE) rather than
+      # photographing whatever is on screen: a window the test owns carries known
+      # text, so "ink > 0" is a statement about the capture path instead of about
+      # the runner's wallpaper. The test measures the ink ratio of every frame and
+      # FAILS on a blank one, which is the whole point - PrintWindow returns TRUE
+      # for windows it did not paint.
+      #
+      # It asserts an interactive seat, because a hosted runner was measured to
+      # have one (SessionId 2, UserInteractive True) and a silent empty directory
+      # would be indistinguishable from a broken capture.
+      - name: Capture a real window to PNG
+        shell: bash
+        env:
+          AWS_LC_SYS_CMAKE_BUILDER: '1'
+        run: |
+          set +e
+          cargo test --locked --profile ci --target x86_64-pc-windows-msvc --all-features \
+            --lib capture_dump -- --ignored --nocapture
+          status=$?
+          set -e
+          echo "capture-dump test exit=$status"
+          ls -la target/capture-dump 2>/dev/null || echo "no target/capture-dump directory"
+          # An outcome gate, deliberately separate from the test's exit code. The
+          # claim this job has to support is "a PNG was photographed", and a green
+          # run that wrote nothing is the failure this module keeps meeting: an
+          # `--ignored` filter that matches no real test exits 0, cargo prints "ok"
+          # for it, and the upload step at most warns. Count the files instead.
+          frames=$(find target/capture-dump -type f -name '*.png' 2>/dev/null | wc -l)
+          echo "capture-dump frames=$frames"
+          if [ "$frames" -eq 0 ]; then
+            echo "::error::the capture dump produced no PNG (test exit $status); refusing to hand back an empty artifact"
+            exit 1
+          fi
+          exit $status
+
+      - name: Upload the window captures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencrabs-windows-captures
+          path: target/capture-dump
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Drive a real window (injected and posted input)
+        shell: bash
+        env:
+          AWS_LC_SYS_CMAKE_BUILDER: '1'
+        run: |
+          set +e
+          # --test-threads=1 is not a style choice. These jobs share two pieces of
+          # machine-global state: which window holds focus, and where the pointer
+          # is. Run concurrently, one job's injected click moves the pointer that
+          # another job is asserting was left alone, and a spawned console steals
+          # focus from the one about to be typed into -- which that test is
+          # written to refuse, so it would fail for a reason that is the runner's
+          # fault and not the code's.
+          cargo test --locked --profile ci --target x86_64-pc-windows-msvc --all-features \
+            --lib input_dump -- --ignored --nocapture --test-threads=1
+          status=$?
+          set -e
+          echo "input-dump test exit=$status"
+          ls -la target/input-dump 2>/dev/null || echo "no target/input-dump directory"
+          # Same outcome gate as the capture step, same reason: the claim here is
+          # "a keystroke visibly changed a captured frame", and that claim needs
+          # the before/after pair on disk to be checkable by anyone. A filter that
+          # matches nothing exits 0 and prints ok.
+          frames=$(find target/input-dump -type f -name '*.png' 2>/dev/null | wc -l)
+          echo "input-dump frames=$frames"
+          if [ "$frames" -lt 2 ]; then
+            echo "::error::the input dump wrote fewer than 2 PNGs (frames=$frames, test exit $status): no before/after pair, so the keystroke claim is unverified"
+            exit 1
+          fi
+          exit $status
+
+      - name: Upload the input evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencrabs-windows-input
+          path: target/input-dump
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Drive the app lane (launch, focus, close)
+        # `always()` on purpose: this is the only place the three app actions are
+        # exercised against a real window, and it is most worth running on a
+        # commit whose input step just went red.
+        if: always()
+        run: cargo test --locked --profile ci --target x86_64-pc-windows-msvc --all-features --lib app_dump -- --ignored --nocapture --test-threads=1
+        shell: bash
+
+      - name: Count the app evidence
+        # Windows runners default this step to PowerShell; the gate below is
+        # POSIX. Without an explicit shell the count dies with a ParserError
+        # even when the frames are on disk and the receipt is real.
+        shell: bash
+        if: always()
+        run: |
+          status=0
+          ls -la target/input-dump 2>/dev/null || echo "no target/input-dump directory"
+          # Same gate as the input and capture steps, same reason: the claim is
+          # "a launched program showed a window, took the foreground, and then
+          # stopped being one", and that claim is only checkable if the frames it
+          # was measured against are on disk. A filter that matches nothing exits
+          # 0 and prints ok, so the count is the test, not the exit code.
+          frames=$(find target/input-dump -type f -name 'app-*.png' 2>/dev/null | wc -l)
+          echo "app-dump frames=$frames"
+          if [ "$frames" -lt 2 ]; then
+            echo "::error::the app dump wrote fewer than 2 app-*.png (frames=$frames): no launched-window and focused-window frame, so the app-control claim is unverified"
+            exit 1
+          fi
+          exit $status
+
+      - name: Upload the app evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencrabs-windows-app
+          path: target/input-dump/app-*.png
+          if-no-files-found: error
           retention-days: 30
 
   # The render dump proves what the app writes into the terminal buffer. It does

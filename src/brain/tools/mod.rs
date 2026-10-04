@@ -93,6 +93,10 @@ pub mod dynamic;
 pub mod toml_hot_reload;
 pub mod tool_manage;
 
+// Desktop control: seat-gated and approval-gated. Its effects are Windows-only,
+// but the module compiles on every target so the Linux job can test the gates.
+pub mod windows_desktop;
+
 // Browser automation — headless Chrome via CDP
 #[cfg(feature = "browser")]
 pub mod browser;

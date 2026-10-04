@@ -88,6 +88,13 @@ def scan(path):
             attrs = []
             continue
         kind, name = m.group(1), m.group(2)
+        if name == "_":
+            # `const _: () = assert!(...)` is the anonymous-const idiom: `_`
+            # declares no name, so repeating it in one file is legal and rustc
+            # accepts it (verified with rustc, edition 2021). Counting it would
+            # report a compile-time assertion pair as a collision.
+            attrs = []
+            continue
         total += 1
         cfg = " ".join(attrs)
         prior = seen.setdefault(name, [])
@@ -116,6 +123,8 @@ FIXTURES = [
     ("cfg_attr and doc attributes are not gates",
      '#[cfg(windows)]\n#[cfg_attr(feature = "x", allow(dead_code))]\nmod winlock;\n'
      '#[cfg(windows)]\nmod winlock;\n', 1),
+    ("anonymous const assertions do not collide",
+     'const _: () = assert!(1 > 0);\nconst _: () = assert!(2 > 0);\n', 0),
 ]
 
 

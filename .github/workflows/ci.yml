@@ -257,7 +257,11 @@ jobs:
           # src/cli/service_windows.rs IS listed: on this fork that carrier
           # exists (#9), so the Scheduled Task lifecycle is compiled and
           # exercised by the scoped-test slice below on every change to it.
-          pattern='^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|build\.rs|\.github/workflows/ci\.yml|src/utils/(shell|cwd)\.rs|src/brain/tools/(bash|read)\.rs|src/tui/app/input\.rs|src/config/(winlock|profile)\.rs|src/cli/service_windows\.rs)$'
+          # src/desktop/ and its tests are listed too: that module is
+          # Windows-only by construction (its backend sits behind
+          # cfg(windows)), so a change there is exactly the case this
+          # filter must not miss.
+          pattern='^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|build\.rs|\.github/workflows/ci\.yml|src/utils/(shell|cwd)\.rs|src/brain/tools/(bash|read)\.rs|src/tui/app/input\.rs|src/config/(winlock|profile)\.rs|src/cli/service_windows\.rs|src/desktop/.*\.rs|src/tests/(desktop_.*|winlock|service_windows)_test\.rs)$'
           if echo "$files" | grep -qE "$pattern"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
@@ -365,36 +369,51 @@ jobs:
       # POSIX-semantics failures that are not bugs). Every member below
       # exists on this tree, so Windows gives real receipts on day 1 instead
       # of a zero-match tripwire:
-      #   config::winlock                     3 tests, cross-handle
-      #                                       contention and fail-closed
-      #                                       terminate proof, cfg(windows):
-      #                                       these run nowhere else
-      #   tests::utils_shell_test            12 tests, the shell_pair probe
-      #                                       contract
-      #   tests::utils_cwd_test               5 tests, drive-letter and
-      #                                       lookalike dirs
-      #   tests::browser_default_windows_test  6 tests, browser path
-      #                                       detection
-      #   tests::profile_test                67 tests, lock-owner stamp
-      #                                       parsing and reused-PID
-      #                                       resolution. The round-9
-      #                                       finding (a Windows-only test
-      #                                       failure) lived in exactly this
-      #                                       module, and no CI job could
-      #                                       have seen it: Windows ran no
-      #                                       tests.
-      #   cli::service_windows               11 tests, PS builders, the line
-      #                                       protocol parser, injection and the
-      #                                       Scheduled Task lifecycle. Its carrier
-      #                                       EXISTS on this fork (#9), so it is
-      #                                       listed here and gets real receipts
-      #                                       instead of a zero-match tripwire.
-      # continue-on-error: true is the honest day-1 state, not a dodge: 104
-      # tests here have never executed on Windows in this repo's history, so
-      # their outcome is unknown and must not block a PR. The smoke step
-      # above is NOT soft, because a binary that does not start is a hard
-      # fail. Flip continue-on-error to false once the receipts are green,
-      # in the PR that reports them.
+      #   tests::winlock_test             cross-handle contention and
+      #                                   fail-closed terminate proof,
+      #                                   cfg(windows): these run nowhere else
+      #   tests::service_windows_test     PS builders, the line protocol
+      #                                   parser, injection and the Scheduled
+      #                                   Task lifecycle (#9)
+      #   tests::utils_shell_test         the shell_pair probe contract
+      #   tests::utils_cwd_test           drive-letter and lookalike dirs
+      #   tests::browser_default_windows_test  browser path detection
+      #   tests::profile_test             lock-owner stamp parsing and
+      #                                   reused-PID resolution. The round-9
+      #                                   finding (a Windows-only test failure)
+      #                                   lived in exactly this module, and no
+      #                                   CI job could have seen it: Windows
+      #                                   ran no tests.
+      #   tests::desktop_windows_test     what a window station guarantees: an
+      #                                   HWND is never null, at most one window
+      #                                   holds the keyboard, the backdrop
+      #                                   filter was actually applied, and
+      #                                   enumeration still succeeds when there
+      #                                   is nothing to show. None of it is
+      #                                   checkable on any other OS.
+      #   tests::desktop_capture_test     the ink measurement and the blank
+      #                                   verdict. Cross-platform arithmetic,
+      #                                   but the pixel format it guards is the
+      #                                   Windows one: a DIB arrives BGRA with a
+      #                                   zero alpha byte, and that is the shape
+      #                                   that decides whether a capture is
+      #                                   evidence or a black rectangle.
+      #   tests::desktop_input_test       the input ABI layout and the
+      #                                   coordinate scaling. The layout
+      #                                   assertions pin x64 byte sizes, and x64
+      #                                   is only meaningful on the target that
+      #                                   ships.
+      #   tests::desktop_input_posted_test message packing and the key table.
+      #                                   One test in it is cfg(not(windows))
+      #                                   and compiles out here, which is why
+      #                                   its count differs from the Linux job
+      #                                   by one rather than matching it.
+      # continue-on-error: true is the honest day-1 state, not a dodge: these
+      # tests have never executed on Windows in this repo's history, so their
+      # outcome is unknown and must not block a PR. The smoke step above is
+      # NOT soft, because a binary that does not start is a hard fail. Flip
+      # continue-on-error to false once the receipts are green, in the PR
+      # that reports them.
       - name: "Scoped tests (windows): platform-behaviour slice"
         continue-on-error: true
         shell: bash
@@ -412,9 +431,11 @@ jobs:
           # cargo writes "test result: FAILED. N passed" on failure, so
           # parsing $out must not assume the ok-form.
           status=0
-          for m in config::winlock cli::service_windows tests::utils_shell_test \
+          for m in tests::winlock_test tests::service_windows_test tests::utils_shell_test \
                    tests::utils_cwd_test tests::browser_default_windows_test \
-                   tests::profile_test; do
+                   tests::profile_test tests::desktop_windows_test \
+                   tests::desktop_capture_test tests::desktop_input_test \
+                   tests::desktop_input_posted_test; do
             set +e
             out=$(cargo test --locked --profile ci --target x86_64-pc-windows-msvc \
                     --lib -- "$m" 2>&1)
