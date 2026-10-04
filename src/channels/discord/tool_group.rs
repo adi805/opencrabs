@@ -254,47 +254,21 @@ fn summary_line(group: &GroupState) -> String {
     }
 }
 
-/// Header of the mechanical evidence footer (FR-007). Kept as a constant so
-/// the phantom-safety test pins the SAME string the renderer emits, instead
-/// of a copy that can drift (AC-016).
-pub(crate) const EVIDENCE_HEADER: &str = "🔎 evidence:";
+/// The evidence footer's header, re-exported so the phantom-safety test can
+/// pin the SAME string the renderer emits (AC-016). One definition, shared
+/// with Telegram — see [`crate::channels::evidence`] (NFR-002).
+pub(crate) use crate::channels::evidence::EVIDENCE_HEADER;
 
 /// Mechanical evidence footer for the turn's final answer (FR-007, #1880).
 ///
 /// Built from the SAME `entries` the tool card renders, which are appended
 /// from `ProgressEvent::ToolStarted` — the tool loop's real executions. The
 /// model's prose never reaches this function, so the footer cannot claim a
-/// tool the turn did not run (NFR-003, AC-014/AC-015).
-///
-/// The caller appends this at the CHANNEL layer, after the agent returned,
-/// so the phantom gate (which inspects the model's own output) never sees
-/// the line (AC-016). The wording also avoids every `executed_framings`
-/// entry — pinned by a test, not by hope.
-///
-/// `None` when the turn ran no tools: an empty or invented footer is worse
-/// than no footer (AC-015).
+/// tool the turn did not run (NFR-003, AC-014/AC-015). Wording, dedup, and
+/// the cap live in [`crate::channels::evidence`], shared with Telegram so
+/// the two surfaces cannot drift (NFR-002).
 pub(crate) fn evidence_line(group: &GroupState) -> Option<String> {
-    // Distinct names in first-seen order: a turn that reads the same file
-    // four times is still one tool in the evidence line.
-    let mut names: Vec<&str> = Vec::new();
-    for e in &group.entries {
-        let n = e.name.as_str();
-        if !names.contains(&n) {
-            names.push(n);
-        }
-    }
-    if names.is_empty() {
-        return None;
-    }
-    // Cap the list: a 20-tool turn must not turn its footer into a wall.
-    const SHOWN: usize = 6;
-    let extra = names.len().saturating_sub(SHOWN);
-    let shown: Vec<&str> = names.iter().copied().take(SHOWN).collect();
-    let mut line = format!("{EVIDENCE_HEADER} {}", shown.join(", "));
-    if extra > 0 {
-        line.push_str(&format!(" +{extra} more"));
-    }
-    Some(line)
+    crate::channels::evidence::evidence_line(group.entries.iter().map(|e| e.name.as_str()))
 }
 
 /// Message body for the group in its current display state.

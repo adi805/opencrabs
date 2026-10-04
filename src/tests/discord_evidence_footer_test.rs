@@ -87,3 +87,22 @@ fn footer_never_frames_a_command_as_already_run() {
         }
     }
 }
+
+/// NFR-002: the footer must land on BOTH surfaces from ONE implementation. A
+/// channel that re-implemented the line would be free to drift from the
+/// phantom-safety property the test above pins.
+#[test]
+fn both_channels_render_the_shared_line() {
+    const DISCORD: &str = include_str!("../channels/discord/tool_group.rs");
+    const TELEGRAM: &str = include_str!("../channels/telegram/delivery.rs");
+    for (name, src) in [("discord", DISCORD), ("telegram", TELEGRAM)] {
+        assert!(
+            src.contains("evidence::evidence_line("),
+            "{name} does not render the shared evidence line"
+        );
+        assert!(
+            !src.contains("🔎 evidence:"),
+            "{name} hardcodes the footer header instead of using EVIDENCE_HEADER"
+        );
+    }
+}
