@@ -692,6 +692,40 @@ impl EventHandler for Handler {
             }
 
             // Provider picker callback → show models for that provider
+            if let Some(rest) = custom_id.strip_prefix(super::long_answer::PAGER_PREFIX) {
+                // FR-009: reveal one page of a long answer WITHOUT adding a
+                // message to the channel — ephemeral, and it carries its own
+                // position so a pasted-out-of-context page still says where it
+                // came from. An aged-out pager answers plainly instead of
+                // silently doing nothing.
+                use serenity::builder::{
+                    CreateInteractionResponse, CreateInteractionResponseMessage,
+                };
+                let mut parts = rest.splitn(2, ':');
+                let mid = parts.next().and_then(|s| s.parse::<u64>().ok());
+                let page = parts.next().and_then(|s| s.parse::<usize>().ok());
+                let body = match (mid, page) {
+                    (Some(mid), Some(page)) => self
+                        .discord_state
+                        .long_answer_pages(mid)
+                        .await
+                        .and_then(|pages| super::long_answer::page_body(&pages, page)),
+                    _ => None,
+                };
+                let content = body.unwrap_or_else(|| {
+                    "That pager aged out. Ask me again and I will repost the answer.".to_string()
+                });
+                let resp = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(content)
+                        .ephemeral(true),
+                );
+                if let Err(e) = comp.create_response(&ctx.http, resp).await {
+                    tracing::warn!("Discord: long-answer page response failed: {e}");
+                }
+                return;
+            }
+
             if let Some(mid_str) = custom_id.strip_prefix("toolgroup:") {
                 // Expand/Collapse toggle (#380): flip stored state and
                 // update THIS message via the interaction response (which

@@ -53,6 +53,10 @@ pub struct DiscordState {
     pub(super) pending_selects: Mutex<HashMap<String, (std::time::Instant, Vec<String>)>>,
     /// Pending modal forms: id -> (created, spec) (#383). Same lazy TTL.
     pub(super) pending_forms: Mutex<HashMap<String, (std::time::Instant, interactions::FormSpec)>>,
+    /// Long answers paged behind a button (FR-009), keyed by the id of the
+    /// message carrying page 0. Insertion-ordered for pruning; bounded at
+    /// `DiscordState::LONG_ANSWER_CAP` (see `long_answer`).
+    pub(super) long_answers: Mutex<(Vec<u64>, HashMap<u64, Vec<String>>)>,
     /// Collapsible tool groups keyed by message id, so the Expand/Collapse
     /// interaction can re-render after the turn ended. Insertion-ordered
     /// for pruning; bounded at [`Self::TOOL_GROUP_CAP`] (see `tool_group`).
@@ -80,6 +84,7 @@ impl DiscordState {
             cancel_tokens: Mutex::new(HashMap::new()),
             pending_selects: Mutex::new(HashMap::new()),
             pending_forms: Mutex::new(HashMap::new()),
+            long_answers: Mutex::new((Vec::new(), HashMap::new())),
             tool_groups: Mutex::new((Vec::new(), HashMap::new())),
         }
     }
