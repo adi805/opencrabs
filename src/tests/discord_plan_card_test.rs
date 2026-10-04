@@ -67,7 +67,10 @@ fn editing_plan_renders_the_checklist_with_marks_and_criteria_counts() {
         body.contains("_(2 acceptance criteria)_"),
         "criteria count: {body}"
     );
-    assert!(body.contains("☐ **2. honest settle**"), "pending row: {body}");
+    assert!(
+        body.contains("☐ **2. honest settle**"),
+        "pending row: {body}"
+    );
     // A task with no criteria must not render a "(0 acceptance criteria)"
     // stub: it says nothing and costs a row's worth of noise.
     assert!(
@@ -93,7 +96,10 @@ fn editing_plan_offers_approve_and_discard() {
 /// Approve on a live plan would re-seed a turn that is already running.
 #[test]
 fn active_plan_offers_discard_only() {
-    let plan = plan_with(PlanStatus::Active, vec![("run it", TaskStatus::InProgress, 0)]);
+    let plan = plan_with(
+        PlanStatus::Active,
+        vec![("run it", TaskStatus::InProgress, 0)],
+    );
     assert_eq!(PlanKb::of(&plan), PlanKb::DiscardOnly);
     let rows = render_components(PlanKb::of(&plan));
     assert_eq!(rows.len(), 1, "exactly one action row");
