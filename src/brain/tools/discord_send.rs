@@ -135,11 +135,23 @@ impl Tool for DiscordSendTool {
                 },
                 "embed_description": {
                     "type": "string",
-                    "description": "Body text for send_embed"
+                    "description": "Body text for send_embed (single-embed path; ignored when 'embeds' is given)"
                 },
                 "embed_color": {
                     "type": "integer",
                     "description": "RGB color integer for send_embed (e.g. 0x00FF00 = 65280)"
+                },
+                "embeds": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "description": {"type": "string"},
+                            "color": {"type": "integer"}
+                        }
+                    },
+                    "description": "Multi-embed layout for send_embed (max 10 blocks). When present and non-empty it replaces embed_title/embed_description/embed_color. Each block: title (<=256 chars), description (<=4096), color (RGB int, default Discord blurple). Discord caps the combined title+description text across all blocks at 6000 chars; overflow is trimmed from the tail and reported."
                 },
                 "thread_name": {
                     "type": "string",
@@ -201,11 +213,15 @@ impl Tool for DiscordSendTool {
                 },
                 "file_path": {
                     "type": "string",
-                    "description": "Local file path to upload (required for send_file)"
+                    "description": "Local file path to upload (required for send_file). Refused locally if over Discord's 20 MiB per-attachment default or 25 MiB request limit."
                 },
                 "caption": {
                     "type": "string",
                     "description": "Optional caption text for send_file"
+                },
+                "silent": {
+                    "type": "boolean",
+                    "description": "Post with SUPPRESS_NOTIFICATIONS: recipients get the unread badge but no push/desktop notification. Applies to send, reply, send_embed, send_file. Omit to use the channel default (channels.discord.suppress_notifications, false). Set true for scheduled/report output that should not ping the server; set false to force a loud send on a quiet channel."
                 }
             },
             "required": ["action"]
@@ -267,17 +283,37 @@ impl Tool for DiscordSendTool {
 
         let guild_id_opt = self.discord_state.guild_id().await;
 
+        // C1: resolve silent delivery once. An explicit `silent` param wins
+        // over the channel default so one scheduled job can stay loud on a
+        // quiet channel and vice versa. Only the actions that create a fresh
+        // message consult it (send/reply/send_embed/send_file); edit/react and
+        // the rest never set create-time flags.
+        let silent = crate::channels::discord::flags::resolve_silent(
+            input.get("silent").and_then(|v| v.as_bool()),
+            crate::config::Config::current()
+                .channels
+                .discord
+                .suppress_notifications,
+        );
+
         use serenity::model::id::{ChannelId, GuildId, MessageId, RoleId, UserId};
 
         match action.as_str() {
             // ── send ─────────────────────────────────────────────────────────
             "send" => {
+                use serenity::builder::CreateMessage;
                 let text = pget!(get_str(&input, "message")).to_string();
                 let channel_id = pget!(channel_or_err(channel_id_opt));
                 let channel = ChannelId::new(channel_id);
                 let chunks = crate::channels::discord::handler::split_message(&text, 2000);
                 for chunk in chunks {
-                    if let Err(e) = channel.say(&http, chunk).await {
+                    // C1: build through apply_silent rather than `channel.say`,
+                    // which has no flags field on its builder.
+                    let builder = crate::channels::discord::flags::apply_silent(
+                        CreateMessage::new().content(chunk),
+                        silent,
+                    );
+                    if let Err(e) = channel.send_message(&http, builder).await {
                         return Ok(ToolResult::error(format!("Failed to send: {e}")));
                     }
                 }
@@ -295,9 +331,12 @@ impl Tool for DiscordSendTool {
                 let message_id = pget!(get_id(&input, "message_id"));
                 let channel = ChannelId::new(channel_id);
                 let reference = MessageReference::from((channel, MessageId::new(message_id)));
-                let builder = CreateMessage::new()
-                    .content(text.as_str())
-                    .reference_message(reference);
+                let builder = crate::channels::discord::flags::apply_silent(
+                    CreateMessage::new()
+                        .content(text.as_str())
+                        .reference_message(reference),
+                    silent,
+                );
                 match channel.send_message(&http, builder).await {
                     Ok(_) => Ok(ToolResult::success(format!(
                         "Reply sent to message {message_id}."
@@ -439,34 +478,72 @@ impl Tool for DiscordSendTool {
 
             // ── send_embed ───────────────────────────────────────────────────
             "send_embed" => {
-                use serenity::builder::{CreateEmbed, CreateMessage};
+                use crate::channels::discord::embed::{EmbedInput, build_spec, embed_builders};
+                use serenity::builder::CreateMessage;
                 let channel_id = pget!(channel_or_err(channel_id_opt));
-                let title = input
-                    .get("embed_title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let description = input
-                    .get("embed_description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let color = input
-                    .get("embed_color")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0x5865F2) as u32; // Discord blurple default
-                let embed = CreateEmbed::new()
-                    .title(title.as_str())
-                    .description(description.as_str())
-                    .color(color);
-                let builder = CreateMessage::new().embed(embed);
+
+                // An explicit non-empty `embeds` array wins; otherwise the
+                // single-embed params become a one-element input, so both paths
+                // share one validator (C2). A blank single embed is refused
+                // rather than sent as an empty embed Discord would 400 on.
+                let inputs: Vec<EmbedInput> = match input.get("embeds").and_then(|v| v.as_array()) {
+                    Some(arr) if !arr.is_empty() => arr
+                        .iter()
+                        .map(|e| {
+                            EmbedInput::new(
+                                e.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                                e.get("description").and_then(|v| v.as_str()).unwrap_or(""),
+                                e.get("color").and_then(|v| v.as_u64()).unwrap_or(0x5865F2) as u32,
+                            )
+                        })
+                        .collect(),
+                    _ => vec![EmbedInput::new(
+                        input
+                            .get("embed_title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                        input
+                            .get("embed_description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                        input
+                            .get("embed_color")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0x5865F2) as u32, // Discord blurple default
+                    )],
+                };
+
+                let spec = match build_spec(&inputs) {
+                    Ok(spec) => spec,
+                    Err(e) => return Ok(ToolResult::error(e.message())),
+                };
+                let builder = crate::channels::discord::flags::apply_silent(
+                    CreateMessage::new().embeds(embed_builders(&spec)),
+                    silent,
+                );
                 match ChannelId::new(channel_id)
                     .send_message(&http, builder)
                     .await
                 {
-                    Ok(_) => Ok(ToolResult::success(format!(
-                        "Embed sent to channel {channel_id}."
-                    ))),
+                    Ok(_) => {
+                        let mut note = format!(
+                            "{} embed(s) sent to channel {channel_id}.",
+                            spec.embeds.len()
+                        );
+                        if spec.dropped_embeds > 0 {
+                            note.push_str(&format!(
+                                " {} block(s) dropped (blank, past the 10-embed cap, or past the \
+                                 6000-char budget).",
+                                spec.dropped_embeds
+                            ));
+                        }
+                        if spec.truncated {
+                            note.push_str(
+                                " Text was trimmed to fit Discord's 6000-character embed budget.",
+                            );
+                        }
+                        Ok(ToolResult::success(note))
+                    }
                     Err(e) => Ok(ToolResult::error(format!("Failed to send embed: {e}"))),
                 }
             }
@@ -775,6 +852,7 @@ impl Tool for DiscordSendTool {
             }
 
             "send_file" => {
+                use crate::channels::discord::guard::{FileSize, check_batch};
                 use serenity::builder::{CreateAttachment, CreateMessage};
                 use serenity::model::id::ChannelId;
                 let channel_id = pget!(channel_or_err(channel_id_opt));
@@ -792,18 +870,34 @@ impl Tool for DiscordSendTool {
                     .unwrap_or("")
                     .to_string();
                 let channel = ChannelId::new(channel_id);
+                // C3: check the size from metadata BEFORE reading, so an
+                // oversized file is refused instead of pulled into memory.
+                // Discord would answer 400 after the whole upload.
+                let fname = std::path::Path::new(&file_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file.png")
+                    .to_string();
+                match tokio::fs::metadata(&file_path).await {
+                    Ok(meta) => {
+                        if let Err(e) = check_batch(&[FileSize::new(fname.clone(), meta.len())]) {
+                            return Ok(ToolResult::error(e.message()));
+                        }
+                    }
+                    Err(e) => {
+                        return Ok(ToolResult::error(format!(
+                            "Failed to read file '{file_path}': {e}"
+                        )));
+                    }
+                }
                 match tokio::fs::read(&file_path).await {
                     Ok(bytes) => {
-                        let fname = std::path::Path::new(&file_path)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("file.png")
-                            .to_string();
                         let attachment = CreateAttachment::bytes(bytes.as_slice(), fname);
                         let mut msg = CreateMessage::new().add_file(attachment);
                         if !caption.is_empty() {
                             msg = msg.content(caption);
                         }
+                        let msg = crate::channels::discord::flags::apply_silent(msg, silent);
                         match channel.send_message(&http, msg).await {
                             Ok(_) => Ok(ToolResult::success("File sent.".to_string())),
                             Err(e) => Ok(ToolResult::error(format!("Failed to send file: {e}"))),

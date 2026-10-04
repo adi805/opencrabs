@@ -4,6 +4,7 @@
 //! session routing (owner shares TUI session, others get per-user sessions).
 
 use super::DiscordState;
+use super::guard;
 use crate::brain::agent::AgentService;
 use crate::channels::group_history;
 use crate::config::{Config, RespondTo};
@@ -1590,8 +1591,12 @@ pub(crate) async fn handle_message(
             // Media gallery (#385): batch all generated files into ONE
             // multi-attachment message (Discord caps 10 per message; the
             // remainder rolls into follow-up batches) instead of one
-            // message per file.
+            // message per file. The batching now also respects the 25 MiB
+            // request ceiling and the per-attachment upload limit (C3): a
+            // batch of ten large images used to be sent blind and come back
+            // as an unexplained 400.
             let mut attachments: Vec<CreateAttachment> = Vec::new();
+            let mut sizes: Vec<guard::FileSize> = Vec::new();
             for img_path in &img_paths {
                 match tokio::fs::read(img_path).await {
                     Ok(bytes) => {
@@ -1600,6 +1605,7 @@ pub(crate) async fn handle_message(
                             .and_then(|n| n.to_str())
                             .unwrap_or("image.png")
                             .to_string();
+                        sizes.push(guard::FileSize::new(fname.clone(), bytes.len() as u64));
                         attachments.push(CreateAttachment::bytes(bytes, fname));
                     }
                     Err(e) => {
@@ -1607,10 +1613,30 @@ pub(crate) async fn handle_message(
                     }
                 }
             }
-            for batch in attachments.chunks(10) {
+            let plan = guard::plan_batches(&sizes);
+            if plan.sent_count() > 0 {
+                tracing::info!(
+                    "Discord: media gallery sending {} file(s) in {} batch(es)",
+                    plan.sent_count(),
+                    plan.batches.len()
+                );
+            }
+            for idx in &plan.oversized {
+                tracing::error!(
+                    "Discord: media gallery skipped {}: {}",
+                    sizes[*idx].name,
+                    guard::GuardError::AttachmentTooLarge {
+                        name: sizes[*idx].name.clone(),
+                        bytes: sizes[*idx].bytes,
+                        max: guard::ATTACHMENT_MAX_BYTES,
+                    }
+                    .message()
+                );
+            }
+            for batch in &plan.batches {
                 let mut message = CreateMessage::new();
-                for file in batch {
-                    message = message.add_file(file.clone());
+                for idx in batch {
+                    message = message.add_file(attachments[*idx].clone());
                 }
                 if let Err(e) = target.send_message(&ctx.http, message).await {
                     tracing::error!("Discord: failed to send media gallery batch: {}", e);

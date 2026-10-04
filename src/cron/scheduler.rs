@@ -1408,9 +1408,24 @@ async fn deliver_discord(channel_id: &str, message: &str) {
 
     let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
     let client = reqwest::Client::new();
+    // C1: a scheduled report should not push-notify every member, so honor
+    // channels.discord.suppress_notifications here too. This delivery path
+    // hand-builds its JSON body, so it reads the shared bit from flags.rs
+    // instead of going through a serenity builder.
+    let silent = crate::config::Config::current()
+        .channels
+        .discord
+        .suppress_notifications;
     let mut delivered = 0usize;
     for chunk in split_for_delivery(message, 2000) {
-        let body = serde_json::json!({ "content": chunk });
+        let body = if silent {
+            serde_json::json!({
+                "content": chunk,
+                "flags": crate::channels::discord::flags::SUPPRESS_NOTIFICATIONS_BITS,
+            })
+        } else {
+            serde_json::json!({ "content": chunk })
+        };
         match client
             .post(&url)
             .header("Authorization", format!("Bot {token}"))
