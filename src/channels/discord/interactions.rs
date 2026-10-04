@@ -588,6 +588,7 @@ pub(crate) async fn route_followup_turn(
                 && let Some(group) = discord_state
                     .settle_tool_group(
                         mid.get(),
+                        super::tool_group::TurnOutcome::Finished,
                         if ctx_line.is_empty() {
                             None
                         } else {
@@ -648,9 +649,27 @@ pub(crate) async fn route_followup_turn(
         }
         Err(ref e) if matches!(e, crate::brain::agent::AgentError::Cancelled) => {
             tracing::info!("Discord: follow-up tap turn cancelled for session {session_id}");
+            super::handler::settle_outcome(
+                &http,
+                channel,
+                &discord_state,
+                &turn_group_mid,
+                super::tool_group::TurnOutcome::Cancelled,
+                None,
+            )
+            .await;
         }
         Err(e) => {
             tracing::error!("Discord: follow-up tap agent error: {e}");
+            super::handler::settle_outcome(
+                &http,
+                channel,
+                &discord_state,
+                &turn_group_mid,
+                super::handler::classify_outcome(&e),
+                None,
+            )
+            .await;
             let error_msg = format!("❌ Error\n\n{}", crate::brain::agent::format_user_error(&e));
             if let Err(e) = writes::say(&http, channel, error_msg, Class::Final).await {
                 tracing::warn!("Discord: follow-up tap error post failed: {e}");

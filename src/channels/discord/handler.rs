@@ -1605,6 +1605,7 @@ pub(crate) async fn handle_message(
                 && let Some(group) = discord_state
                     .settle_tool_group(
                         mid.get(),
+                        super::tool_group::TurnOutcome::Finished,
                         if ctx_line.is_empty() {
                             None
                         } else {
@@ -1757,9 +1758,27 @@ pub(crate) async fn handle_message(
         }
         Err(ref e) if matches!(e, crate::brain::agent::AgentError::Cancelled) => {
             tracing::info!("Discord: agent call cancelled for session {}", session_id);
+            settle_outcome(
+                &ctx.http,
+                target,
+                &discord_state,
+                &turn_group_mid,
+                super::tool_group::TurnOutcome::Cancelled,
+                None,
+            )
+            .await;
         }
         Err(e) => {
             tracing::error!("Discord: agent error: {}", e);
+            settle_outcome(
+                &ctx.http,
+                target,
+                &discord_state,
+                &turn_group_mid,
+                classify_outcome(&e),
+                None,
+            )
+            .await;
             // Shared helper translates the raw error into something
             // the user can act on (5xx exhausted, rate limit, context
             // too large, stream broken, repetition loop). Same wording
@@ -1769,6 +1788,54 @@ pub(crate) async fn handle_message(
                 tracing::warn!(error = %e, "failed to send Discord message");
             }
         }
+    }
+}
+
+/// Classify a turn error into the terminal outcome stamped on the flow card
+/// (FR-005, #1880). Mirrors Telegram's `FlowOutcome` split exactly: a
+/// deadline/timeout reads as `TimedOut`, anything else as `Failed`.
+/// Cancellation is matched on the error VARIANT by the caller, never here.
+pub(crate) fn classify_outcome(
+    err: &crate::brain::agent::AgentError,
+) -> super::tool_group::TurnOutcome {
+    let es = err.to_string().to_lowercase();
+    if es.contains("timed out") || es.contains("timeout") || es.contains("deadline") {
+        super::tool_group::TurnOutcome::TimedOut
+    } else {
+        super::tool_group::TurnOutcome::Failed
+    }
+}
+
+/// Settle the flow card with a terminal outcome and re-render it in place
+/// (FR-005, #1880).
+///
+/// Before this, settle ran ONLY on the `Ok` arm. A turn that failed, timed out
+/// or was cancelled left the card's `🕒` clock spinning forever — on screen
+/// indistinguishable from a turn still working — and the card's icon came from
+/// tool status, so a timeout with all tools green rendered a green check. The
+/// trace is never deleted: the card is edited to its final shape.
+pub(crate) async fn settle_outcome(
+    http: &Http,
+    channel: serenity::model::id::ChannelId,
+    discord_state: &DiscordState,
+    turn_group_mid: &Arc<Mutex<Option<serenity::model::id::MessageId>>>,
+    outcome: super::tool_group::TurnOutcome,
+    ctx: Option<String>,
+) {
+    let Some(mid) = *turn_group_mid.lock().await else {
+        return;
+    };
+    let Some(group) = discord_state
+        .settle_tool_group(mid.get(), outcome, ctx)
+        .await
+    else {
+        return;
+    };
+    let edit = serenity::builder::EditMessage::new()
+        .content(super::tool_group::render_content(&group))
+        .components(super::tool_group::render_components(&group, mid.get()));
+    if let Err(e) = writes::edit(http, channel, mid, edit, Class::Final).await {
+        tracing::debug!("Discord: settled status stamp failed: {e}");
     }
 }
 

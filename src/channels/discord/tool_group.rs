@@ -53,8 +53,36 @@ pub(crate) struct GroupState {
 /// goes away in #1842, leaving the settled line as the single home).
 #[derive(Debug, Clone)]
 pub(crate) struct SettledStatus {
+    pub outcome: TurnOutcome,
     pub elapsed: Duration,
     pub ctx: Option<String>,
+}
+
+/// Terminal outcome of a turn, stamped on the group at settle (FR-005, #1880).
+/// The Discord twin of Slack's `TurnOutcome` and Telegram's `FlowOutcome`.
+///
+/// Without it the settled icon was derived from *tool* status, so a turn that
+/// timed out or was cancelled with no failing tool rendered a green check:
+/// a false success signal on the card the user is actually watching.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TurnOutcome {
+    Finished,
+    Failed,
+    TimedOut,
+    Cancelled,
+}
+
+impl TurnOutcome {
+    /// Icon + verb for the settled line. Mirrors Slack's `icon_verb` so the
+    /// three channels read the same.
+    fn icon_verb(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Finished => ("✅", "Finished"),
+            Self::Failed => ("❌", "Failed"),
+            Self::TimedOut => ("⏱", "Timed out"),
+            Self::Cancelled => ("❌", "Cancelled"),
+        }
+    }
 }
 
 /// Keep at most this many narration lines in the bubble (newest win).
@@ -179,18 +207,25 @@ fn summary_line(group: &GroupState) -> String {
     let counts = format!("**{n} tool call{}**", if n == 1 { "" } else { "s" });
     match &group.settled {
         Some(s) => {
-            // Settled chrome (#1841): frozen clock, ctx budget as the last
-            // word before it, mirroring the Telegram settled header order.
-            // A settled turn has no running tools: the icon reads final
-            // states only, ❌ when something failed, ✅ otherwise, never
-            // the live "N running" tail (an entry left statusless at
-            // settle is done, not running).
-            let (icon, tail) = if failed > 0 {
-                ("❌", format!(" · {failed} failed"))
+            // Settled chrome (#1841), outcome-honest since FR-005 (#1880):
+            // the icon and verb come from how the TURN ended, not from
+            // whether some tool happened to fail. A timeout or a cancel
+            // with all tools green used to render ✅ — a false success on
+            // the card the user is watching. The failure count stays as
+            // supporting detail, never as the primary signal.
+            let (icon, verb) = s.outcome.icon_verb();
+            let tail = if failed > 0 {
+                format!(" · {failed} failed")
             } else {
-                ("✅", String::new())
+                String::new()
             };
-            let mut line = format!("{icon} {counts}{tail}");
+            let mut line = format!("{icon} {verb} · {counts}{tail}");
+            // AC-010: a turn that did not finish cleanly must SAY so. The user
+            // is looking at a partial result and has no other signal that the
+            // work stopped early — the tool count alone cannot tell them.
+            if s.outcome != TurnOutcome::Finished {
+                line.push_str(" · result may be incomplete");
+            }
             if let Some(ctx) = &s.ctx {
                 line.push_str(&format!(" · {ctx}"));
             }
@@ -317,14 +352,16 @@ impl DiscordState {
         Some(group.clone())
     }
 
-    /// Stamp the post-delivery status (#1841): freeze the clock at now and
-    /// record the ctx budget line for the settled chrome. A `None` ctx keeps
-    /// whatever a previous settle stamped, so a re-settle never clears the
-    /// budget. Returns the updated state, or None when the message has no
-    /// stored group (aged out of retention).
+    /// Stamp the post-delivery status (#1841, outcome-honest FR-005): freeze
+    /// the clock at now, record how the turn ENDED, and keep the ctx budget
+    /// line for the settled chrome. A `None` ctx keeps whatever a previous
+    /// settle stamped, so a re-settle never clears the budget. Returns the
+    /// updated state, or None when the message has no stored group (aged out
+    /// of retention).
     pub(crate) async fn settle_tool_group(
         &self,
         message_id: u64,
+        outcome: TurnOutcome,
         ctx: Option<String>,
     ) -> Option<GroupState> {
         let mut guard = self.tool_groups.lock().await;
@@ -332,6 +369,7 @@ impl DiscordState {
         let group = map.get_mut(&message_id)?;
         let prev_ctx = group.settled.as_ref().and_then(|s| s.ctx.clone());
         group.settled = Some(SettledStatus {
+            outcome,
             elapsed: group.started_at.elapsed(),
             ctx: ctx.or(prev_ctx),
         });

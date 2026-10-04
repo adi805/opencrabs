@@ -40,7 +40,13 @@ async fn snapshot_reports_a_live_group_so_the_ticker_ticks() {
 async fn snapshot_reports_settled_so_the_ticker_stops() {
     let state = DiscordState::new();
     state.upsert_tool_group(111, live_group()).await;
-    state.settle_tool_group(111, None).await;
+    state
+        .settle_tool_group(
+            111,
+            crate::channels::discord::tool_group::TurnOutcome::Finished,
+            None,
+        )
+        .await;
     let snap = state
         .tool_group_snapshot(111)
         .await
