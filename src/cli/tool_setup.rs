@@ -175,7 +175,11 @@ pub(crate) fn register_core_agent_tools(
     // headless paths (owner ruling C: sub-agents report via the harness's
     // final-message relay, proven live-fire 2026-09-07). Gated with
     // suggest_options above; the context guard backstops both.
-    if !headless {
+    // #1840 (owner order): also gated on the kill switch. A disabled tool
+    // must not exist in the model's surface at all: no schema in context,
+    // nothing to call, nothing to be confused by. The #1803 execute-time
+    // refusal stays as the backstop for the non-registry paths (A2A, CLI).
+    if !headless && config.agent.session_notify_enabled {
         tool_registry.register(Arc::new(crate::brain::tools::subagent::SessionNotifyTool));
     }
 

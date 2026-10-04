@@ -543,9 +543,11 @@ pub(super) fn render_input(f: &mut Frame, app: &App, area: Rect) {
     // no layout: the input height is derived from the buffer alone and the
     // Paragraph below does not wrap, so a long notice is clipped, not
     // wrapped onto a row the layout never allotted.
-    if let Some((kind, text)) =
-        super::notice::pick_notice(app.error_message.as_deref(), app.notification.as_deref())
-        && let Some(row) = input_lines.get_mut(cursor_row)
+    if let Some((kind, text)) = super::notice::pick_notice(
+        app.error_message.as_deref(),
+        app.notification.as_deref(),
+        app.clipboard_hint.as_deref(),
+    ) && let Some(row) = input_lines.get_mut(cursor_row)
     {
         let room = input_content_width.saturating_sub(row.width());
         if let Some(label) = super::notice::notice_label(text, room) {

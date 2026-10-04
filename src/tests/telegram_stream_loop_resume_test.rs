@@ -59,6 +59,7 @@ async fn resume_shape_loop_edits_tools_in_place_and_never_reacts() {
     // which is exactly how the open flow stopped being edited in place.
     // Every other test that touches the gates takes the same guard.
     let _guard = crate::channels::telegram::governor::test_support::registry_guard().await;
+    let _cooldown = crate::tests::telegram_cooldown_lock::guard().await;
     crate::channels::telegram::governor::test_support::reset(0);
     crate::channels::telegram::rate_limit::reset_global_cooldown();
 

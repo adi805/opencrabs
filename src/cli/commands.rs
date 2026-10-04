@@ -236,11 +236,51 @@ pub(crate) async fn cmd_doctor(config: &crate::config::Config, fix: bool) -> Res
     if db_path.exists() {
         match Database::connect(db_path).await {
             Ok(db) => {
-                db.run_migrations().await.ok();
-                println!("  ✅ Database: {}", db_path.display());
-                pass += 1;
-                if fix {
-                    apply_fixes(config, db.pool()).await;
+                // #1779: the pre-migration guard refuses on a damaged image, and
+                // `.ok()` threw that refusal away, so doctor printed
+                // "✅ Database" over a corrupt file. That is precisely the
+                // blindness the rpi5 operator hit while looking for a signal, so
+                // the refusal is reported here instead of discarded.
+                //
+                // Note what this does NOT fix: `doctor` still returns Ok and
+                // still exits 0 with failures counted, so a script cannot gate on
+                // it. That is a separate defect about the whole command, not
+                // about the database check.
+                match db.run_migrations().await {
+                    Ok(()) => {
+                        println!("  ✅ Database: {}", db_path.display());
+                        pass += 1;
+                        // #1779 defect 4: doctor reported the image as healthy and
+                        // nothing about whether a copy of it existed to restore.
+                        // The snapshot line makes the recovery asset visible on the
+                        // one command an operator reaches for mid-incident.
+                        let snapshot_dir = crate::db::migration_snapshot::snapshot_dir();
+                        let newest = crate::db::migration_snapshot::newest_snapshot(&snapshot_dir);
+                        if crate::db::db_integrity_failed_now() {
+                            println!(
+                                "  ⚠️  Database integrity: check FAILED after migrations; \
+                                 newest snapshot: {}",
+                                crate::db::migration_snapshot::newest_snapshot_note(
+                                    newest.as_deref()
+                                )
+                            );
+                            warn += 1;
+                        } else {
+                            println!(
+                                "  📸 Database snapshot: {}",
+                                crate::db::migration_snapshot::newest_snapshot_note(
+                                    newest.as_deref()
+                                )
+                            );
+                        }
+                        if fix {
+                            apply_fixes(config, db.pool()).await;
+                        }
+                    }
+                    Err(e) => {
+                        println!("  ❌ Database: {e:#}");
+                        fail += 1;
+                    }
                 }
             }
             Err(e) => {
@@ -1116,7 +1156,8 @@ pub(crate) async fn cmd_agent_interactive(
 
     // Core tools come from the shared tool_setup helper so this REPL path never
     // drifts from the TUI/daemon tool set. `false` = interactive (#129): the
-    // REPL user sees mid-task output, so session_notify/suggest_options stay.
+    // REPL user sees mid-task output, so session_notify stays when [agent]
+    // session_notify_enabled is on (#1840); suggest_options always stays.
     // Runtime tools (dynamic/browser) are added after the system brain is
     // built, below.
     let tool_registry = Arc::new(ToolRegistry::new());
@@ -1948,6 +1989,11 @@ pub(crate) fn build_systemd_unit(
     } else {
         "default.target"
     };
+    // OOMPolicy=continue: this daemon is the parent of every tool call and cron
+    // child, and systemd's default policy (`stop`) terminates the whole unit when
+    // any single child is OOM-killed — turning one tool call's memory spike into a
+    // full daemon restart that takes every agent lane down with it. `continue`
+    // logs the kill and leaves the daemon running.
     format!(
         "[Unit]\n\
          Description=OpenCrabs Daemon [{profile_label}]\n\
@@ -1958,6 +2004,7 @@ pub(crate) fn build_systemd_unit(
          {identity}ExecStart={exec_args}\n\
          Restart=always\n\
          RestartSec=5\n\
+         OOMPolicy=continue\n\
          \n\
          [Install]\n\
          WantedBy={wanted_by}\n"
@@ -2684,6 +2731,10 @@ pub(crate) async fn cmd_evolve(config: &crate::config::Config, check_only: bool)
         .with_working_directory(std::env::current_dir().unwrap_or_default())
         .with_auto_approve(true);
     context.timeout_secs = 300;
+    // #1802: every surface that builds a context stamps the kill switch.
+    context.session_notify_enabled = crate::config::Config::current()
+        .agent
+        .session_notify_enabled;
 
     let result = tool.execute(input, &context).await?;
     println!("{}", result.output);

@@ -385,7 +385,7 @@ The one user-settable TTL is `cache_ttl` (default 300s, range 1-86400), which se
 | **Telegram Bot** | Full-featured Telegram bot — owner DMs share TUI session, groups get isolated per-group sessions (keyed by chat ID). Photo/voice support (STT transcribes incoming voice notes; TTS replies as OGG/Opus voice notes via `send_voice` when input was audio). Allowed user IDs, allowed chat/group IDs, per-group allow lists (`[channels.telegram.groups.<id>]`), `respond_to` filter (`all`/`dm_only`/`mention`/`auto`, global or per-group). Passive group message capture — all messages stored for context even when bot isn't mentioned |
 | **Telegram Userbot (experimental)** | Feature-gated, opt-in, receive-only MTProto companion. Experimental: merged from #1209 without a maintainer-side live login yet; expect rough edges. Local QR/code/2FA login; allowlisted text is passively stored under `telegram-userbot` for explicit retrieval through `channel_search`. Empty `allowed_chats` is dry mode. It does not invoke the agent or send/edit/react as the user. |
 | **WhatsApp** | Pair by scanning a QR code from the TUI: first-run onboarding, or `/onboard:channels` then select WhatsApp. The QR is shown in the terminal. You run the bot AS whatever account you scan: your own number (talk via "Message Yourself") or any other number you own, including a WhatsApp Business account, to serve that account's incoming DMs. `response_policy` (`auto`/`owner_only`/`allowlist`/`open`) decides who it answers; the paired account's self-chat and `bot_owner` operator are always allowed. Streaming edits ONE living message in place rather than posting a chunk per step, and a finished multi-step turn is acknowledged with a reaction. Inbound: text, image, video, audio, document, sticker, location, contact card, reactions and poll votes (decrypted and resolved back to the option labels). Media whose CDN URL has expired is recovered through a server re-upload rather than reported as a failed download. Outbound audio goes out as a native voice note (`ptt`) with a recording indicator, pairing directly with built-in `local-tts`. Beyond messaging: block / unblock / list blocked contacts, disappearing messages (per message or channel-wide), pin and unpin chats, forward a message the session has seen, set the profile name and status, post status updates, discover followed newsletters, and create and assign labels. Every action that delivers a message is charged to an outbound send budget. Tool-approval prompts can optionally be sent as interactive buttons (`interactive_buttons`, off by default). Follow-up suggestion sets that exceed the native button cap render as a poll instead, and a vote selects the option (#1616). Per-phone sessions, session persists across restarts |
-| **Discord** | Full Discord bot — text + image + voice. Owner DMs share TUI session, guild channels get isolated per-channel sessions. Allowed user IDs, allowed channel IDs, `respond_to` filter. Tool calls render as ONE grouped message per turn, collapsed to a summary with an Expand/Collapse button, edited in place as tools run — Slack parity. Reacting to a bot message becomes an agent turn (approval emoji = keep going with a silent react-back, stop emoji = pause and ask), and the agent reacts back via its `<<react:EMOJI>>` marker. Multiple generated files batch into one gallery-style message. Interactive components: select menus (`discord_send` with `action=select_menu`), modal forms (`action=modal`), component TTL with auto-cleanup, role-based access control, forum thread creation. Live reply tracing with auto-threading (tool turns stream into a linked thread; tables render as native Discord markdown tables) and double-post dedup on tool turns (#1603, #1608). Full proactive control via `discord_send` (17 actions): `send`, `reply`, `react`, `unreact`, `edit`, `delete`, `pin`, `unpin`, `create_thread`, `send_embed`, `get_messages`, `list_channels`, `add_role`, `remove_role`, `kick`, `ban`, `send_file`. Generated images sent as native Discord file attachments |
+| **Discord** | Full Discord bot — text + image + voice. Owner DMs share TUI session, guild channels get isolated per-channel sessions. Allowed user IDs, allowed channel IDs, `respond_to` filter. Tool calls render as ONE grouped message per turn, collapsed to a summary with an Expand/Collapse button, edited in place as tools run — Slack parity. Intermediate narration folds into the same bubble as dim subtext lines (`trace_narration`, default true). Reacting to a bot message becomes an agent turn (approval emoji = keep going with a silent react-back, stop emoji = pause and ask), and the agent reacts back via its `<<react:EMOJI>>` marker. Multiple generated files batch into one gallery-style message. Slash commands are native: `commands.toml` is projected onto Discord's command list per guild with argument hints (#1850, needs the `applications.commands` invite scope). Interactive components: select menus (`discord_send` with `action=select_menu`), modal forms (`action=modal`), component TTL with auto-cleanup, role-based access control, forum thread creation. Live reply tracing with auto-threading (tool turns stream into a linked thread; tables render as native Discord markdown tables) and double-post dedup on tool turns (#1603, #1608). Full proactive control via `discord_send` (17 actions): `send`, `reply`, `react`, `unreact`, `edit`, `delete`, `pin`, `unpin`, `create_thread`, `send_embed`, `get_messages`, `list_channels`, `add_role`, `remove_role`, `kick`, `ban`, `send_file`. Generated images sent as native Discord file attachments |
 | **Slack** | Full Slack bot via Socket Mode — owner DMs share TUI session, channels get isolated per-channel sessions. Text + image + voice (STT transcribes incoming audio attachments; TTS replies upload an OGG/Opus audio file via Slack's external upload flow — renders inline with waveform UI — when input was audio and `tts_enabled=true`). Allowed user IDs, allowed channel IDs, `respond_to` filter. Tool calls render as ONE grouped message per turn, collapsed to a summary with an Expand/Collapse button (Block Kit), edited in place as tools run — Telegram parity. Reacting to a bot message becomes an agent turn (approval emoji = keep going with a silent react-back, stop emoji = pause and ask), and the agent reacts back via its `<<react:EMOJI>>` marker. All file uploads (generated docs/images, TTS audio) use Slack's supported external upload flow (`files.getUploadURLExternal` + `completeUploadExternal`) with real MIME types. Full proactive control via `slack_send` (17 actions): `send`, `reply`, `react`, `unreact`, `edit`, `delete`, `pin`, `unpin`, `get_messages`, `get_channel`, `list_channels`, `get_user`, `list_members`, `kick_user`, `set_topic`, `send_blocks`, `send_file`. Generated images sent as native Slack file uploads. Bot token + app token from `api.slack.com/apps` (Socket Mode required). **Required Bot Token Scopes:** `chat:write`, `channels:history`, `groups:history`, `im:history`, `mpim:history`, `users:read`, `files:read`, `files:write`, `reactions:write`, `app_mentions:read` |
 | **Trello** | Tool-only by default — the AI acts on Trello only when explicitly asked via `trello_send`. Opt-in polling via `poll_interval_secs` in config; when enabled, only `@bot_username` mentions from allowed users trigger a response. Full card management via `trello_send` (22 actions): `add_comment`, `create_card`, `move_card`, `find_cards`, `list_boards`, `get_card`, `get_card_comments`, `update_card`, `archive_card`, `add_member_to_card`, `remove_member_from_card`, `add_label_to_card`, `remove_label_from_card`, `add_checklist`, `add_checklist_item`, `complete_checklist_item`, `list_lists`, `get_board_members`, `search`, `get_notifications`, `mark_notifications_read`, `add_attachment`. API Key + Token from `trello.com/power-ups/admin`, board IDs and member-ID allowlist configurable |
 
@@ -569,7 +569,7 @@ This solves the core UX problem in mention-only groups: previously, tagging the 
 | **Expand / Collapse Blocks** | Click a tool-call group or a **Thinking** block, or press `Ctrl+O`, to expand it. Reasoning cycles through three states so a long thought never floods the view: **collapsed → capped** (first ~10 lines + a "… N more (click / ctrl+o for full)" hint) **→ full → collapsed**. Tool-call groups toggle expand/collapse. A plain **click** toggles the block under the cursor; a **click-and-drag** selects text to copy (even over a collapsible block) instead of expanding it |
 | **Multi-line Input** | Alt+Enter / Shift+Enter for newlines; Enter to send |
 | **Abort Processing** | Escape×2 within 3 seconds to cancel any in-progress request |
-| **Clipboard Image Paste** | Copy an image from a browser, screenshot tool, or any app and paste it directly into the input. Raw image bytes are read from the OS clipboard (macOS: osascript, Linux: wl-paste/xclip), written to a temp file, and attached through the existing image pipeline. No need to save to disk first |
+| **Clipboard Image Paste** | Copy an image from a browser, screenshot tool, or any app and paste it directly into the input. Raw image bytes are read from the OS clipboard (macOS: osascript, Linux: wl-paste/xclip), written to a temp file, and attached through the existing image pipeline. No need to save to disk first. `Ctrl+V` in the chat input reads the clipboard directly and works in every terminal, including a screenshot copied to the clipboard (image data, no text). `Cmd+V` works where the terminal pastes or passes the key through; iTerm2 and Terminal.app swallow `Cmd+V` for an image-only clipboard, so use `Ctrl+V` there. While the chat input is focused on macOS, an unpasted screenshot in the clipboard also shows a vanishing `Image in clipboard - Ctrl+V to paste` hint inside the input area, like the other notices, until you paste or the clipboard changes |
 | **File Drag & Drop** | Drag a file onto the TUI and the terminal inserts its path; OpenCrabs unescapes it and takes it from there. Images attach as vision content, text files (`.txt`, `.md`, `.json`, source code) are read from disk and inlined into the message, and PDFs surface a hint pointing the agent at `pdf_to_images` + `analyze_image`. Over SSH the dropped path names a file on the wrong machine; see [Dropping files into a TUI running on a VPS](#dropping-files-into-a-tui-running-on-a-vps) |
 | **Bang Operator (`!cmd`)** | Run any shell command directly from the input — no LLM round-trip. Output is shown as a system message in the working directory context. Full-screen editors (`!vi`, `!vim`, `!nano`, `!emacs`) are the exception on Unix terminals: the TUI hands the real terminal to the editor, so you edit in place and return to the chat when it exits (a mid-edit Ctrl+Z ends the editor instead of hanging the TUI); on Windows, editors are pipe-captured like any other command |
 | **Auto-Update** | Checks GitHub for new releases on startup and once every 24h in the background. When a new version is found it silently installs and hot-restarts. Disable via `[agent] auto_update = false` in `config.toml` to be prompted instead |
@@ -646,6 +646,8 @@ OpenCrabs writes structured debug logs to files when debug logging is active. Tw
 **Precedence:** the two are ORed. If `--debug` is set, debug logging stays on regardless of the config value. A config edit setting `debug_logs = false` cannot silence an operator who launched with the flag. If only the config toggle is set, flipping it back to `false` turns logging off immediately, no restart needed.
 
 **Where logs land:** `~/.opencrabs/logs/` by default. Override the directory with the `DEBUG_LOGS_LOCATION` env var.
+
+**Panic records:** the TUI installs a panic hook that appends every panic it sees to `panic.log`, in that same directory (`DEBUG_LOGS_LOCATION` moves it too), with the source location, the first `opencrabs::` backtrace frame and the captured stack, and mirrors a one-line `PANIC <site> [frame] :: <message>` record into the daily log. That file is written directly rather than through the debug gate, so it exists even with `debug_logs = false`, and the age-based cleanup leaves it alone because `cleanup_old_logs` only prunes names matching `opencrabs.YYYY-MM-DD`. A TUI that died with nothing in the daily log has its record here.
 
 **Hot-reload:** edit `debug_logs` in `config.toml` (or ask the agent to flip it via `config_manager`) and the change takes effect on the next event. No restart required.
 
@@ -2734,6 +2736,15 @@ plan_worker_allow_write = false  # default false: isolated plan workers run READ
 subagent_session_ttl_days = 7    # days a spawned sub-agent's session is kept before pruning. Nothing revisits
                                  # them, so they accumulate with their messages, tool rows and plan files. 0 keeps forever
 
+# ── Cross-session notification (kill switch) ─────────────────────────────────
+session_notify_enabled = false   # default false (#1802): the session_notify tool, the A2A
+                                 # session/notify method and `opencrabs session notify` all refuse.
+                                 # Cross-session notification is an explicit operator opt-in for
+                                 # machine-tooling fan-out only; an unprompted channel into another
+                                 # session's context breaks session isolation. User-directed
+                                 # "notify that session" belongs to the channel send tools
+                                 # (telegram_send / slack_send) with the user's request.
+
 # ── Runaway-reasoning guard ───────────────────────────────────────────────────
 thinking_loop_timeout_secs = 600 # how long a model may stream with zero tool calls. Enforced at this
                                  # default even when absent from this file. A stream still delivering
@@ -3517,6 +3528,7 @@ OpenCrabs includes 40+ built-in tools. The AI can use these during conversation:
 | `load_brain_file` | Load any brain context file from `~/.opencrabs/` on demand (USER.md, MEMORY.md, AGENTS.md, TOOLS.md, SECURITY.md, etc.) |
 | `write_opencrabs_file` | Write or edit any file under `~/.opencrabs/` (brain files, memory logs, commands.toml). Enforces append-only + dedup-aware shrink + `.bak` snapshots on the 9 protected brain files (SOUL/USER/AGENTS/TOOLS/CODE/SECURITY/MEMORY/BOOT) |
 | `evolve` | Download latest release binary from GitHub and hot-restart (no Rust toolchain needed). Also runs automatically on startup and every 24h when `[agent] auto_update = true` (default), and via the `/evolve` slash command — both paths invoke the tool directly without the LLM, so they can't be dropped or refused by a provider |
+| `evolve` on a Homebrew install | The upgrade is delegated to `brew upgrade opencrabs` instead of swapping the binary, so brew's manifest and the Cellar agree with what is on disk. Each `brew` child runs under a 600s budget and is killed when it overruns, and the killed message names the check to run (`brew list --versions opencrabs`), because a killed upgrade may have written the new keg without repointing the symlink. The version reported afterwards is read back from brew, never borrowed from the GitHub release name fetched before brew ran; if brew reports nothing, none is claimed. On a systemd host the same delayed-restart timer the download path arms is armed as a backstop, so a restart that dies still comes back (#1779) |
 | `rebuild` | Build from source (`cargo build --release`) and hot-restart |
 | `suggest_options` | Surface up to 8 short options for the user to pick as their next input. Channel-agnostic: native buttons where the channel has them, numbered text where it does not. Options carry styles (`primary`/`danger`/default); a single option renders as one tap-to-confirm button; the first word of each option must be distinctive or the set is refused (#1611) |
 | `goal_manage` | Set and manage an autonomous goal for the session, so the agent can drive itself toward it across turns |
@@ -3775,12 +3787,13 @@ Any tool on your `$PATH` works. If it runs in your terminal, OpenCrabs can use i
 
 | Shortcut | Action |
 |----------|--------|
-| `Ctrl+C` | First press clears input, second press (within 3s) quits |
+| `Ctrl+C` | First press: snaps to bottom if scrolled up, else clears input. Second press (within 3s) quits |
 | `Ctrl+N` | New session |
 | `Ctrl+L` | List/switch sessions |
 | `Ctrl+K` | Clear current session |
 | `Page Up/Down` | Scroll chat history |
 | `Mouse Scroll` | Scroll chat history |
+| `Mouse click` | On a URL or an existing file path: open it in the default app (browser, Finder/Explorer, `xdg-open`). Elsewhere: expand/collapse blocks and select messages; click-drag still selects text to copy |
 | `F12` | Toggle mouse capture: off gives native terminal drag-select and copy (browser-style), on restores in-app click, right-click, and scroll. Works even inside dialogs |
 | `Escape` | Clear input / close overlay |
 
@@ -4025,11 +4038,11 @@ Memory search combines two strategies via **Reciprocal Rank Fusion (RRF)** for b
 
 | Mode | How | RAM | Setup |
 |---|---|---|---|
-| **Local** (default) | embeddinggemma-300M GGUF (~300 MB, auto-downloaded) | ~2.9 GB | Zero config, works offline |
+| **Local** (opt-in) | embeddinggemma-300M GGUF (~300 MB, auto-downloaded) | ~2.9 GB | Set `vector_enabled = true` in `[memory]`; works offline |
 | **API** | Any `/v1/embeddings` endpoint (OpenAI, Ollama, Jina, etc.) | ~0 MB | Set `url`, `model`, `api_key` in `[memory.embedding]` |
-| **FTS5-only** | No embeddings, keyword search only | ~0 MB | Set `vector_enabled = false` in `[memory]` |
+| **FTS5-only** (default) | No embeddings, keyword search only | ~0 MB | Nothing to set; `vector_enabled` defaults to `false` (#1798) |
 
-Auto-detects VPS environments and disables local embeddings automatically.
+Vector embeddings are **off by default** (#1798): the GGUF engine crashes on VPS and Windows hosts, so local embeddings are an explicit opt-in that runs well on Apple Silicon and most Linux desktops. Keyword search always works. Startup detection additionally writes an explicit `vector_enabled = false` on VPS/cloud.
 
 ```
 ┌─────────────────────────────────────┐
@@ -4068,7 +4081,7 @@ Auto-detects VPS environments and disables local embeddings automatically.
 | **Privacy** | 100% local | Data sent to API endpoint | 100% local |
 | **Latency** | ~2ms (in-process) | 100-500ms (HTTP) | N/A |
 | **Offline** | Works without internet | Requires internet | Works offline |
-| **Setup** | Automatic, no API key | Set `[memory.embedding]` config | Set `vector_enabled = false` |
+| **Setup** | Set `vector_enabled = true`, no API key | Set `[memory.embedding]` config | Default, no setup |
 | **Quality** | Excellent for code/session recall | Depends on model | Keyword-only |
 | **RAM** | ~2.9 GB | ~0 MB | ~0 MB |
 | **VPS-friendly** | No (needs RAM) | Yes | Yes |
@@ -4769,6 +4782,40 @@ flowchart LR
     end
 ```
 
+### Durability: check the image, snapshot it, then migrate
+
+The SQLite image is the one piece of state a bad migration can damage and a
+restart cannot heal, so startup protects it twice before any DDL runs (#1779):
+
+1. **Integrity preflight.** `PRAGMA integrity_check` runs against the image
+   *before* any migration, on its own read-write connection. It cannot go
+   through the pool: `post_create` applies `PRAGMA journal_mode = WAL`, which is
+   itself a write, so on a torn image the pool never produces a connection and a
+   check that needed one would be unreachable in exactly the incident it exists
+   to catch. A damaged image refuses, and nothing is written.
+2. **Pre-migration snapshot.** A healthy image is copied with `VACUUM INTO` to
+   `~/.opencrabs/backups/opencrabs.db.pre-migration-<user_version>-<stamp>`, plus
+   a stable `opencrabs.db.pre-migration-latest` alias. `VACUUM INTO` rather than
+   a file copy because it is the only form safe against a live writer: a plain
+   copy of a WAL database can catch a half-written page. The 7 most recent dated
+   copies are kept and older ones pruned on each boot. A fresh or in-memory image
+   skips silently.
+
+Migrations run only when both pass. If the snapshot cannot be taken on a
+non-empty image, the process refuses to migrate rather than issuing `ALTER TABLE`
+against an already-torn page 1, which is how one incident lost every cron row
+while the file being overwritten was the only copy of itself. The refusal names
+the stage, the cause, the snapshot directory, and what is untouched (brain files,
+config and keys are never part of the image).
+
+Corruption is reported wherever an operator can read it, not only on a screen:
+the TUI banner keeps its consuming read, while the daemon startup log and
+`opencrabs doctor` take a non-consuming peek, so a headless host (systemd,
+Docker, a Pi on an SD card) is not blind. Doctor prints the newest snapshot path
+under `Database snapshot:`, or `Database integrity:` when the check failed. The
+restore is a copy of that file over the database path; see
+[Troubleshooting](#database-integrity-check-failed--migrations-refuse-to-run).
+
 ## 9. Channel Integration
 
 ```mermaid
@@ -5086,7 +5133,7 @@ The default release binary requires AVX2 (Haswell 2013+). If you have an older C
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
-Pre-built `*-compat` binaries are also available on the [releases page](https://github.com/adolfousier/opencrabs/releases) for AVX-only CPUs. If your CPU lacks AVX entirely (pre-2011), or you're on a low-RAM VPS, set `vector_enabled = false` in `[memory]` to disable vector embeddings and use FTS5-only keyword search.
+Pre-built `*-compat` binaries are also available on the [releases page](https://github.com/adolfousier/opencrabs/releases) for AVX-only CPUs. Vector embeddings are off by default (#1798), so you get FTS5-only keyword search out of the box; set `vector_enabled = true` in `[memory]` only on machines that can run the GGUF engine.
 
 ### macOS
 
@@ -5257,6 +5304,256 @@ Add-MpPreference -ExclusionPath "C:\path\to\opencrabs.exe"
 ```
 
 If SmartScreen blocks the first run, click **More info** → **Run anyway**.
+
+### Database Integrity Check Failed / Migrations Refuse to Run
+
+After a power loss, or after a restart that never handed over (the rpi5 incident was
+an `/evolve` that died mid-swap, on NVMe, not an SD card), the SQLite image can lose
+page 1, and OpenCrabs refuses to start rather than migrate over damage:
+
+```
+Refusing to run database migrations: the pre-migration integrity check failed
+(integrity_check reported "..." ). An earlier snapshot is still available at
+~/.opencrabs/backups/opencrabs.db.pre-migration-23-20260928-041500. Nothing has
+been written to the database. Restore it by copying a snapshot over the database
+file, or repair the header, then start again. Your brain files and config are
+untouched.
+```
+
+**Fix, when a snapshot exists:**
+
+1. Find the newest snapshot: `opencrabs doctor` prints it under
+   `📸 Database snapshot:` (or list `~/.opencrabs/backups/`).
+2. Stop the daemon, then copy it over the database file:
+   `cp ~/.opencrabs/backups/opencrabs.db.pre-migration-latest ~/.opencrabs/opencrabs.db`
+3. Start again. Sessions and messages written after that snapshot are lost. Brain
+   files, `config.toml`, `keys.toml` and the skills directory were never part of
+   the image and are untouched by any of this.
+
+Rotation keeps 7 dated copies plus that stable `-latest` alias, so the restore point is
+at most one migration behind you.
+
+**Fix, when no snapshot exists** (the image predates this protection, or every boot
+since it has failed before the snapshot could land): salvage the image. The procedure
+below recovered a 70 MB database holding 36,408 rows with zero loss on 2026-09-28
+(#1779), and every command in it was run before it was written down.
+
+#### Step 1, freeze the file, then work only on copies
+
+Stop the daemon first. Every launch re-runs the `post_create` PRAGMA batch, which is a
+write, so a daemon that keeps restarting keeps damaging the image.
+
+```bash
+mkdir -p ~/.opencrabs/rescue/orig
+cp -a ~/.opencrabs/opencrabs.db ~/.opencrabs/rescue/orig/
+chmod -R a-w ~/.opencrabs/rescue/orig/
+cp ~/.opencrabs/rescue/orig/opencrabs.db /tmp/work.db
+```
+
+Leave `opencrabs.db-wal` and `opencrabs.db-shm` behind: a 0-byte `-wal` holds nothing,
+and a `-shm` from another WAL generation is how a clean recovery acquires a brand new
+mystery. `/tmp/work.db` is deliberately writable, because SQLite refuses
+`PRAGMA journal_mode = WAL` against a read-only file and that error looks like deeper
+damage than it is.
+
+#### Step 2, name the damage
+
+```bash
+sqlite3 /tmp/work.db "PRAGMA integrity_check;"
+dd if=/tmp/work.db bs=4096 count=1 2>/dev/null | strings -n 6 | grep 'CREATE TABLE'
+```
+
+| Output | Damage | Outlook |
+|---|---|---|
+| `Parse error ...: database disk image is malformed (11)` | page 1, the schema page | every row is reachable, once a tool can walk the b-trees by page number |
+| `ok`, or rows naming specific pages | data pages | the unaffected pages, plus whatever salvage reaches |
+
+A `Parse error` or "in prepare" on a plain `PRAGMA` means SQLite died loading the
+schema, before your statement ever ran. Schema lives on page 1, so that is page-1
+damage, and it is the case the rest of this entry is written for. The `strings` line is
+the good-news check: `CREATE TABLE` text in plaintext means the schema survived and
+only its b-tree header is gone.
+
+#### Step 3, the two dead ends, so you do not lose a night to them
+
+```bash
+sqlite3 /tmp/work.db "PRAGMA writable_schema=ON; select count(*) from sqlite_master;"
+# Error in 2nd command line argument: database disk image is malformed
+
+sqlite3 /tmp/work.db .dump > /tmp/work.sql
+# 243 bytes, 0 INSERT lines, and "-- CORRUPTION ERROR" markers
+```
+
+Neither reads `sqlite_master` when page 1's b-tree header is dead. `.dump` is right for
+a consistent image with a broken index and wrong here. Header fields are still
+readable, because they live in the first 100 bytes rather than in the schema:
+
+```bash
+python3 -c "
+import struct
+d = open('/tmp/work.db', 'rb').read(100)
+print('page_size   ', struct.unpack('>H', d[16:18])[0])
+print('user_version', struct.unpack('>I', d[60:64])[0])
+print('application ', struct.unpack('>I', d[68:72])[0])
+"
+```
+
+That is how you learn your `user_version` with no working schema at all, which is what
+tells you in Step 6 whether the rebuild landed at the right one.
+
+#### Step 4, build a sqlite3 new enough to recover
+
+A distro CLI is probably too old to help: Raspbian's 3.40.1 printed 173 bytes and zero
+rows against this exact damage, and 3.53.4 returned every row. There is no prebuilt
+Linux CLI for aarch64 (sqlite.org ships `sqlite-tools-linux-x64` only), so build it
+from the amalgamation. Under a minute on a Pi 5, no install:
+
+```bash
+sudo apt install -y build-essential   # if gcc is missing
+cd /tmp && curl -sSLO https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip
+unzip -oq sqlite-amalgamation-3530400.zip
+cd sqlite-amalgamation-3530400
+gcc -O1 -DSQLITE_ENABLE_DBPAGE_VTAB -o /tmp/sql353 shell.c sqlite3.c -lpthread -ldl
+/tmp/sql353 --version
+```
+
+`-DSQLITE_ENABLE_DBPAGE_VTAB` is not optional, and it is the easiest thing here to get
+wrong. Without it the build succeeds, prints a normal version string, and then answers
+`.recover` with `Error: unknown command or invalid arguments: "recover"`, which reads
+like a corrupt download rather than a missing compile-time define.
+
+#### Step 5, recover to a file, never to a pipe
+
+```bash
+/tmp/sql353 /tmp/work.db ".recover" > /tmp/rec.sql 2> /tmp/rec.err
+```
+
+Piping `.recover` into `sqlite3` discards exactly the partial SQL it exists to emit.
+Then take a census, because a large file proves nothing on its own:
+
+```bash
+wc -c /tmp/rec.sql                                    # bytes, not proof
+grep -c "^INSERT OR IGNORE INTO '" /tmp/rec.sql        # rows in named tables
+grep -oE "^INSERT OR IGNORE INTO '[^']+'" /tmp/rec.sql |
+  sed "s/.*'\(.*\)'/\1/" | sort | uniq -c | sort -rn   # per-table census
+grep -ci lost_and_found /tmp/rec.sql                   # salvage-form lines
+grep -nE "^PRAGMA user_version" /tmp/rec.sql           # version preserved?
+head -5 /tmp/rec.err
+```
+
+The census names which of two recoveries you are holding:
+
+| Census | What happened | Next |
+|---|---|---|
+| per-table counts you recognise, `lost_and_found` 0 | schema was readable; every row reached its own table | Step 6, then you are done |
+| `^INSERT OR IGNORE` 0 and `lost_and_found` above 0 | page 1's schema is gone; rows are recovered but unnamed | Step 7 first |
+
+Sum the census against what you expect, and read the pairs that must travel together
+(`cron_jobs` beside `cron_job_runs`, `sessions` beside `messages`). A census that
+closes on the arithmetic is the difference between a full recovery and a partial one.
+
+#### Step 6, rebuild and verify
+
+```bash
+rm -f /tmp/rebuilt.db
+/tmp/sql353 /tmp/rebuilt.db < /tmp/rec.sql
+/tmp/sql353 /tmp/rebuilt.db "PRAGMA integrity_check; PRAGMA user_version;"
+/tmp/sql353 /tmp/rebuilt.db "select count(*) from sqlite_master where type='table';"
+```
+
+Use the new binary for the load too; the dump's preamble carries dot-commands an old
+shell may reject. The `defensive off` line it echoes is the CLI printing the dump's own
+`.dbconfig` command, not an error.
+
+Expect `ok`, the `user_version` you read in Step 3, and a table count matching a healthy
+database at that version. `.recover` emits `PRAGMA user_version`, so migrations will
+not re-run over columns that already exist. If the load throws, do not retry into the
+same file: rename it and start over, so a half-loaded image cannot masquerade as a
+clean one.
+
+#### Step 7, only if the rows came back as `lost_and_found`
+
+That table is `(rootpgno, pgno, nfield, id, c0, c1, ...)`: the b-tree each record came
+from, how many fields it has, then the values in column order. Nothing is lost, nothing
+is named. Rebuild the real schema from the migration files in `src/migrations/` applied
+in filename order, then move each root page's rows into its table.
+
+Filter by `nfield` as well as `rootpgno`, and never `select *` from the salvage table. A
+`TEXT PRIMARY KEY` table emits its autoindex as a root page too, so a 21-column
+`cron_jobs` holding two jobs shows up as four salvage rows across two root pages, and a
+naive remap both double-counts the table and inserts index entries as data:
+
+```
+rootpgno  nfield  rows
+2         21      2      <- the cron_jobs table
+3         2       2      <- sqlite_autoindex_cron_jobs_1, ignore it
+```
+
+```bash
+sqlite3 /tmp/fresh.db < /path/to/cron_migrations.sql
+/tmp/sql353 /tmp/fresh.db <<'SQL'
+attach '/tmp/rebuilt.db' as s;
+insert into cron_jobs(id, name, cron_expr, timezone, prompt, provider, model, thinking,
+                      auto_approve, deliver_to, enabled, last_run_at, next_run_at,
+                      created_at, updated_at, deliver_api_key, profile_name,
+                      trigger_cmd, trigger_on, set_goal, goal_template)
+select c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16,
+       c17, c18, c19, c20
+  from s.lost_and_found where rootpgno = 2;
+detach s;
+SQL
+```
+
+Check the column order against the migration before you select, then verify the result
+row by row: `select id, name, cron_expr, length(prompt) from cron_jobs`. A prompt over
+8 KB lives on overflow pages, so `length(prompt)` returning the full value is the check
+that those chains came back. `typeof()` on the same column checks an older, unrelated
+failure mode (migration `20260517000001_cron_jobs_text_recast.sql`): a `blob` there is
+a text-recast bug, not corruption, and `UPDATE cron_jobs SET prompt =
+CAST(prompt AS TEXT) WHERE typeof(prompt) = 'blob';` clears it.
+
+#### Step 8, swap it in, keeping every way back
+
+```bash
+mkdir -p ~/.opencrabs/rescue/stale
+mv ~/.opencrabs/opencrabs.db      ~/.opencrabs/rescue/stale/opencrabs.db.broken-$(date +%Y%m%d)
+mv ~/.opencrabs/opencrabs.db-wal  ~/.opencrabs/rescue/stale/ 2>/dev/null
+mv ~/.opencrabs/opencrabs.db-shm  ~/.opencrabs/rescue/stale/ 2>/dev/null
+cp /tmp/rebuilt.db ~/.opencrabs/opencrabs.db
+```
+
+Nothing here deletes anything. `rescue/orig/` stays read-only, `rescue/stale/` holds
+the broken image, and `/tmp/rec.sql` is a plain-SQL reconstruction of the whole
+database, so there are three ways back from any single step. The stale `-wal`/`-shm`
+moves with the file rather than staying beside it.
+
+Then boot once and read the receipt, because migrations pending on the recovered file
+apply on that first boot and the numbers should move up on purpose:
+
+```bash
+sqlite3 ~/.opencrabs/opencrabs.db "PRAGMA integrity_check; PRAGMA user_version;"
+sqlite3 ~/.opencrabs/opencrabs.db "select count(*) from sqlite_master where type='table';"
+```
+
+If `user_version` rose and the table count grew by exactly the tables those pending
+migrations create, the file is current. If boot instead reports the file as coming from
+a *future* version, stop: your installed binary predates the recovered schema and
+continuing is a downgrade.
+
+Prove the scheduler can read the rows, not merely that SQL can: `opencrabs cron list`,
+or the `cron_manage` tool's `list` action, and check the jobs return with sane next-run
+times. An empty list over a database that `select`s fine is the storage-class bug
+above, not corruption.
+
+Keep `rescue/orig/` and the dump until the jobs, sessions and messages have behaved for
+a day. The dump is also your portable copy: plain SQL outlives whatever the image
+format becomes next.
+
+The refusal is deliberate. The old behaviour was to run the migration against the
+damaged page anyway and die on the migration error, which destroyed the only copy
+of the data while reporting a bare "Failed to run database migrations" (#1779).
+The same check now also runs *after* migrations, and a failure there is logged by
+the daemon and reported by `doctor` as well as shown on the TUI banner.
 
 ---
 

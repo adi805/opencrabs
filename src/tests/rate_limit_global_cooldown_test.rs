@@ -39,6 +39,7 @@ fn test_clamp_inline_wait() {
 #[tokio::test]
 async fn test_global_429_lock_cooldown() {
     let _guard = test_support::registry_guard().await;
+    let _cooldown = crate::tests::telegram_cooldown_lock::guard().await;
     test_support::reset(0);
     reset_global_cooldown();
 
@@ -70,6 +71,7 @@ async fn test_global_429_lock_cooldown() {
 #[tokio::test]
 async fn test_global_429_lock_extension_monotonic() {
     let _guard = test_support::registry_guard().await;
+    let _cooldown = crate::tests::telegram_cooldown_lock::guard().await;
     test_support::reset(0);
     reset_global_cooldown();
 

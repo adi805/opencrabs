@@ -234,3 +234,195 @@ jobs:
           path: target/input-dump/app-*.png
           if-no-files-found: error
           retention-days: 30
+
+  # The render dump proves what the app writes into the terminal buffer. It does
+  # not prove what a user sees in a window. A probe run (PR#14) settled the open
+  # question with receipts: a hosted Windows runner really does have a desktop
+  # session (SessionId 2, UserInteractive True, 1024x768 virtual screen), and a
+  # console window it launched came back from the capture with legible text
+  # ("PROBE_MARKER_12345", "Waiting for 51 seconds"). So photographs are
+  # possible here without anybody's PC, and this job takes them: it runs the exe
+  # we just built in a visible console sized to the app's own request, drives it
+  # with real keystrokes, and shoots the screen after each step.
+  #
+  # Deliberately fail-soft. Whatever the app happens to show is the finding; an
+  # empty capture is still a frame to read, so the job must not go red before the
+  # images are uploaded.
+  desktop-capture:
+    name: Photograph the app on a real Windows desktop
+    needs: windows-exe
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch the exe this run built
+        uses: actions/download-artifact@v4
+        with:
+          name: opencrabs-windows-x64
+          path: app
+
+      - name: Launch it in a console window and shoot every step
+        # Not continue-on-error: a frame showing the wrong screen is a finding
+        # to read, but zero frames means the harness failed, and the script
+        # exits non-zero for exactly that case so a silent empty artifact
+        # cannot pass as a successful capture.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          $shots = Join-Path $PWD 'shots'
+          New-Item -ItemType Directory -Force -Path $shots | Out-Null
+          $exe = (Resolve-Path (Join-Path $PWD 'app\opencrabs.exe')).Path
+          "exe: $exe"
+
+          # The window is found by title, so the capture cannot silently shoot
+          # some other process's window.
+          $sig = @"
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+          public class U {
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+            [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+          }
+          "@
+          Add-Type -TypeDefinition $sig -Language CSharp
+
+          function FindTarget {
+            Get-Process | Where-Object { $_.MainWindowTitle -like '*OCAP*' } |
+              Select-Object -First 1
+          }
+
+          # SetForegroundWindow is allowed to fail and says so only through its
+          # return value, which the old code threw away with [void]. A keystroke
+          # or a whole-screen copy aimed at the wrong window still looks like
+          # success, so ask, then VERIFY the foreground handle is the target
+          # before anything is typed or shot.
+          function Focus([System.Diagnostics.Process]$t) {
+            for ($try = 1; $try -le 5; $try++) {
+              if ([U]::GetForegroundWindow() -eq $t.MainWindowHandle) { return $true }
+              [void][U]::SetForegroundWindow($t.MainWindowHandle)
+              Start-Sleep -Milliseconds 400
+            }
+            # Write-Host, not the pipeline: a bare string would join $false in
+            # the return value, and `-not @("msg", $false)` is $false, so the
+            # caller's guard would never fire on a real focus failure.
+            Write-Host "  focus FAILED: wanted $($t.MainWindowHandle), foreground is $([U]::GetForegroundWindow())"
+            return $false
+          }
+
+          function Shoot([string]$tag) {
+            $t = FindTarget
+            if ($null -eq $t) { "  $tag : no OCAP window found, skipped"; return }
+            if (-not (Focus $t)) { "  $tag : skipped, the target never held the foreground"; return }
+            Start-Sleep -Milliseconds 500
+            $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+            try {
+              $bmp = New-Object System.Drawing.Bitmap($vs.Width, $vs.Height)
+              $g = [System.Drawing.Graphics]::FromImage($bmp)
+              $g.CopyFromScreen($vs.X, $vs.Y, 0, 0, $bmp.Size)
+              $file = Join-Path $shots "$tag.png"
+              $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
+              $g.Dispose(); $bmp.Dispose()
+              "  $tag : $((Get-Item $file).Length) bytes (fg=$([U]::GetForegroundWindow()), title='$($t.MainWindowTitle)')"
+            } catch { "  $tag : capture FAILED $($_.Exception.Message)" }
+          }
+
+          function Send([string]$keys) {
+            $t = FindTarget
+            if ($null -eq $t) { "  no window, key dropped: $keys"; return }
+            if (-not (Focus $t)) { "  no foreground, key dropped: $keys"; return }
+            Start-Sleep -Milliseconds 300
+            try { [System.Windows.Forms.SendKeys]::SendWait($keys) }
+            catch { "  send FAILED $($_.Exception.Message)" }
+            Start-Sleep -Milliseconds 900
+          }
+
+          # mode con sizes the buffer BEFORE the app starts, which is the one
+          # thing Wine could not do and the reason its frames were garbage. The
+          # buffer is measured against the screen the runner actually has: a
+          # fixed 150x45 is about 1200px wide at conhost's 8x16 raster font, so
+          # on a 1024px screen the window ran off the right edge and every
+          # whole-screen capture cropped the app. Leave a little room for the
+          # window chrome.
+          $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          $cols = [Math]::Max(80, [Math]::Min(150, [int]($vs.Width / 8) - 2))
+          $lines = [Math]::Max(25, [Math]::Min(50, [int]($vs.Height / 16) - 3))
+          "console buffer: ${cols}x${lines} on a $($vs.Width)x$($vs.Height) screen"
+
+          function Start-App {
+            $proc = Start-Process cmd.exe -ArgumentList '/K', "title OCAP && mode con cols=$cols lines=$lines && `"$exe`"" -PassThru
+            Start-Sleep -Seconds 9
+            # Write-Host: anything on the pipeline would join the returned
+            # process object and make $p an array.
+            Write-Host "started pid=$($proc.Id)"
+            return $proc
+          }
+
+          function Stop-App([System.Diagnostics.Process]$proc) {
+            try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop } catch { Write-Host "stop: $($_.Exception.Message)" }
+            Get-Process opencrabs -ErrorAction SilentlyContinue | ForEach-Object {
+              try { Stop-Process -Id $_.Id -Force } catch { Write-Host "child stop failed" }
+            }
+            Start-Sleep -Seconds 3
+          }
+
+          # Phase 1: a fresh install. No onboarding record exists yet, so the
+          # wizard runs; Enter walks it and every press is a frame.
+          $p = Start-App
+          Shoot "00-boot"
+          for ($i = 1; $i -le 8; $i++) {
+            $tag = "{0:d2}-wizard-{1:d}" -f (1 + $i), $i
+            Send "{ENTER}"
+            Shoot $tag
+          }
+          Stop-App $p
+
+          # Phase 2: the chat menus. The wizard cannot be driven into the chat
+          # by keystrokes alone: its provider step wants an API key this job has
+          # no reason to hold, so eight Enters stop there and the later slashes
+          # land in the path field, leaving the menu frames showing a screen
+          # that never reaches the menus. Whether onboarding finished is a
+          # recorded fact, not an inference, so record it: the runner's home is
+          # disposable, and the app then opens straight into chat, where ESC
+          # plus a slash command renders each menu.
+          $ocHome = Join-Path $env:USERPROFILE '.opencrabs'
+          New-Item -ItemType Directory -Force -Path $ocHome | Out-Null
+          [System.IO.File]::WriteAllText(
+            (Join-Path $ocHome 'onboarding.json'),
+            '{"completed":true}',
+            (New-Object System.Text.UTF8Encoding($false)))   # no BOM: serde_json would reject it
+
+          $p = Start-App
+          Shoot "10-chat-boot"
+          $menus = @('help', 'menu', 'status', 'usage', 'sessions', 'profiles',
+                     'providers', 'models', 'health', 'audit')
+          $n = 10
+          foreach ($m in $menus) {
+            $n++
+            Send "{ESC}"
+            Send "/$m{ENTER}"
+            Shoot ("{0:d2}-menu-{1}" -f $n, $m)
+          }
+          Stop-App $p
+
+          $frames = (Get-ChildItem $shots -Filter *.png | Measure-Object).Count
+          "frames: $frames"
+          Get-ChildItem $shots -Filter *.png | ForEach-Object { "  $($_.Name) $($_.Length)" }
+          # A frame that shows the wrong screen is still a finding to read, so
+          # the step stays soft about CONTENT. Zero frames is not a finding: the
+          # harness itself failed, and reporting success there is the false
+          # green this guard exists to stop.
+          if ($frames -eq 0) {
+            "no frame was captured at all: the harness failed, not the app"
+            exit 1
+          }
+
+      - name: Upload the frames
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencrabs-windows-desktop
+          path: shots
+          if-no-files-found: error
+          retention-days: 30

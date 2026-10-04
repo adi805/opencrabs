@@ -68,11 +68,23 @@ pub(crate) fn heal_notify_queue(conn: &rusqlite::Connection) -> rusqlite::Result
     Ok(true)
 }
 
-/// Index of the `pending_requests_thread_id` migration in the current list.
+/// 1-based position of the migration whose SQL contains `marker`.
 ///
-/// Kept next to the guard that uses it so the two cannot drift: if the list is
-/// re-sorted again this constant is what has to move.
-const THREAD_ID_MIGRATION_INDEX: i64 = 41;
+/// The index is load-bearing for `to_latest`. A hand-kept integer goes stale
+/// when the list is re-sorted: this migration already moved once, and the
+/// constant had to be edited by hand to follow it.
+fn migration_index_1based(marker: &str) -> i64 {
+    let pos = super::database::MIGRATION_SQL
+        .iter()
+        .position(|sql| sql.contains(marker))
+        .expect("migration marker missing from MIGRATION_SQL");
+    pos as i64 + 1
+}
+
+/// Index of `pending_requests_thread_id` in the current migration list.
+pub(crate) fn thread_id_migration_index() -> i64 {
+    migration_index_1based("ALTER TABLE pending_requests ADD COLUMN channel_thread_id TEXT;")
+}
 
 /// Stamp past the `channel_thread_id` migration when its column is already
 /// there, so `to_latest` does not re-run an ALTER that has already happened.
@@ -96,19 +108,44 @@ pub(crate) fn skip_applied_thread_id_migration(
     conn: &rusqlite::Connection,
     user_version: i64,
 ) -> rusqlite::Result<bool> {
-    if user_version != THREAD_ID_MIGRATION_INDEX - 1 {
+    let index = thread_id_migration_index();
+    if user_version != index - 1 {
         return Ok(false);
     }
     if !has_column(conn, "pending_requests", "channel_thread_id")? {
         return Ok(false);
     }
-    conn.pragma_update(None, "user_version", THREAD_ID_MIGRATION_INDEX)?;
+    conn.pragma_update(None, "user_version", index)?;
     tracing::warn!(
         "Stamped past the pending_requests.channel_thread_id migration: the column was already \
          present at version {user_version}, so replaying it would have failed startup on a \
          duplicate column (#1401)."
     );
     Ok(true)
+}
+
+/// True when a heal in this module would write on this connection.
+///
+/// The predicates are the same early-outs as the heal functions. A database
+/// whose `user_version` already equals the list length can still need a
+/// pre-write snapshot when one of these is true: the stamp says latest while
+/// a skipped migration's column or table is still absent.
+pub(crate) fn heals_would_write(
+    conn: &rusqlite::Connection,
+    user_version: i64,
+) -> rusqlite::Result<bool> {
+    if user_version == thread_id_migration_index() - 1
+        && has_column(conn, "pending_requests", "channel_thread_id")?
+    {
+        return Ok(true);
+    }
+    if has_table(conn, "pending_requests")? && !has_column(conn, "pending_requests", "origin")? {
+        return Ok(true);
+    }
+    if !has_table(conn, "notify_queue")? {
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Add `pending_requests.origin` when migration 37 was skipped.

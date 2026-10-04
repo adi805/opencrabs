@@ -14,11 +14,14 @@ use crate::utils::sanitize::redact_secrets;
 use crate::utils::truncate_str;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use serenity::builder::{CreateAttachment, CreateMessage};
-use serenity::model::channel::Message;
+use serenity::http::Http;
+use serenity::model::channel::{Message, MessageFlags, MessageSnapshot};
+use serenity::model::id::ChannelId;
 use serenity::prelude::*;
 
 /// Split a message into chunks that fit Discord's 2000 char limit.
@@ -148,6 +151,170 @@ pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
     chunks
 }
 
+/// Flow-line re-render interval (#1843): one edit per tick, deliberately
+/// slower than Telegram's 1500 ms. Discord's current docs do not publish a
+/// fixed per-route edit budget and explicitly forbid hardcoding one
+/// ("rate limits should not be hard coded into your app... parse response
+/// headers... and respond accordingly"); serenity 0.12 ships a built-in
+/// per-bucket ratelimiter (src/http/ratelimiting.rs) that pre-emptively
+/// queues requests and honors retry_after, so safety comes from the
+/// limiter, not from a magic number. 4 s matches the Slack ticker (#1807)
+/// for cross-channel parity.
+const FLOW_TICKER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(4);
+/// Hard stop for orphaned ticks (crashed turn): no immortal tasks.
+const FLOW_TICKER_CAP: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Re-render the turn's flow group on an interval (#1843): the Discord twin
+/// of Slack's `spawn_flow_ticker` and Telegram's `spawn_edit_loop`. Without
+/// it the clock freezes between tool events. Waits for the group message to
+/// be born (first tool call), exits on settle/prune/cap, and re-snapshots
+/// after each edit so the settled line keeps the last word.
+pub(super) fn spawn_flow_ticker(
+    http: Arc<serenity::http::Http>,
+    channel: serenity::model::id::ChannelId,
+    group_mid: Arc<Mutex<Option<serenity::model::id::MessageId>>>,
+    dstate: Arc<super::state::DiscordState>,
+) {
+    tokio::spawn(async move {
+        use serenity::builder::EditMessage;
+        let born = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(FLOW_TICKER_INTERVAL).await;
+            if born.elapsed() > FLOW_TICKER_CAP {
+                break;
+            }
+            let Some(mid) = *group_mid.lock().await else {
+                // Group not born yet: the turn has not reached its first
+                // tool call. Keep waiting.
+                continue;
+            };
+            let Some(group) = dstate.tool_group_snapshot(mid.get()).await else {
+                break; // pruned by retention mid-turn
+            };
+            if group.settled.is_some() {
+                break; // settle already posted the final line
+            }
+            let edit = EditMessage::new()
+                .content(super::tool_group::render_content(&group))
+                .components(super::tool_group::render_components(&group, mid.get()));
+            if let Err(e) = channel.edit_message(&http, mid, edit).await {
+                tracing::warn!("Discord: flow ticker edit failed (mid={}): {e}", mid.get());
+            }
+            // Race guard: settle may have stamped and posted while this
+            // tick's edit was in flight. The settled line must be last,
+            // so if the group settled behind us, re-render its content once.
+            match dstate.tool_group_snapshot(mid.get()).await {
+                Some(re) if re.settled.is_some() => {
+                    let edit = EditMessage::new()
+                        .content(super::tool_group::render_content(&re))
+                        .components(super::tool_group::render_components(&re, mid.get()));
+                    if let Err(e) = channel.edit_message(&http, mid, edit).await {
+                        tracing::warn!("Discord: flow ticker settle fixup failed: {e}");
+                    }
+                    break;
+                }
+                Some(_) => {}  // still live: keep ticking
+                None => break, // pruned mid-tick
+            }
+        }
+    });
+}
+
+/// Fold forwarded payloads into display text (#1891).
+///
+/// Discord message forwards never touch `Message::content` or the top-level
+/// attachments; the payload lives in `message_snapshots`, which this handler
+/// used to ignore entirely, so a pure forward was invisible both to the agent
+/// turn and to the channel history. Images keep the vision-first
+/// `<<IMG:url>>` marker format used for regular attachments; other files carry
+/// their name and CDN URL so the agent can fetch them on demand.
+pub(crate) fn forwarded_snapshot_text(snapshots: &[MessageSnapshot]) -> String {
+    let mut out = String::new();
+    for snap in snapshots {
+        let text = snap.content.trim();
+        if !text.is_empty() {
+            out.push_str(&format!("\n\n[forwarded message]: {text}"));
+        }
+        for att in &snap.attachments {
+            let mime = att.content_type.as_deref().unwrap_or("");
+            if mime.starts_with("image/") {
+                out.push_str(&format!(" <<IMG:{}>>", att.url));
+            } else {
+                out.push_str(&format!(
+                    "\n[forwarded attachment]: {} {}",
+                    att.filename, att.url
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Combine a message's own text with its forwarded payloads (#1891 shape),
+/// reused for replied-to messages so a bare mention reading a forwarded
+/// original sees the payload too (#1890).
+pub(crate) fn folded_message_text(content: &str, snapshots: &[MessageSnapshot]) -> String {
+    let fwd = forwarded_snapshot_text(snapshots);
+    if fwd.is_empty() {
+        content.to_string()
+    } else if content.trim().is_empty() {
+        fwd.trim_start().to_string()
+    } else {
+        format!("{content}{fwd}")
+    }
+}
+
+/// What to do with a message that is empty of text and attachments after
+/// stripping. Pure so the branch contract from #1890 is testable without a
+/// live Context.
+pub(crate) enum EmptyContentDecision {
+    /// The message qualified (mention mode) despite coming up empty:
+    /// dispatch with this visible context instead of vanishing.
+    DispatchWith(String),
+    /// Nothing qualified; drop it, but leave a reason the caller can log.
+    Drop(&'static str),
+}
+
+pub(crate) fn decide_empty_content(
+    in_mention_mode: bool,
+    replied_folded: Option<&str>,
+) -> EmptyContentDecision {
+    if in_mention_mode {
+        EmptyContentDecision::DispatchWith(bare_mention_content(replied_folded))
+    } else {
+        EmptyContentDecision::Drop("no content, no attachments, and no qualifying mention")
+    }
+}
+
+/// Content for a bare @mention whose tag was just stripped (#1890). When the
+/// mention rode a reply, the replied-to text is the payload the user meant to
+/// send; without it, the ping itself is still a dispatchable turn.
+pub(crate) fn bare_mention_content(replied_folded: Option<&str>) -> String {
+    match replied_folded.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(text) => format!("The user mentioned you in reply to this message:\n\n{text}"),
+        None => "The user mentioned you with no other content.".to_string(),
+    }
+}
+
+/// Fetch the message a bare mention replied to and fold its forwards in.
+/// `None` when there is no reply reference or the fetch fails — the caller
+/// still dispatches the ping, just without extra context.
+async fn resolve_replied_folded(ctx: &Context, msg: &Message) -> Option<String> {
+    let reference = msg.message_reference.as_ref()?;
+    let referenced = reference.message_id?;
+    let channel = reference.channel_id;
+    match ctx.http.get_message(channel, referenced).await {
+        Ok(replied) => Some(folded_message_text(
+            &replied.content,
+            &replied.message_snapshots,
+        )),
+        Err(e) => {
+            tracing::warn!(error = %e, "Discord: could not resolve reply target of a bare mention (#1890)");
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_message(
     ctx: &Context,
@@ -174,9 +341,14 @@ pub(crate) async fn handle_message(
 
     let user_id = msg.author.id.get() as i64;
 
+    // Forwarded payloads belong in history too, not just in the agent's turn
+    // (#1891) — the raw `msg.content` of a pure forward is empty.
+    let forwarded_history = forwarded_snapshot_text(&msg.message_snapshots);
+
     // Helper: passively capture a channel message for history
     let store_channel_msg = |text: String| {
         let repo = channel_msg_repo.clone();
+        let fwd = forwarded_history.clone();
         let channel_chat_id = msg.channel_id.get().to_string();
         let guild_name = msg
             .guild_id
@@ -186,6 +358,14 @@ pub(crate) async fn handle_message(
         let sender_name = msg.author.name.clone();
         let msg_id = msg.id.get().to_string();
         async move {
+            let mut text = text;
+            if !fwd.is_empty() {
+                if text.is_empty() {
+                    text = fwd.trim_start().to_string();
+                } else {
+                    text.push_str(&fwd);
+                }
+            }
             if text.is_empty() {
                 return;
             }
@@ -369,8 +549,33 @@ pub(crate) async fn handle_message(
         let mention_tag = format!("<@{}>", bot_id);
         content = content.replace(&mention_tag, "").trim().to_string();
     }
+    // Surface forwarded payloads before the emptiness guard (#1891): a
+    // mention + pure forward has empty content and no top-level attachments,
+    // and used to be dropped here as noise before ever reaching the agent.
+    content = folded_message_text(&content, &msg.message_snapshots);
     if content.is_empty() && msg.attachments.is_empty() {
-        return;
+        // The strip above can empty a message that DID qualify at the gate:
+        // a bare @mention, usually a reply to a missed message (#1890).
+        // Resolve what it replied to and dispatch anyway; everything else
+        // keeps dropping, but never silently.
+        let in_mention_mode = !is_dm && respond_to == &RespondTo::Mention;
+        let replied_folded = if in_mention_mode {
+            resolve_replied_folded(ctx, msg).await
+        } else {
+            None
+        };
+        match decide_empty_content(in_mention_mode, replied_folded.as_deref()) {
+            EmptyContentDecision::DispatchWith(text) => {
+                tracing::debug!(
+                    "Discord: bare mention after tag-strip resolved to a dispatch (#1890)"
+                );
+                content = text;
+            }
+            EmptyContentDecision::Drop(reason) => {
+                tracing::debug!("Discord: dropping empty message: {reason}");
+                return;
+            }
+        }
     }
 
     // Handle attachments — vision-first pipeline
@@ -884,19 +1089,15 @@ pub(crate) async fn handle_message(
     );
     let _typing_guard = super::typing::TypingGuard(typing_cancel);
 
-    // Per-turn record of intermediate posts: (clean body, Option<(MessageId,
-    // last-chunk text)>). The body feeds the final-response dedup: tool_loop
-    // emits the last iteration's text BOTH as IntermediateText (so the TUI
-    // persists it) AND as response.content, so without coordination every tool
-    // turn that ends in text was posted twice — once without the ctx footer
-    // (intermediate) and once with it (final). The MessageId + last-chunk text
-    // let the final path append the ctx footer to the kept intermediate via
-    // edit_message, mirroring Slack's chat.update (#459). Per-TURN scope:
-    // a cross-turn window suppressed legitimate repeated answers on Slack.
-    use serenity::model::id::MessageId;
-    /// One intermediate already posted: (normalized body key, handle of the
-    /// last Discord chunk when the text was split).
-    type SentIntermediate = (String, Option<(MessageId, String)>);
+    // Per-turn record of intermediate post bodies. The body feeds the
+    // final-response dedup: tool_loop emits the last iteration's text BOTH
+    // as IntermediateText (so the TUI persists it) AND as response.content,
+    // so without coordination every tool turn that ends in text was posted
+    // twice. Per-TURN scope: a cross-turn window suppressed legitimate
+    // repeated answers on Slack. (#1842: no message ids or chunk text are
+    // recorded anymore — the ctx footer never rides on any message.)
+    /// One intermediate already posted: its post-sanitized body.
+    type SentIntermediate = String;
     let sent_intermediates: Arc<Mutex<Vec<SentIntermediate>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Track every IntermediateText spawn handle so the final-response path can
@@ -911,6 +1112,8 @@ pub(crate) async fn handle_message(
     let intermediate_handles_final = intermediate_handles.clone();
     let sent_intermediates_final = sent_intermediates.clone();
 
+    use serenity::model::id::MessageId;
+
     // Turn bubble id, hoisted OUT of the progress-callback block so the
     // final-response path can find the bubble: trace mode drops the trailing
     // narration note that mirrors the answer, and auto-thread anchors the
@@ -921,7 +1124,6 @@ pub(crate) async fn handle_message(
     let progress_cb: crate::brain::agent::ProgressCallback = {
         use crate::brain::agent::ProgressEvent;
         use serenity::builder::EditMessage;
-        use serenity::model::id::MessageId;
 
         use super::tool_group::{GroupEntry, GroupState};
 
@@ -985,6 +1187,8 @@ pub(crate) async fn handle_message(
                                             entries,
                                             notes: Vec::new(),
                                             expanded: false,
+                                            started_at: Instant::now(),
+                                            settled: None,
                                         },
                                     )
                                     .await;
@@ -1003,6 +1207,8 @@ pub(crate) async fn handle_message(
                                     entries,
                                     notes: Vec::new(),
                                     expanded: false,
+                                    started_at: Instant::now(),
+                                    settled: None,
                                 };
                                 let content = super::tool_group::render_content(&group);
                                 match channel.say(&http, &content).await {
@@ -1060,6 +1266,8 @@ pub(crate) async fn handle_message(
                                         entries,
                                         notes: Vec::new(),
                                         expanded: false,
+                                        started_at: Instant::now(),
+                                        settled: None,
                                     },
                                 )
                                 .await;
@@ -1077,7 +1285,8 @@ pub(crate) async fn handle_message(
                 }
                 ProgressEvent::SelfHealingAlert { message } => {
                     tokio::spawn(async move {
-                        let text = format!("🔧 {}", message);
+                        let text =
+                            format!("🔧 {}", crate::utils::sanitize::normalize_dashes(&message));
                         if let Err(e) = channel.say(&http, &text).await {
                             tracing::warn!(error = %e, "failed to send Discord message");
                         }
@@ -1142,28 +1351,14 @@ pub(crate) async fn handle_message(
                         // already posted this turn.
                         {
                             let mut prev = sent.lock().await;
-                            if prev.iter().any(|(b, _)| b == &clean) {
+                            if prev.iter().any(|b| b == &clean) {
                                 return;
                             }
-                            prev.push((clean.clone(), None));
+                            prev.push(clean.clone());
                         }
-                        // Remember the last chunk's message id so the
-                        // final-response path can append the ctx footer to
-                        // the kept intermediate when it matches (Slack's
-                        // keep-intermediate path, #459).
-                        let mut last: Option<(MessageId, String)> = None;
                         for chunk in split_message(&clean, 2000) {
-                            match channel.say(&http, &chunk).await {
-                                Ok(m) => last = Some((m.id, chunk.to_string())),
-                                Err(e) => {
-                                    tracing::debug!("Discord: intermediate text send failed: {}", e)
-                                }
-                            }
-                        }
-                        if let Some(entry) = last {
-                            let mut prev = sent.lock().await;
-                            if let Some(slot) = prev.iter_mut().find(|(b, _)| b == &clean) {
-                                slot.1 = Some(entry);
+                            if let Err(e) = channel.say(&http, &chunk).await {
+                                tracing::debug!("Discord: intermediate text send failed: {}", e)
                             }
                         }
                     });
@@ -1199,7 +1394,7 @@ pub(crate) async fn handle_message(
                 }
                 // Optional follow-up suggestions (#598): post tap-to-send
                 // buttons under the response. A tap injects the suggestion as a
-                // new turn via route_interaction_turn.
+                // new turn via route_followup_turn (#1852).
                 ProgressEvent::SuggestedOptions(options) => {
                     let http = http.clone();
                     let state = group_state_cb.clone();
@@ -1219,6 +1414,44 @@ pub(crate) async fn handle_message(
             }
         })
     };
+
+    // Turn-start group shell (#1845, the #1808 Slack parity): the bubble
+    // posts NOW, before the turn dispatches, so the clock covers the
+    // thinking window. Starts as `✅ **0 tool calls** · 🕒 0:00` and is
+    // edited in place on the first tool event (the Some(mid) upsert path
+    // preserves this started_at); the settle stamp is the last word. On a
+    // post failure the mid stays None and creation falls back to the first
+    // tool call, the pre-#1845 behavior.
+    let turn_shell = super::tool_group::GroupState {
+        entries: Vec::new(),
+        notes: Vec::new(),
+        expanded: false,
+        started_at: Instant::now(),
+        settled: None,
+    };
+    match target
+        .say(&ctx.http, &super::tool_group::render_content(&turn_shell))
+        .await
+    {
+        Ok(sent) => {
+            discord_state
+                .upsert_tool_group(sent.id.get(), turn_shell)
+                .await;
+            *turn_group_mid.lock().await = Some(sent.id);
+        }
+        Err(e) => tracing::warn!("Discord: turn-start group shell post failed: {e}"),
+    }
+
+    // Flow ticker (#1843): re-renders the bubble's clock every 4 s so the
+    // timer does not freeze between tool events. Spawns after the turn-start
+    // shell (#1845) so the group already exists; stops itself on
+    // settle/prune/cap.
+    spawn_flow_ticker(
+        ctx.http.clone(),
+        target,
+        turn_group_mid.clone(),
+        discord_state.clone(),
+    );
 
     let discord_chat_id = msg.channel_id.get().to_string();
     let result = agent
@@ -1262,9 +1495,11 @@ pub(crate) async fn handle_message(
             // copies of a text (intermediate + final) normalize identically.
             let text_only = super::table_convert::tables_to_discord(&text_only);
 
-            // Context budget footer appended to last display chunk, never stored in DB
+            // Settled-line ctx source (#1842): the context budget lives ONLY
+            // on the flow group's settled chrome, never appended to an
+            // answer message. Built here, consumed by settle_tool_group.
             let ctx_max = agent.context_limit_for_session(session_id);
-            let footer = crate::utils::format_ctx_footer(
+            let ctx_line = crate::utils::format_ctx_footer(
                 response.context_tokens,
                 ctx_max,
                 response.tokens_per_second,
@@ -1289,28 +1524,17 @@ pub(crate) async fn handle_message(
                     tracing::warn!("Discord: intermediate post task panicked: {e}");
                 }
             }
-            let (skip_final_post, footer_edit_target) = {
+            let skip_final_post = {
                 let posted = sent_intermediates_final.lock().await;
                 if text_only.trim().is_empty() {
                     // Empty-final guard (#943/#951 class): the model's real
                     // answer already went out as intermediates and the final
                     // content is just a wrap-up. Keep them, never post a bare
-                    // footer on its own.
-                    (true, posted.last().and_then(|e| e.1.clone()))
+                    // shell.
+                    true
                 } else {
                     let final_key = norm_key(&text_only);
-                    match posted.iter().rev().find(|(b, _)| norm_key(b) == final_key) {
-                        // The intermediate IS the answer: keep it, append the
-                        // footer to its last chunk via edit, skip the final
-                        // post (Slack's keep-intermediate outcome, #459).
-                        Some((_, Some((id, last_chunk)))) => {
-                            (true, Some((*id, last_chunk.clone())))
-                        }
-                        // Matched but the send failed so no id was recorded:
-                        // still skip the duplicate post, nothing to edit.
-                        Some((_, None)) => (true, None),
-                        None => (false, None),
-                    }
+                    posted.iter().any(|b| norm_key(b) == final_key)
                 }
             };
 
@@ -1336,6 +1560,30 @@ pub(crate) async fn handle_message(
                     .components(super::tool_group::render_components(&group, mid.get()));
                 if let Err(e) = target.edit_message(&ctx.http, mid, edit).await {
                     tracing::debug!("Discord: trace mirror-note drop failed: {e}");
+                }
+            }
+
+            // Settled status chrome (#1841): freeze the clock and stamp the
+            // ctx budget into the flow group, the Discord twin of Telegram's
+            // settled flow header. Runs on every delivery outcome so the
+            // chrome ends as the last word regardless of the answer path.
+            if let Some(mid) = *turn_group_mid.lock().await
+                && let Some(group) = discord_state
+                    .settle_tool_group(
+                        mid.get(),
+                        if ctx_line.is_empty() {
+                            None
+                        } else {
+                            Some(ctx_line.clone())
+                        },
+                    )
+                    .await
+            {
+                let edit = serenity::builder::EditMessage::new()
+                    .content(super::tool_group::render_content(&group))
+                    .components(super::tool_group::render_components(&group, mid.get()));
+                if let Err(e) = target.edit_message(&ctx.http, mid, edit).await {
+                    tracing::debug!("Discord: settled status stamp failed: {e}");
                 }
             }
 
@@ -1370,29 +1618,11 @@ pub(crate) async fn handle_message(
             }
 
             if skip_final_post {
-                // Answer already visible via the kept intermediate: append the
-                // ctx footer to its last chunk (edit, not a new message) so the
-                // completion marker still shows exactly once.
-                if let Some((id, last_chunk)) = footer_edit_target {
-                    let content = if footer.is_empty() {
-                        last_chunk
-                    } else {
-                        format!("{last_chunk}\n\n{footer}")
-                    };
-                    let edit = serenity::builder::EditMessage::new().content(content);
-                    if let Err(e) = target.edit_message(&ctx.http, id, edit).await {
-                        tracing::warn!("Discord: footer edit on kept intermediate failed: {e}");
-                    }
-                }
+                // Answer already visible via the kept intermediate (#459's
+                // keep-intermediate outcome): skip the duplicate post. The
+                // settled flow group above carries the completion chrome.
             } else {
-                let mut chunks: Vec<String> = split_message(&text_only, 2000);
-                // Append footer to last display chunk so it's inline, not a separate message
-                if let Some(last) = chunks.last_mut() {
-                    last.push_str("\n\n");
-                    last.push_str(&footer);
-                } else if !footer.is_empty() {
-                    chunks.push(footer);
-                }
+                let chunks: Vec<String> = split_message(&text_only, 2000);
                 // Auto-thread (opt-in): long answers post a short teaser in
                 // the channel and the full body in a thread anchored to the
                 // turn's bubble (or the user's message). The channel stays
@@ -1479,14 +1709,7 @@ pub(crate) async fn handle_message(
             if is_voice && voice_config.tts_enabled {
                 match crate::channels::voice::synthesize(&response.content, &voice_config).await {
                     Ok(audio_bytes) => {
-                        let file = CreateAttachment::bytes(audio_bytes.as_slice(), "response.ogg");
-                        if let Err(e) = msg
-                            .channel_id
-                            .send_message(&ctx.http, CreateMessage::new().add_file(file))
-                            .await
-                        {
-                            tracing::error!("Discord: failed to send TTS voice: {e}");
-                        }
+                        send_tts_voice(&ctx.http, msg.channel_id, &audio_bytes).await;
                     }
                     Err(e) => tracing::error!("Discord: TTS error: {e}"),
                 }
@@ -1505,6 +1728,64 @@ pub(crate) async fn handle_message(
             if let Err(e) = target.say(&ctx.http, error_msg).await {
                 tracing::warn!(error = %e, "failed to send Discord message");
             }
+        }
+    }
+}
+
+/// Filename the synthesized reply is uploaded under (#1849). The `ogg`
+/// extension is load-bearing, not cosmetic: serenity derives the part's
+/// `Content-Type` from the filename (`http/multipart.rs:10-12`) and mime_guess
+/// 2.0.5 maps `ogg` to `audio/ogg` (`src/mime_types.rs:829`), which is the
+/// `audio/` prefix the voice-message contract requires.
+const TTS_ATTACHMENT_NAME: &str = "response.ogg";
+
+/// The message that carries a synthesized TTS reply: a native Discord voice
+/// bubble (#1849).
+///
+/// The bubble only renders when `IS_VOICE_MESSAGE` (`1 << 13`) is set on create.
+/// It is one of the four flags a create request may set (`discord-api-docs`,
+/// `developers/resources/message.mdx:1093`), and a voice message must carry a
+/// single audio attachment and no content (same file, "Voice Messages",
+/// `:433-438`). Both hold here: the text half of a TTS reply is sent before this
+/// builder runs, and the opus file is the only attachment. serenity refuses to
+/// `edit()` a flagged message (`model/channel/message.rs:400`), which matches the
+/// documented "cannot be edited" property instead of fighting it.
+///
+/// Known gap, stated rather than hidden: the same docs list `duration_secs` and
+/// `waveform` in the Attachment Request Structure (`:685-686`) as required for
+/// voice messages, while serenity 0.12.5 `CreateAttachment` exposes only `bytes`
+/// and `description`, so neither field can be sent from this crate version.
+/// Whether a client draws a waveform from an upload that omits it is a live-bot
+/// check tracked on #1849. [`plain_attachment_builder`] is the fallback if the
+/// flagged send is rejected outright.
+pub(crate) fn voice_reply_builder(audio: &[u8]) -> CreateMessage {
+    CreateMessage::new()
+        .add_file(CreateAttachment::bytes(audio, TTS_ATTACHMENT_NAME))
+        .flags(MessageFlags::IS_VOICE_MESSAGE)
+}
+
+/// The shape this path had before #1849: the same audio as a plain file entry,
+/// no voice flag. Kept as the fallback so a TTS reply cannot be lost.
+pub(crate) fn plain_attachment_builder(audio: &[u8]) -> CreateMessage {
+    CreateMessage::new().add_file(CreateAttachment::bytes(audio, TTS_ATTACHMENT_NAME))
+}
+
+/// Send a synthesized reply, preferring the native voice bubble (#1849).
+///
+/// A rejected flagged send is retried once as a plain attachment and logged at
+/// warn with the original error: the flag's behaviour without an
+/// uploader-supplied waveform is unverified against a live bot, and a TTS reply
+/// that silently vanishes is worse than one that renders as a file.
+pub(crate) async fn send_tts_voice(http: &Http, channel: ChannelId, audio: &[u8]) {
+    if let Err(e) = channel.send_message(http, voice_reply_builder(audio)).await {
+        tracing::warn!(
+            "Discord: voice-flagged TTS send rejected ({e}); retrying as a plain attachment (#1849)"
+        );
+        if let Err(e2) = channel
+            .send_message(http, plain_attachment_builder(audio))
+            .await
+        {
+            tracing::error!("Discord: failed to send TTS voice: {e2}");
         }
     }
 }

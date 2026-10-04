@@ -1,0 +1,142 @@
+# Semgrep - the deterministic second layer behind PR-Agent.
+#
+# Why this file exists: PR-Agent reads logic and intent, but it is a model, and a
+# model misses mechanical patterns it has no rule for. Semgrep never reasons: it
+# matches known-bad shapes (weak crypto, injection, hardcoded secrets) and fails
+# the same way every time. Review catches what is wrong with the change; Semgrep
+# catches what is wrong with the code.
+#
+# Baseline, not a blanket scan. This repo is a fork of a large upstream tree that
+# already carries findings we do not own (insecure websocket defaults in the
+# browser manager, a raw-SQL cron template, a shell-injection shape in
+# prerelease.yml). A scan with no baseline is red on day one and stays red forever,
+# which only teaches everyone to ignore the gate. --baseline-commit reports the
+# findings the PR introduces and nothing else, so the gate speaks about the change
+# under review.
+#
+# Policy: only ERROR-severity findings fail the job. MEDIUM/WARNING findings are
+# printed in full (log + job summary) so they stay visible without turning every
+# PR red on day one. Tighten by setting STRICT to "true" once the backlog is triaged.
+#
+# Cost control:
+#   - ONE scan, not two: the JSON is produced once and jq renders every view of it
+#   - semgrep is version-pinned so CI and the local pre-push gate agree on rules;
+#     a floating version means the ruleset can change underneath a green build
+#   - concurrency cancels a superseded run instead of queueing it
+#
+# Security:
+#   - contents is read-only; this job only reads the tree
+#   - both actions are pinned to a commit SHA, not a tag: a tag is a movable ref,
+#     so the code running in this job could change underneath a green build
+#   - the workflow needs no secrets, so a fork PR can run it safely
+name: Semgrep
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: semgrep-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semgrep:
+    name: Scan
+    runs-on: ubuntu-latest
+    env:
+      SEMGREP_VERSION: "1.179.0"
+      # "true" = every severity fails the job; "false" = only ERROR fails
+      STRICT: "false"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # the baseline diff needs the base commit's tree, which a depth-1
+          # checkout does not carry
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve baseline
+        id: base
+        run: |
+          zero=0000000000000000000000000000000000000000
+          sha=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            sha="${{ github.event.pull_request.base.sha }}"
+          elif [ "${{ github.event_name }}" = "push" ] && [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "$zero" ]; then
+            sha="${{ github.event.before }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # a manual run carries no event baseline, and a no-baseline scan
+            # reports upstream's entire backlog: it would be red on every
+            # dispatch, which is the "red forever" case this file exists to
+            # avoid. Diff against main instead; if that ref is missing the
+            # guard below falls back to a full tree scan.
+            sha="origin/main"
+          fi
+          # a sha we cannot resolve would make semgrep fail the scan outright
+          if [ -n "$sha" ] && git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+            echo "sha=$sha" >> "$GITHUB_OUTPUT"
+            echo "baseline: $sha"
+          else
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            echo "baseline: none - scanning the full tree"
+          fi
+
+      - name: Install Semgrep
+        run: pip install --disable-pip-version-check "semgrep==${SEMGREP_VERSION}"
+
+      - name: Scan
+        env:
+          BASELINE: ${{ steps.base.outputs.sha }}
+        run: |
+          if [ -n "$BASELINE" ]; then
+            set -- --baseline-commit "$BASELINE"
+          fi
+          semgrep scan \
+            --config p/default \
+            --config p/secrets \
+            --metrics=off \
+            --quiet \
+            "$@" \
+            --json --output semgrep.json
+
+      - name: Report and gate
+        env:
+          BASELINE: ${{ steps.base.outputs.sha }}
+        run: |
+          {
+            echo "### Semgrep"
+            echo
+            echo "semgrep ${SEMGREP_VERSION} | policy: STRICT=${STRICT}"
+            if [ -n "$BASELINE" ]; then
+              echo "baseline: \`${BASELINE}\` - findings already in the base branch are not reported"
+            else
+              echo "baseline: none - full tree scan"
+            fi
+            echo
+            echo "| Severity | Rule | Location |"
+            echo "| --- | --- | --- |"
+            jq -r '.results[] | "| \(.extra.severity) | `\(.check_id | split(".") | last)` | `\(.path):\(.start.line)` |"' semgrep.json | sort
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "--- findings ---"
+          jq -r '.results[] | "\(.extra.severity)\t\(.check_id)\t\(.path):\(.start.line)"' semgrep.json | sort
+
+          if [ "$STRICT" = "true" ]; then
+            blocking=$(jq '[.results[]] | length' semgrep.json)
+          else
+            blocking=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' semgrep.json)
+          fi
+          echo "blocking findings: $blocking"
+          if [ "$blocking" -gt 0 ]; then
+            echo "::error::$blocking blocking finding(s). Full list in the job summary."
+            exit 1
+          fi

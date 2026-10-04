@@ -7,8 +7,10 @@
 //! production module.
 
 use crate::acp::protocol::{
-    AcpMode, ClientMessage, SESSION_SET_MODE, SESSION_SET_MODEL, initialize_result, modes_payload,
-    parse_line, permission_outcome, prompt_text, replay_updates, tool_kind,
+    AcpMode, ClientMessage, EXTENSION_METHODS, SESSION_COMPACT, SESSION_COMPACT_LEGACY,
+    SESSION_SET_MODE, SESSION_SET_MODEL, SESSION_SET_MODEL_LEGACY, SESSION_STEER_LEGACY,
+    initialize_result, modes_payload, parse_line, permission_outcome, prompt_text, replay_updates,
+    session_response, tool_kind,
 };
 use crate::db::models::Message;
 use chrono::Utc;
@@ -123,7 +125,62 @@ fn set_mode_is_accepted_alongside_set_model() {
     // The contract Moe's PR body promised is spelled `session/set_mode`;
     // both spellings dispatch to the same handler.
     assert_eq!(SESSION_SET_MODE, "session/set_mode");
-    assert_eq!(SESSION_SET_MODEL, "session/set_model");
+    assert_eq!(SESSION_SET_MODEL, "_opencrabs/set_model");
+}
+
+#[test]
+fn custom_methods_live_behind_the_extension_prefix() {
+    // v1 allows custom requests "as long as their name starts with an
+    // underscore" and reserves every other name for future protocol versions
+    // (#1815 F3). Official methods stay unprefixed: `session/set_mode` is one
+    // of the twelve session methods in the schema and must not be renamed.
+    for name in EXTENSION_METHODS {
+        assert!(
+            name.starts_with('_'),
+            "{name} sits in the reserved namespace"
+        );
+    }
+    assert_eq!(SESSION_SET_MODEL, "_opencrabs/set_model");
+    assert_eq!(SESSION_COMPACT, "_opencrabs/compact");
+    assert!(!SESSION_SET_MODE.starts_with('_'));
+}
+
+#[test]
+fn legacy_spellings_are_retained_but_not_advertised() {
+    // Dropping these breaks MonoCode and every adapter already in the field,
+    // so they stay accepted for one release (#1815 F3). They must not appear
+    // in the advertisement, or a fresh client is pointed at a name we are
+    // retiring.
+    assert_eq!(SESSION_SET_MODEL_LEGACY, "session/set_model");
+    assert_eq!(SESSION_COMPACT_LEGACY, "session/compact");
+    assert_eq!(SESSION_STEER_LEGACY, "session/steer");
+    for legacy in [
+        SESSION_SET_MODEL_LEGACY,
+        SESSION_COMPACT_LEGACY,
+        SESSION_STEER_LEGACY,
+    ] {
+        assert!(
+            !EXTENSION_METHODS.contains(&legacy),
+            "{legacy} advertised as canonical"
+        );
+    }
+}
+
+#[test]
+fn initialize_advertises_extensions_under_meta() {
+    // `_meta` is the sanctioned place for this; a root-level field on a spec
+    // type is a MUST NOT (#1815 F3, and the same rule F4 trips on `models`).
+    let result = initialize_result();
+    let advertised = result["_meta"]["extensions"]
+        .as_array()
+        .expect("initialize result must advertise its extensions");
+    let names: Vec<&str> = advertised
+        .iter()
+        .map(|v| v.as_str().expect("extension name is a string"))
+        .collect();
+    for method in EXTENSION_METHODS {
+        assert!(names.contains(method), "{method} not advertised");
+    }
 }
 
 #[test]
@@ -205,4 +262,47 @@ fn replay_updates_maps_reasoning_blocked_and_text_segments() {
     assert!(texts[1].contains("Blocked narration"));
     assert!(texts[1].contains("phantom narration"));
     assert_eq!(texts[2], "the visible answer");
+}
+
+#[test]
+fn initialize_advertises_auth_methods() {
+    let v = initialize_result();
+    assert!(
+        v.get("authMethods").and_then(|a| a.as_array()).is_some(),
+        "authMethods is optional per the ACP v1 schema (required is only protocolVersion); we emit it explicitly so clients and registry validators that expect the field present do not depend on the schema default"
+    );
+}
+
+#[test]
+fn new_session_result_carries_the_session_id() {
+    let result = session_response(
+        "acp-sess-1",
+        json!({ "availableModels": [], "currentModelId": "" }),
+        json!({ "availableModes": [] }),
+        json!([]),
+        true,
+    );
+    // NewSessionResponse requires sessionId: it is the only place a client
+    // learns the id of a session it asked us to create.
+    assert_eq!(result["sessionId"], json!("acp-sess-1"));
+    assert!(result["configOptions"].is_array());
+}
+
+#[test]
+fn load_session_result_does_not_echo_the_session_id() {
+    // LoadSessionResponse defines modes, configOptions and _meta and nothing
+    // else. The client supplied the id in the request, so echoing it added a
+    // root field to a type the spec owns (#1815 F4).
+    let result = session_response(
+        "acp-sess-1",
+        json!({ "availableModels": [], "currentModelId": "" }),
+        json!({ "availableModes": [] }),
+        json!([]),
+        false,
+    );
+    assert!(
+        result.get("sessionId").is_none(),
+        "load echoed a sessionId the client already has"
+    );
+    assert!(result["configOptions"].is_array());
 }

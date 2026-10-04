@@ -133,6 +133,7 @@ fn final_dialect_defaults_to_html() {
 #[tokio::test]
 async fn global_pacer_burst_smoothing_and_cooldown() {
     let _guard = crate::channels::telegram::governor::test_support::registry_guard().await;
+    let _cooldown = crate::tests::telegram_cooldown_lock::guard().await;
     crate::channels::telegram::governor::test_support::reset(0);
     crate::channels::telegram::rate_limit::reset_global_cooldown();
 
@@ -165,6 +166,7 @@ async fn global_pacer_burst_smoothing_and_cooldown() {
 #[tokio::test]
 async fn global_cooldown_suppresses_drop_eligible_gates() {
     let _guard = crate::channels::telegram::governor::test_support::registry_guard().await;
+    let _cooldown = crate::tests::telegram_cooldown_lock::guard().await;
     crate::channels::telegram::governor::test_support::reset(0);
     crate::channels::telegram::rate_limit::reset_global_cooldown();
 
