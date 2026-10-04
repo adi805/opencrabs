@@ -8,9 +8,8 @@
 //! can never read as an "already ran" claim (AC-016).
 
 use crate::brain::agent::service::phantom_lang::all_langs;
-use crate::channels::discord::tool_group::{
-    EVIDENCE_HEADER, GroupEntry, GroupState, evidence_line,
-};
+use crate::channels::discord::tool_group::{GroupEntry, GroupState, evidence_line};
+use crate::channels::evidence::EVIDENCE_HEADER;
 use std::time::Instant;
 
 fn group(names: &[&str]) -> GroupState {

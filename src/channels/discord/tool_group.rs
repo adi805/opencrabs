@@ -254,11 +254,6 @@ fn summary_line(group: &GroupState) -> String {
     }
 }
 
-/// The evidence footer's header, re-exported so the phantom-safety test can
-/// pin the SAME string the renderer emits (AC-016). One definition, shared
-/// with Telegram — see [`crate::channels::evidence`] (NFR-002).
-pub(crate) use crate::channels::evidence::EVIDENCE_HEADER;
-
 /// Mechanical evidence footer for the turn's final answer (FR-007, #1880).
 ///
 /// Built from the SAME `entries` the tool card renders, which are appended
