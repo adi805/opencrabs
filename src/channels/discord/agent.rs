@@ -24,6 +24,9 @@ use serenity::prelude::*;
 pub struct DiscordAgent {
     agent_service: Arc<AgentService>,
     session_service: SessionService,
+    /// Kept alongside the service handles: plan Discard clears the session
+    /// goal through `GoalManager`, which needs the pool (FR-008).
+    service_context: ServiceContext,
     shared_session_id: Arc<Mutex<Option<Uuid>>>,
     discord_state: Arc<DiscordState>,
     config_rx: tokio::sync::watch::Receiver<Config>,
@@ -41,7 +44,8 @@ impl DiscordAgent {
     ) -> Self {
         Self {
             agent_service,
-            session_service: SessionService::new(service_context),
+            session_service: SessionService::new(service_context.clone()),
+            service_context,
             shared_session_id,
             discord_state,
             config_rx,
@@ -717,6 +721,149 @@ impl EventHandler for Handler {
                                 serenity::builder::CreateInteractionResponse::Acknowledge,
                             )
                             .await;
+                    }
+                }
+                return;
+            }
+
+            // Plan card Approve/Discard (`plan:` prefix, deliberately distinct
+            // from the tool-approval `approve:{id}` family). Owner-only for the
+            // same reason Telegram is: the keyboard sits in a channel any
+            // allowlisted member can see, so the tapper is re-checked here.
+            if super::plan_card::is_plan_callback(custom_id) {
+                use serenity::builder::{
+                    CreateInteractionResponse, CreateInteractionResponseMessage,
+                };
+                let cfg = self.config_rx.borrow().clone();
+                let caller = comp.user.id.get().to_string();
+                let is_owner = crate::config::owner::is_owner(
+                    &cfg.channels.discord.allowed_users,
+                    &cfg.channels.discord.bot_owner,
+                    &caller,
+                );
+                if !is_owner {
+                    tracing::warn!(
+                        "Discord: non-owner {} tapped '{}' — refused (OC-01)",
+                        caller,
+                        custom_id
+                    );
+                    let _ = comp
+                        .create_response(
+                            &ctx.http,
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("🔒 Owner only")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+
+                let channel_id = comp.channel_id;
+                let Some(session_id) = self
+                    .discord_state
+                    .session_owner_by_channel(channel_id.get())
+                    .await
+                else {
+                    let _ = comp
+                        .create_response(
+                            &ctx.http,
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("No session for this channel.")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await;
+                    return;
+                };
+
+                if custom_id == super::plan_card::PLAN_DISCARD {
+                    // Discard cancels the running turn first, exactly like the
+                    // Telegram arm: the plan is going away, so letting the turn
+                    // keep executing would write results against a dead plan.
+                    let cancelled = self.discord_state.cancel_session(session_id).await;
+                    let mut reply =
+                        crate::utils::plan_mode::discard(session_id, &self.service_context).await;
+                    if cancelled {
+                        reply = format!("⏹️ Cancelled the running turn. {reply}");
+                    }
+                    let _ = comp
+                        .create_response(
+                            &ctx.http,
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("Plan discarded")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await;
+                    super::plan_card::remove_plan_card(
+                        &ctx.http,
+                        channel_id,
+                        &self.discord_state,
+                        session_id,
+                    )
+                    .await;
+                    if let Err(e) = writes::say(&ctx.http, channel_id, &reply, Class::Final).await {
+                        tracing::warn!("Discord: plan discard note failed: {e}");
+                    }
+                    return;
+                }
+
+                // plan:ok — Approve, or the empty-tasks seed retry.
+                match crate::utils::plan_mode::try_approve(
+                    session_id,
+                    crate::tui::plan::ApprovalSource::User,
+                )
+                .await
+                {
+                    crate::utils::plan_mode::ApproveOutcome::Refused(msg) => {
+                        let _ = comp
+                            .create_response(
+                                &ctx.http,
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content(msg)
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await;
+                    }
+                    crate::utils::plan_mode::ApproveOutcome::SeedTurn { prompt } => {
+                        let _ = comp
+                            .create_response(
+                                &ctx.http,
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content("✅ Plan approved — starting now…")
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await;
+                        // Visible seed turn, spawned so the callback answers
+                        // inside Discord's 3s window. Runs through the same
+                        // resume path a background task uses, so the result
+                        // lands in the channel like any other turn.
+                        let agent = self.agent_service.clone();
+                        let http = ctx.http.clone();
+                        let target = channel_id.get().to_string();
+                        tokio::spawn(async move {
+                            if let Some(content) = crate::channels::bg_resume::run_resume_turn(
+                                agent, session_id, prompt, "discord", &target,
+                            )
+                            .await
+                            {
+                                if let Err(e) =
+                                    writes::say(&http, channel_id, &content, Class::Final).await
+                                {
+                                    tracing::warn!(
+                                        "Discord: plan approval turn delivery failed: {e}"
+                                    );
+                                }
+                            }
+                        });
                     }
                 }
                 return;
