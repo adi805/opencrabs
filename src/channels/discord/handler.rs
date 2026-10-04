@@ -1094,6 +1094,20 @@ pub(crate) async fn handle_message(
         .store_cancel_token(session_id, cancel_token.clone())
         .await;
 
+    // Acknowledge receipt before the first progress write (#1880 FR-010): a
+    // 👀 on the user's message so the turn never looks silently eaten.
+    // Best-effort: skipped while the channel is backing off from a 429,
+    // because the ack is transient and the reply itself is unaffected.
+    if super::governor::cooldown_remaining(msg.channel_id.get()).is_none() {
+        use serenity::model::channel::ReactionType;
+        if let Err(e) = msg
+            .react(&ctx.http, ReactionType::Unicode("👀".to_string()))
+            .await
+        {
+            tracing::warn!("Discord: ack reaction failed: {e}");
+        }
+    }
+
     // Sustained typing for the turn, continuing while the session has detached
     // work (#812). Discord had no turn-long pinger at all, so an ordinary turn
     // showed the dots briefly and a background command showed nothing: spawning
@@ -1204,6 +1218,7 @@ pub(crate) async fn handle_message(
                                     .upsert_tool_group(
                                         mid.get(),
                                         GroupState {
+                                            last_activity_at: Instant::now(),
                                             entries,
                                             notes: Vec::new(),
                                             expanded: false,
@@ -1226,6 +1241,7 @@ pub(crate) async fn handle_message(
                             }
                             None => {
                                 let group = GroupState {
+                                    last_activity_at: Instant::now(),
                                     entries,
                                     notes: Vec::new(),
                                     expanded: false,
@@ -1287,6 +1303,7 @@ pub(crate) async fn handle_message(
                                 .upsert_tool_group(
                                     mid.get(),
                                     GroupState {
+                                        last_activity_at: Instant::now(),
                                         entries,
                                         notes: Vec::new(),
                                         expanded: false,
@@ -1452,6 +1469,7 @@ pub(crate) async fn handle_message(
     // post failure the mid stays None and creation falls back to the first
     // tool call, the pre-#1845 behavior.
     let turn_shell = super::tool_group::GroupState {
+        last_activity_at: Instant::now(),
         entries: Vec::new(),
         notes: Vec::new(),
         expanded: false,
@@ -1605,6 +1623,7 @@ pub(crate) async fn handle_message(
                 && let Some(group) = discord_state
                     .settle_tool_group(
                         mid.get(),
+                        super::tool_group::TurnOutcome::Finished,
                         if ctx_line.is_empty() {
                             None
                         } else {
@@ -1757,9 +1776,27 @@ pub(crate) async fn handle_message(
         }
         Err(ref e) if matches!(e, crate::brain::agent::AgentError::Cancelled) => {
             tracing::info!("Discord: agent call cancelled for session {}", session_id);
+            settle_outcome(
+                &ctx.http,
+                target,
+                &discord_state,
+                &turn_group_mid,
+                super::tool_group::TurnOutcome::Cancelled,
+                None,
+            )
+            .await;
         }
         Err(e) => {
             tracing::error!("Discord: agent error: {}", e);
+            settle_outcome(
+                &ctx.http,
+                target,
+                &discord_state,
+                &turn_group_mid,
+                classify_outcome(&e),
+                None,
+            )
+            .await;
             // Shared helper translates the raw error into something
             // the user can act on (5xx exhausted, rate limit, context
             // too large, stream broken, repetition loop). Same wording
@@ -1769,6 +1806,54 @@ pub(crate) async fn handle_message(
                 tracing::warn!(error = %e, "failed to send Discord message");
             }
         }
+    }
+}
+
+/// Classify a turn error into the terminal outcome stamped on the flow card
+/// (FR-005, #1880). Mirrors Telegram's `FlowOutcome` split exactly: a
+/// deadline/timeout reads as `TimedOut`, anything else as `Failed`.
+/// Cancellation is matched on the error VARIANT by the caller, never here.
+pub(crate) fn classify_outcome(
+    err: &crate::brain::agent::AgentError,
+) -> super::tool_group::TurnOutcome {
+    let es = err.to_string().to_lowercase();
+    if es.contains("timed out") || es.contains("timeout") || es.contains("deadline") {
+        super::tool_group::TurnOutcome::TimedOut
+    } else {
+        super::tool_group::TurnOutcome::Failed
+    }
+}
+
+/// Settle the flow card with a terminal outcome and re-render it in place
+/// (FR-005, #1880).
+///
+/// Before this, settle ran ONLY on the `Ok` arm. A turn that failed, timed out
+/// or was cancelled left the card's `🕒` clock spinning forever — on screen
+/// indistinguishable from a turn still working — and the card's icon came from
+/// tool status, so a timeout with all tools green rendered a green check. The
+/// trace is never deleted: the card is edited to its final shape.
+pub(crate) async fn settle_outcome(
+    http: &Http,
+    channel: serenity::model::id::ChannelId,
+    discord_state: &DiscordState,
+    turn_group_mid: &Arc<Mutex<Option<serenity::model::id::MessageId>>>,
+    outcome: super::tool_group::TurnOutcome,
+    ctx: Option<String>,
+) {
+    let Some(mid) = *turn_group_mid.lock().await else {
+        return;
+    };
+    let Some(group) = discord_state
+        .settle_tool_group(mid.get(), outcome, ctx)
+        .await
+    else {
+        return;
+    };
+    let edit = serenity::builder::EditMessage::new()
+        .content(super::tool_group::render_content(&group))
+        .components(super::tool_group::render_components(&group, mid.get()));
+    if let Err(e) = writes::edit(http, channel, mid, edit, Class::Final).await {
+        tracing::debug!("Discord: settled status stamp failed: {e}");
     }
 }
 
