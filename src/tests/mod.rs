@@ -940,6 +940,7 @@ pub mod discord_fr004_one_message_test;
 pub mod discord_governor_test;
 pub mod discord_handler_test;
 pub mod discord_history_dedup_test;
+pub mod discord_long_answer_test;
 pub mod discord_mention_only_test;
 pub mod discord_norm_key_test;
 pub mod discord_slash_defer_followup_test;
