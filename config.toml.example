@@ -656,6 +656,15 @@ allowed_channels = ["channel_id"]       # Where the bot operates (empty = all ch
 # cooldown_base_millis = 1000           # First 429 cooldown; doubles per consecutive 429.
 # cooldown_max_millis = 60000           # Ceiling for the exponential 429 cooldown.
 
+# Progress-card display (FR-006). The live card stays the single message for a
+# turn; these knobs decide when it admits the turn has gone quiet.
+# [channels.discord.progress]
+# silence_warning_secs = 90             # Idle seconds before the card adds a
+                                        # "still working" line naming the last
+                                        # activity. 0 disables. Default: 90.
+                                        # The clock denominator is not set here:
+                                        # it reads [agent] thinking_loop_timeout_secs.
+
 [channels.telegram]
 enabled = false
 # allowed_users = [123456789]             # Who the bot replies to (numeric user ID, empty = everyone)
